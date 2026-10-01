@@ -1250,6 +1250,10 @@ PREFILL_COMMIT_STUCK_LOG_S = 60.0
 # Extra bounded wait at shutdown for a commit worker that is inside a store
 # call after the cancel flag is set. Past it the stores are left unclosed.
 PREFILL_COMMIT_CANCEL_WAIT_S = 10.0
+# Bound on the final-store worker waiting for the request's in-flight commit.
+# Past it the final store is skipped so a stuck commit cannot hold the store
+# worker (and the gate slots queued behind it).
+PREFILL_COMMIT_FINAL_STORE_WAIT_S = 120.0
 
 
 class _DaemonCommitExecutor:
@@ -2145,6 +2149,10 @@ class Scheduler:
         self._deferred_teardowns: dict[str, list[Callable[[], None]]] = {}
         self._deferred_teardown_since: dict[str, float] = {}
         self._stuck_teardown_logged: set[str] = set()
+        # Final stores skipped because the request's commit never ended within
+        # PREFILL_COMMIT_FINAL_STORE_WAIT_S. Added on the store worker (GIL-atomic
+        # set.add), consumed by _drain_pending_async_removes on the scheduler thread.
+        self._skipped_final_stores: set[str] = set()
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -2743,7 +2751,21 @@ class Scheduler:
         """
         self._store_cache_thread_id = threading.get_ident()
         if after_commit is not None:
-            concurrent.futures.wait([after_commit])
+            done, _pending = concurrent.futures.wait(
+                [after_commit], timeout=PREFILL_COMMIT_FINAL_STORE_WAIT_S
+            )
+            if not done:
+                # Skip this final store; table and snapshot teardown stays
+                # deferred behind the commit (scheduler thread), the gate slot
+                # is released when the drain sees this future done.
+                logger.warning(
+                    "Skipping final store for %s: its prefill commit did not "
+                    "finish within %.0fs",
+                    request_id,
+                    PREFILL_COMMIT_FINAL_STORE_WAIT_S,
+                )
+                self._skipped_final_stores.add(request_id)
+                return
         window_kwargs = {"cache_covers_suffix_only": True} if incremental_commit else {}
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
@@ -2795,6 +2817,23 @@ class Scheduler:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+
+    def _skipped_store_teardown(self, request_id: str) -> Callable[[], None]:
+        """Teardown for a request whose final store was skipped (stuck commit)."""
+
+        def teardown() -> None:
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
+            if self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+                if block_table:
+                    self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
+                    )
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
+
+        return teardown
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -2855,7 +2894,15 @@ class Scheduler:
                 # delete now that the future has completed. Cleanup was
                 # deferred from _cleanup_finished to avoid racing the worker's
                 # boundary_snapshot_store.load() calls with rmtree.
-                if self._boundary_snapshot_store is not None:
+                if request_id in self._skipped_final_stores:
+                    # The final store never ran: the stuck commit may still
+                    # read the snapshots and use the table, so both are torn
+                    # down once it ends, exactly as the worker would have.
+                    self._skipped_final_stores.discard(request_id)
+                    self._after_commit(
+                        request_id, self._skipped_store_teardown(request_id)
+                    )
+                elif self._boundary_snapshot_store is not None:
                     self._boundary_snapshot_store.cleanup_request(request_id)
                 # Worker no longer holds extracted_cache — pop request from
                 # self.requests and drop the cache buffer references so MLX
@@ -14933,6 +14980,7 @@ class Scheduler:
         self._deferred_teardowns.clear()
         self._deferred_teardown_since.clear()
         self._stuck_teardown_logged.clear()
+        self._skipped_final_stores.clear()
         self._prefill_commits.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()
