@@ -355,6 +355,15 @@ class SchedulerSettings:
     # prompt is still prefilling, so an aborted or re-issued request resumes from
     # the last committed block instead of token zero. 0 disables it.
     prefill_progress_commit_blocks: int = 0
+    # Under hard memory pressure, pause (park) the most recent prefilling
+    # request instead of aborting everything; it re-queues without an error
+    # and resumes from its last committed prefix once pressure has cleared.
+    # Best with prefill_progress_commit_blocks > 0 (otherwise it resumes cold).
+    memory_pressure_park: bool = False
+    # Parks a single request may take before it falls back to the abort.
+    max_parks_per_request: int = 3
+    # Consecutive "ok" pressure polls before parked requests may resume.
+    park_resume_ok_polls: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -383,6 +392,13 @@ class SchedulerSettings:
             or commit_blocks < 0
         ):
             commit_blocks = 0
+
+        def positive_int(key: str, default: int) -> int:
+            value = data.get(key, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                return default
+            return value
+
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
@@ -390,6 +406,9 @@ class SchedulerSettings:
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
             prefill_progress_commit_blocks=commit_blocks,
+            memory_pressure_park=data.get("memory_pressure_park") is True,
+            max_parks_per_request=positive_int("max_parks_per_request", 3),
+            park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
         )
 
 
@@ -1257,6 +1276,17 @@ class GlobalSettings:
                     f"Invalid OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS value: "
                     f"{commit_blocks}"
                 )
+        if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
+            self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
+        for env_name, attr in (
+            ("OMLX_MAX_PARKS_PER_REQUEST", "max_parks_per_request"),
+            ("OMLX_PARK_RESUME_OK_POLLS", "park_resume_ok_polls"),
+        ):
+            if raw := os.getenv(env_name):
+                try:
+                    setattr(self.scheduler, attr, int(raw))
+                except ValueError:
+                    logger.warning(f"Invalid {env_name} value: {raw}")
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1773,6 +1803,16 @@ class GlobalSettings:
                 f"Invalid prefill_progress_commit_blocks: "
                 f"{self.scheduler.prefill_progress_commit_blocks} (must be >= 0)"
             )
+        if self.scheduler.max_parks_per_request < 1:
+            errors.append(
+                f"Invalid max_parks_per_request: "
+                f"{self.scheduler.max_parks_per_request} (must be >= 1)"
+            )
+        if self.scheduler.park_resume_ok_polls < 1:
+            errors.append(
+                f"Invalid park_resume_ok_polls: "
+                f"{self.scheduler.park_resume_ok_polls} (must be >= 1)"
+            )
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -1941,6 +1981,9 @@ class GlobalSettings:
             prefill_progress_commit_blocks=(
                 self.scheduler.prefill_progress_commit_blocks
             ),
+            memory_pressure_park=self.scheduler.memory_pressure_park,
+            max_parks_per_request=self.scheduler.max_parks_per_request,
+            park_resume_ok_polls=self.scheduler.park_resume_ok_polls,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

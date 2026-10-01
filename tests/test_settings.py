@@ -395,6 +395,9 @@ class TestSchedulerSettings:
             "prefill_priority": "context",
             "decode_fairness": True,
             "prefill_progress_commit_blocks": 0,
+            "memory_pressure_park": False,
+            "max_parks_per_request": 3,
+            "park_resume_ok_polls": 3,
         }
 
     def test_prefill_progress_commit_blocks_from_dict(self):
@@ -429,6 +432,62 @@ class TestSchedulerSettings:
         assert any(
             "prefill_progress_commit_blocks" in e for e in settings.validate()
         )
+
+    def test_park_settings_defaults_and_round_trip(self):
+        """Park is off by default; valid values round-trip; junk falls back."""
+        defaults = SchedulerSettings.from_dict({})
+        assert defaults.memory_pressure_park is False
+        assert defaults.max_parks_per_request == 3
+        assert defaults.park_resume_ok_polls == 3
+        custom = SchedulerSettings.from_dict(
+            {
+                "memory_pressure_park": True,
+                "max_parks_per_request": 5,
+                "park_resume_ok_polls": 1,
+            }
+        )
+        assert custom.memory_pressure_park is True
+        assert custom.max_parks_per_request == 5
+        assert custom.park_resume_ok_polls == 1
+        for bad in ("many", None, -1, 0, True):
+            junk = SchedulerSettings.from_dict(
+                {"max_parks_per_request": bad, "park_resume_ok_polls": bad}
+            )
+            assert junk.max_parks_per_request == 3
+            assert junk.park_resume_ok_polls == 3
+
+    def test_park_settings_reach_scheduler_config(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        config = settings.to_scheduler_config()
+        assert config.memory_pressure_park is False
+        assert (config.max_parks_per_request, config.park_resume_ok_polls) == (3, 3)
+        settings.scheduler.memory_pressure_park = True
+        settings.scheduler.max_parks_per_request = 2
+        settings.scheduler.park_resume_ok_polls = 4
+        config = settings.to_scheduler_config()
+        assert config.memory_pressure_park is True
+        assert (config.max_parks_per_request, config.park_resume_ok_polls) == (2, 4)
+
+    def test_park_settings_env_override(self, tmp_path):
+        env = {
+            "OMLX_MEMORY_PRESSURE_PARK": "true",
+            "OMLX_MAX_PARKS_PER_REQUEST": "7",
+            "OMLX_PARK_RESUME_OK_POLLS": "2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.scheduler.memory_pressure_park is True
+        assert settings.scheduler.max_parks_per_request == 7
+        assert settings.scheduler.park_resume_ok_polls == 2
+
+    def test_park_settings_validation(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert not any("park" in e for e in settings.validate())
+        settings.scheduler.max_parks_per_request = 0
+        settings.scheduler.park_resume_ok_polls = 0
+        errors = settings.validate()
+        assert any("max_parks_per_request" in e for e in errors)
+        assert any("park_resume_ok_polls" in e for e in errors)
 
     def test_decode_fairness_from_dict(self):
         """Defaults on; explicit false round-trips."""
