@@ -1187,3 +1187,73 @@ def test_stuck_teardown_warning_is_logged_once(
     finally:
         gate.release.set()
         rig.close()
+
+
+# --- Bounded wait of the final store on an in-flight commit --------------------
+
+
+def test_stuck_commit_times_out_the_final_store_and_frees_the_slot(
+    tmp_path, mock_tokenizer, monkeypatch, gated, caplog
+):
+    """A commit that never ends must not hold the final-store worker or gate.
+
+    The final store is skipped (logged once), the store-gate slot is released,
+    and a later request's final store proceeds on the same worker thread.
+    """
+    import logging
+
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "PREFILL_COMMIT_FINAL_STORE_WAIT_S", 0.3)
+    rig = _Rig(tmp_path, mock_tokenizer, split=False, commit_blocks=2)
+    gate = gated(rig)
+    try:
+        scheduler = rig.scheduler
+        request, state = rig.start("r1", PROMPT)
+        while not scheduler._step_prefill_chunk(state):
+            pass
+        assert gate.entered.wait(20)
+        finished = _decode_to_finish(rig, request, state)
+
+        class _Gate:
+            submitted = 0
+            done = 0
+
+            def note_submitted(self):
+                self.submitted += 1
+
+            def note_done(self):
+                self.done += 1
+
+        store_gate = _Gate()
+        scheduler._store_cache_gate = store_gate
+        with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+            scheduler._cleanup_finished(finished)
+            scheduler._inflight_store_futures["r1"].result(timeout=10)
+            scheduler._drain_pending_async_removes()
+
+        # Skipped, logged once, slot released although the commit still runs.
+        timeouts = [r for r in caplog.records if "final store" in r.getMessage()]
+        assert len(timeouts) == 1
+        assert store_gate.submitted == 1 and store_gate.done == 1
+        assert "r1" not in scheduler._inflight_store_futures
+        assert not scheduler._pending_async_removes
+
+        # Table state is released through the deferred teardown once it ends.
+        assert scheduler._teardown_pending("r1")
+        gate.release.set()
+        rig.drain()
+        assert not scheduler._teardown_pending("r1")
+        assert "r1" not in rig.prefix._request_tables
+        # The blocks the commit stored stay reusable by a re-issue.
+        table, _ = rig.probe(PROMPT)
+        assert table is not None and table.num_tokens >= BLOCK
+
+        # A later final store proceeds.
+        request2, state2 = rig.start("r2", list(range(40, 57)))
+        _finish(rig, request2, state2)
+        table, _ = rig.probe(list(range(40, 57)))
+        assert table is not None and table.num_tokens == 4 * BLOCK
+    finally:
+        gate.release.set()
+        rig.close()
