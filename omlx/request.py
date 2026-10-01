@@ -235,6 +235,12 @@ class Request:
         0  # Per-request prefill-headroom eviction phase counter
     )
 
+    # Memory-pressure park: a prefilling request paused without an error. It
+    # keeps its client stream and place in line and resumes from its last
+    # committed prefix. ``parked`` is True from the park until the resume.
+    parked: bool = False
+    park_count: int = 0  # Parks taken so far (bounded by max_parks_per_request)
+
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
 

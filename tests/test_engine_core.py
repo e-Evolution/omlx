@@ -1281,6 +1281,31 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
+    async def test_abort_all_requests_leaves_parked_requests_alone(
+        self, mock_model, mock_tokenizer
+    ):
+        """A parked request holds no memory; a pressure abort must keep it."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                parked_id = await engine.add_request(prompt="Hello")
+                live_id = await engine.add_request(prompt="World")
+                engine.scheduler.requests[parked_id].parked = True
+
+                assert await engine.abort_all_requests() == 1
+                assert engine._output_collectors[parked_id].get_nowait() is None
+                assert engine._output_collectors[live_id].get_nowait().finished
+
+                # An explicit reason (manual unload, shutdown) aborts it too.
+                assert await engine.abort_all_requests(reason="unloading") == 1
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
     async def test_abort_all_requests_uses_explicit_unload_reason(
         self, mock_model, mock_tokenizer
     ):

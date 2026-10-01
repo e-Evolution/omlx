@@ -848,10 +848,16 @@ class EngineCore:
             pending_aborts = set(
                 getattr(sched_for_filter, "_pending_abort_ids", None) or ()
             )
+        # A parked request holds no live memory: aborting it for memory
+        # pressure frees nothing and throws away its committed prefix. An
+        # explicit reason (unload, shutdown) still aborts everything.
+        is_parked = getattr(sched_for_filter, "is_request_parked", None)
         request_ids = [
             rid
             for rid in self._output_collectors
-            if rid not in self._finished_at and rid not in pending_aborts
+            if rid not in self._finished_at
+            and rid not in pending_aborts
+            and not (reason is None and callable(is_parked) and is_parked(rid) is True)
         ]
         ceiling = 0
         watermark = 0
