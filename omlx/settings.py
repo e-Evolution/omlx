@@ -341,6 +341,10 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Commit completed prefill blocks to the prefix cache every N blocks while a
+    # prompt is still prefilling, so an aborted or re-issued request resumes from
+    # the last committed block instead of token zero. 0 disables it.
+    prefill_progress_commit_blocks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -361,12 +365,16 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        commit_blocks = data.get("prefill_progress_commit_blocks", 0)
+        if not isinstance(commit_blocks, int) or commit_blocks < 0:
+            commit_blocks = 0
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            prefill_progress_commit_blocks=commit_blocks,
         )
 
 
@@ -1226,6 +1234,14 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_EMBEDDING_BATCH_SIZE value: {embedding_batch_size}"
                 )
+        if commit_blocks := os.getenv("OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS"):
+            try:
+                self.scheduler.prefill_progress_commit_blocks = int(commit_blocks)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS value: "
+                    f"{commit_blocks}"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1731,6 +1747,11 @@ class GlobalSettings:
                 f"Invalid embedding_batch_size: "
                 f"{self.scheduler.embedding_batch_size} (must be > 0)"
             )
+        if self.scheduler.prefill_progress_commit_blocks < 0:
+            errors.append(
+                f"Invalid prefill_progress_commit_blocks: "
+                f"{self.scheduler.prefill_progress_commit_blocks} (must be >= 0)"
+            )
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -1896,6 +1917,9 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            prefill_progress_commit_blocks=(
+                self.scheduler.prefill_progress_commit_blocks
+            ),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
