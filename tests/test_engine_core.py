@@ -1281,10 +1281,10 @@ class TestEngineCoreAbortAllRequests:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_abort_all_requests_leaves_parked_requests_alone(
+    async def test_abort_all_requests_spares_parked_only_when_asked(
         self, mock_model, mock_tokenizer
     ):
-        """A parked request holds no memory; a pressure abort must keep it."""
+        """Only the keep-loaded caller may spare parked requests, explicitly."""
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
@@ -1295,12 +1295,43 @@ class TestEngineCoreAbortAllRequests:
                 live_id = await engine.add_request(prompt="World")
                 engine.scheduler.requests[parked_id].parked = True
 
-                assert await engine.abort_all_requests() == 1
+                assert await engine.abort_all_requests(spare_parked=True) == 1
                 assert engine._output_collectors[parked_id].get_nowait() is None
                 assert engine._output_collectors[live_id].get_nowait().finished
 
-                # An explicit reason (manual unload, shutdown) aborts it too.
-                assert await engine.abort_all_requests(reason="unloading") == 1
+                # No implicit default: unload, eviction, emergency and shutdown
+                # callers pass nothing (or a reason) and abort it too.
+                assert await engine.abort_all_requests() == 1
+                out = engine._output_collectors[parked_id].get_nowait()
+                assert out.finished and out.error
+            finally:
+                await engine.stop()
+                engine.close()
+
+    @pytest.mark.asyncio
+    async def test_abort_all_requests_with_reason_aborts_parked(
+        self, mock_model, mock_tokenizer
+    ):
+        """An unload reason aborts parked requests with the unload error."""
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            try:
+                await engine.start()
+                engine.scheduler.has_requests = lambda: False
+                parked_id = await engine.add_request(prompt="Hello")
+                engine.scheduler.requests[parked_id].parked = True
+
+                assert (
+                    await engine.abort_all_requests(
+                        reason="unloading", error_code="model_unloading"
+                    )
+                    == 1
+                )
+                out = engine._output_collectors[parked_id].get_nowait()
+                assert out.finished and out.error == "unloading"
+                assert out.error_code == "model_unloading"
+                assert parked_id in engine.scheduler._pending_abort_ids
             finally:
                 await engine.stop()
                 engine.close()

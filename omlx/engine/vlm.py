@@ -5957,6 +5957,7 @@ class VLMBatchedEngine(BaseEngine):
         *,
         reason: str | None = None,
         error_code: str | None = None,
+        spare_parked: bool = False,
     ) -> int:
         """Abort all active requests."""
         if self.is_diffusion_model:
@@ -5968,5 +5969,6 @@ class VLMBatchedEngine(BaseEngine):
             return await self._engine.engine.abort_all_requests(
                 reason=reason,
                 error_code=error_code,
+                spare_parked=spare_parked,
             )
         return 0
