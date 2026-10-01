@@ -3126,6 +3126,118 @@ class TestPublicCeilingBreakdown:
         }
 
 
+class _ParkedOnlyEngine:
+    """Engine whose only work is a parked request (owns a collector)."""
+
+    def __init__(self):
+        # A scheduler with no park/reclaim API: the enforcer goes straight to
+        # its abort/evict paths instead of deferring.
+        self._engine = SimpleNamespace(
+            engine=SimpleNamespace(scheduler=SimpleNamespace())
+        )
+        self.parked = ["parked-1"]
+        self.aborted = []
+        self.calls = []
+
+    def has_active_requests(self):
+        return bool(self.parked)
+
+    async def abort_all_requests(self, *, spare_parked=False):
+        self.calls.append(spare_parked)
+        if spare_parked:
+            return 0
+        n = len(self.parked)
+        self.aborted.extend(self.parked)
+        self.parked.clear()
+        return n
+
+
+class TestParkedRequestsOnUnloadPaths:
+    """Parked requests are spared only where the model stays loaded."""
+
+    @pytest.mark.asyncio
+    async def test_idle_lru_eviction_aborts_parked_then_unloads(self, enforcer):
+        engine = _ParkedOnlyEngine()
+        entry = _make_entry("idle-model", engine=engine)
+        other = _make_entry("other", engine=MagicMock())
+        enforcer._engine_pool._entries = {"idle-model": entry, "other": other}
+        enforcer._engine_pool._find_lru_victim.return_value = "idle-model"
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=_cycling([15 * 1024**3, 15 * 1024**3, 8 * 1024**3]),
+        ):
+            await enforcer._check_and_enforce()
+
+        assert engine.calls == [False]
+        assert engine.aborted == ["parked-1"]
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("idle-model")
+
+    @pytest.mark.asyncio
+    async def test_emergency_busy_victim_aborts_parked_and_unload_completes(
+        self, enforcer
+    ):
+        engine = _ParkedOnlyEngine()
+        entry = _make_entry("big-model", engine=engine)
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=_cycling([13 * 1024**3, 13 * 1024**3]),
+        ):
+            await enforcer._check_and_enforce()
+
+        assert engine.calls == [False]
+        assert engine.aborted == ["parked-1"]
+        # Nothing keeps the engine busy: the pending unload drained at once.
+        enforcer._engine_pool._unload_engine.assert_awaited_once_with("big-model")
+        assert entry.pending_unload_reason is None
+
+    @pytest.mark.asyncio
+    async def test_keep_loaded_hard_path_spares_parked(self, enforcer):
+        engine = _ParkedOnlyEngine()
+        entry = _make_entry("big-model", engine=engine)
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch.object(
+            enforcer,
+            "_current_usage_bytes",
+            side_effect=_cycling([11 * 1024**3, 11 * 1024**3]),
+        ):
+            await enforcer._check_and_enforce()
+
+        assert engine.calls == [True]
+        assert engine.parked == ["parked-1"]
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+        assert entry.pending_unload_reason is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_abort_of_loaded_models_aborts_parked(self, enforcer):
+        engine = _ParkedOnlyEngine()
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        assert await enforcer._abort_loaded_requests_for_memory_emergency() == 1
+        assert engine.calls == [False]
+        assert engine.parked == []
+
+    @pytest.mark.asyncio
+    async def test_engines_without_parking_keep_the_no_argument_hook(self, enforcer):
+        class Legacy:
+            async def abort_all_requests(self):
+                return 2
+
+        assert await enforcer._abort_all_requests(Legacy(), spare_parked=True) == 2
+
+
 class TestPressureReclaimGrace:
     """Reclaim-first grace gives pooled Metal buffers a bounded chance to
     drain before destructive hot-cache shrinking or request aborts."""

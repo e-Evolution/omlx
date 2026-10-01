@@ -827,6 +827,7 @@ class EngineCore:
         *,
         reason: str | None = None,
         error_code: str | None = None,
+        spare_parked: bool = False,
     ) -> int:
         """Abort all active requests without stopping the engine.
 
@@ -834,6 +835,12 @@ class EngineCore:
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate). Without an explicit reason,
         preserve the memory-pressure error used by the process enforcer.
+
+        Parked requests (memory-pressure park) are aborted too unless the
+        caller passes ``spare_parked=True``. Only a caller that keeps the
+        model loaded and lets the scheduler resume them may spare them;
+        every unload, eviction, emergency or shutdown path must abort them,
+        or they are orphaned (or block the unload from ever draining).
         """
         from .utils.proc_memory import get_phys_footprint
 
@@ -852,15 +859,15 @@ class EngineCore:
                 getattr(sched_for_filter, "_pending_abort_ids", None) or ()
             )
         # A parked request holds no live memory: aborting it for memory
-        # pressure frees nothing and throws away its committed prefix. An
-        # explicit reason (unload, shutdown) still aborts everything.
+        # pressure frees nothing and throws away its committed prefix. Only
+        # an explicit ``spare_parked`` keeps it (keep-loaded hard path).
         is_parked = getattr(sched_for_filter, "is_request_parked", None)
         request_ids = [
             rid
             for rid in self._output_collectors
             if rid not in self._finished_at
             and rid not in pending_aborts
-            and not (reason is None and callable(is_parked) and is_parked(rid) is True)
+            and not (spare_parked and callable(is_parked) and is_parked(rid) is True)
         ]
         ceiling = 0
         watermark = 0
@@ -1480,12 +1487,15 @@ class AsyncEngineCore:
         *,
         reason: str | None = None,
         error_code: str | None = None,
+        spare_parked: bool = False,
     ) -> int:
         """Abort all active requests without stopping the engine."""
         engine = getattr(self, "engine", None)
         if engine is None:
             return 0
-        return await engine.abort_all_requests(reason=reason, error_code=error_code)
+        return await engine.abort_all_requests(
+            reason=reason, error_code=error_code, spare_parked=spare_parked
+        )
 
     async def stream_outputs(
         self,
