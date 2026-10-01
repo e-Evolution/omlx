@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import queue
 import threading
 import time
 from array import array
@@ -1341,6 +1342,49 @@ PREFILL_COMMIT_SHUTDOWN_WAIT_S = 30.0
 # A teardown deferred behind a commit that has not finished after this long
 # is logged once; it stays pending and is dropped at shutdown.
 PREFILL_COMMIT_STUCK_LOG_S = 60.0
+# Extra bounded wait at shutdown for a commit worker that is inside a store
+# call after the cancel flag is set. Past it the stores are left unclosed.
+PREFILL_COMMIT_CANCEL_WAIT_S = 10.0
+
+
+class _DaemonCommitExecutor:
+    """Single daemon worker thread with the ``submit``/``shutdown`` surface.
+
+    ``ThreadPoolExecutor`` workers are non-daemon and joined at interpreter
+    exit, so a commit stuck in a store call would hang process exit. This
+    worker is a daemon: an abandoned commit cannot block exit, and shutdown
+    only waits for it through the cancel flag and the store lock.
+    """
+
+    def __init__(self, thread_name_prefix: str = "omlx-prefill-commit") -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._run, name=f"{thread_name_prefix}_0", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, fn, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as e:  # noqa: BLE001 - delivered via the future
+                future.set_exception(e)
+
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any):
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self._queue.put((future, fn, args, kwargs))
+        return future
+
+    def shutdown(self, wait: bool = False) -> None:
+        self._queue.put(None)
+        if wait:
+            self._thread.join()
 
 
 def _prefill_commit_blocks(config: Any) -> int:
@@ -2233,9 +2277,11 @@ class Scheduler:
         self._prefill_commits: dict[str, tuple[concurrent.futures.Future, int]] = {}
         # Own single-thread executor so commits never queue behind the
         # post-finish final stores (28GB+ memcpys) on _store_cache_executor.
-        self._prefill_commit_executor: concurrent.futures.ThreadPoolExecutor | None = (
-            None
-        )
+        self._prefill_commit_executor: _DaemonCommitExecutor | None = None
+        # Shutdown sets the flag; the worker checks it under the lock before
+        # each store call, and shutdown takes the lock to know none is active.
+        self._commit_cancelled = threading.Event()
+        self._commit_store_lock = threading.Lock()
         # request_id -> destructive teardown steps (release block table,
         # retire snapshots, ...) postponed until that request's in-flight
         # commit has finished. Touched on the scheduler thread only.
@@ -7739,14 +7785,10 @@ class Scheduler:
             self._apply_turboquant_kv_convert(window)
         return window
 
-    def _ensure_prefill_commit_executor(
-        self,
-    ) -> concurrent.futures.ThreadPoolExecutor:
+    def _ensure_prefill_commit_executor(self) -> _DaemonCommitExecutor:
         executor = self._prefill_commit_executor
         if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="omlx-prefill-commit"
-            )
+            executor = _DaemonCommitExecutor("omlx-prefill-commit")
             self._prefill_commit_executor = executor
         return executor
 
@@ -7782,6 +7824,9 @@ class Scheduler:
             ok = False
         if ok:
             self._retire_committed_markers(request_id, committed_tokens)
+        # Draining is part of completion, not of whoever reaps: every path
+        # (step, finish, next commit) leaves no teardown without its commit.
+        self._run_deferred_teardowns(request_id)
 
     def _inflight_commit_future(
         self, request_id: str
@@ -7836,8 +7881,12 @@ class Scheduler:
         """
         for request_id in list(self._prefill_commits):
             self._reap_prefill_commit(request_id)
-            if request_id not in self._prefill_commits:
-                self._run_deferred_teardowns(request_id)
+        # Safety net: a deferred teardown whose commit is no longer tracked
+        # would pin has_requests() and its request id forever.
+        for request_id in [
+            rid for rid in self._deferred_teardowns if rid not in self._prefill_commits
+        ]:
+            self._run_deferred_teardowns(request_id)
         now = time.monotonic()
         for request_id, since in self._deferred_teardown_since.items():
             if (
@@ -7986,19 +8035,27 @@ class Scheduler:
         model_cache_config: Any | None,
         snapshots: Any | None,
     ) -> bool:
-        """Store a committed prefill window; True when the table covers it."""
-        self._async_store_cache_worker(
-            request_id,
-            tokens,
-            window_cache,
-            model_cache_config,
-            snapshots,
-            None,
-            None,
-            None,
-            True,
-            incremental_commit=True,
-        )
+        """Store a committed prefill window; True when the table covers it.
+
+        Cancellation is checked under ``_commit_store_lock`` before the store
+        call, the only step that touches the stores; shutdown takes that lock
+        to learn that no store call is active.
+        """
+        with self._commit_store_lock:
+            if self._commit_cancelled.is_set():
+                return False
+            self._async_store_cache_worker(
+                request_id,
+                tokens,
+                window_cache,
+                model_cache_config,
+                snapshots,
+                None,
+                None,
+                None,
+                True,
+                incremental_commit=True,
+            )
         table = self.paged_cache_manager.get_block_table(request_id)
         return bool(table is not None and table.num_tokens >= len(tokens))
 
@@ -12638,6 +12695,22 @@ class Scheduler:
     def _schedule_waiting(
         self,
     ) -> tuple[list["Request"], list[RequestOutput]]:
+        """Admit waiting requests; see ``_schedule_waiting_scan``.
+
+        Requests whose previous run of the same id is still being torn down
+        behind its prefill commit are set aside while the scan continues, so
+        one stuck commit never blocks the requests queued behind it; they
+        return to the front of the queue in their original order.
+        """
+        held: list[Request] = []
+        try:
+            return self._schedule_waiting_scan(held)
+        finally:
+            self.waiting.extendleft(reversed(held))
+
+    def _schedule_waiting_scan(
+        self, held: list["Request"]
+    ) -> tuple[list["Request"], list[RequestOutput]]:
         """
         Move requests from waiting queue to running.
 
@@ -12772,9 +12845,10 @@ class Scheduler:
                 break
             if self._teardown_pending(request.request_id):
                 # A previous run of this id is still being torn down behind
-                # its prefill commit; the head waits (no blocking) so the
-                # deferred cleanup cannot hit the new run's state.
-                break
+                # its prefill commit; only this request waits (no blocking)
+                # so the deferred cleanup cannot hit the new run's state.
+                held.append(self.waiting.popleft())
+                continue
 
             request = self.waiting.popleft()
             self._cache_freshness_waits.pop(request.request_id, None)
@@ -15272,22 +15346,40 @@ class Scheduler:
 
         logger.info("Deep reset completed - all caches cleared")
 
-    def _shutdown_prefill_commits(self) -> None:
-        """Finish or safely abandon prefill commits and their teardowns.
+    def _shutdown_prefill_commits(self) -> bool:
+        """Finish or cancel prefill commits and their teardowns.
+
+        Returns True when a commit worker is still inside a store call after
+        the bounded waits; the caller must then leave the stores unclosed.
 
         The bounded wait is acceptable here only. A commit that outlives it
-        is abandoned: its pending teardowns are dropped (the snapshot
-        directories are removed by ``cleanup_all`` and the process is going
-        away), and its executor is not joined.
+        is cancelled: the worker checks ``_commit_cancelled`` under
+        ``_commit_store_lock`` before its store call, so it bails out cleanly
+        unless it is already inside one. Shutdown then waits a further
+        ``PREFILL_COMMIT_CANCEL_WAIT_S`` on that lock. The worker is a daemon
+        thread, so an abandoned commit cannot block interpreter exit. Pending
+        teardowns are dropped (``cleanup_all`` removes the snapshot
+        directories and the process is going away).
         """
         executor = self._prefill_commit_executor
         stragglers = self._wait_for_prefill_commits(PREFILL_COMMIT_SHUTDOWN_WAIT_S)
+        store_busy = False
         if stragglers:
+            self._commit_cancelled.set()
+            if self._commit_store_lock.acquire(timeout=PREFILL_COMMIT_CANCEL_WAIT_S):
+                self._commit_store_lock.release()
+            else:
+                store_busy = True
             logger.warning(
-                "Abandoning %d prefill commit(s) still running at shutdown "
-                "(%d pending teardown(s) dropped)",
+                "Cancelled %d prefill commit(s) still running at shutdown "
+                "(%d pending teardown(s) dropped)%s",
                 stragglers,
                 len(self._deferred_teardowns),
+                (
+                    "; a commit is still inside a store call, stores stay open"
+                    if store_busy
+                    else ""
+                ),
             )
         elif executor is not None:
             try:
@@ -15301,6 +15393,7 @@ class Scheduler:
         if executor is not None:
             executor.shutdown(wait=False)
         self._prefill_commit_executor = None
+        return store_busy
 
     def _store_persistence_progress(self):
         manager = self.paged_ssd_cache_manager
@@ -15324,7 +15417,7 @@ class Scheduler:
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
         # below before the executor is asked to shut down.
-        self._shutdown_prefill_commits()
+        commit_store_busy = self._shutdown_prefill_commits()
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
@@ -15393,7 +15486,7 @@ class Scheduler:
             self._inflight_store_info.clear()
             self._cache_freshness_waits.clear()
             self._prefix_cache_prepared.clear()
-        if self._boundary_snapshot_store is not None:
+        if self._boundary_snapshot_store is not None and not commit_store_busy:
             try:
                 self._boundary_snapshot_store.cleanup_all()
             except Exception as e:
@@ -15406,7 +15499,12 @@ class Scheduler:
         self._close_specprefill_draft_cache_manager()
         self._draft_prefix_cache = None
         self._specprefill_draft_model = None
-        if self.paged_ssd_cache_manager is not None:
+        if self.paged_ssd_cache_manager is not None and commit_store_busy:
+            logger.error(
+                "Leaving the paged SSD cache open: a prefill commit worker is "
+                "still inside a store call"
+            )
+        elif self.paged_ssd_cache_manager is not None:
             if teardown is not None:
                 teardown.set_phase(
                     "primary_ssd", self.paged_ssd_cache_manager.persistence_progress

@@ -114,7 +114,9 @@ class _Rig:
         done = False
         for _ in range(chunks):
             done = self.scheduler._step_prefill_chunk(state)
-        self.drain()
+            # A commit still in flight makes the next chunk skip its own, so
+            # settle each one: the commit cadence stays deterministic.
+            self.drain()
         return done
 
     def drain(self):
@@ -910,3 +912,280 @@ def test_shutdown_abandons_a_commit_that_never_completes(
     assert not scheduler._deferred_teardowns
     # The snapshot directory is gone even though the commit never finished.
     assert not any((tmp_path / "cache").rglob("*r1*"))
+
+
+# --- Reaping, admission, shutdown, reset barrier -------------------------------
+
+
+def _orphans(scheduler):
+    """Deferred teardowns with neither a tracked commit nor a completion to run on."""
+    return [
+        rid
+        for rid in scheduler._deferred_teardowns
+        if rid not in scheduler._prefill_commits
+    ]
+
+
+def test_teardowns_drain_when_another_path_reaps_the_commit_first(
+    tmp_path, mock_tokenizer, gated
+):
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    try:
+        scheduler = rig.scheduler
+        _inflight_commit(rig, gate)
+        _returns_promptly(scheduler._do_abort_request, "r1")
+        assert scheduler._teardown_pending("r1")
+        gate.release.set()
+        scheduler._prefill_commits["r1"][0].result(timeout=20)
+
+        # _cleanup_finished-style reap, before _process_finished_commits runs.
+        assert scheduler._inflight_commit_future("r1") is None
+
+        assert _orphans(scheduler) == []
+        assert not scheduler._teardown_pending("r1")
+        assert "r1" not in scheduler._boundary_cache_snapshots
+        assert not scheduler._deferred_teardowns  # has_requests() is not pinned
+    finally:
+        gate.release.set()
+        rig.close()
+
+
+def test_orphaned_deferred_teardowns_are_swept_at_the_next_step(
+    tmp_path, mock_tokenizer
+):
+    rig = _Rig(tmp_path, mock_tokenizer, split=False, commit_blocks=2)
+    try:
+        scheduler = rig.scheduler
+        ran = []
+        scheduler._deferred_teardowns["ghost"] = [lambda: ran.append("ghost")]
+        scheduler._deferred_teardown_since["ghost"] = time.monotonic()
+
+        scheduler._process_finished_commits()
+
+        assert ran == ["ghost"]
+        assert _orphans(scheduler) == []
+        assert not scheduler._teardown_pending("ghost")
+    finally:
+        rig.close()
+
+
+def test_unrelated_request_is_admitted_behind_a_held_head(
+    tmp_path, mock_tokenizer, gated
+):
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    try:
+        scheduler = rig.scheduler
+        request, state = rig.start("r1", PROMPT)
+        for _ in range(2):
+            scheduler._step_prefill_chunk(state)
+        assert gate.entered.wait(20)
+        _returns_promptly(scheduler._drop_boundary_snapshots_for_request, "r1")
+        other = Request(
+            request_id="r2",
+            prompt=list(range(40, 57)),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        third = Request(
+            request_id="r3",
+            prompt=list(range(60, 77)),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        scheduler.add_request(other)
+        scheduler.add_request(third)
+        scheduler.waiting.clear()
+        scheduler.waiting.extend([request, other, third])
+
+        scheduled, _ = scheduler._schedule_waiting()
+
+        assert [r.request_id for r in scheduled] + [
+            r.request_id for r in scheduler.prefilling
+        ] != []
+        queued = [r.request_id for r in scheduler.waiting]
+        assert queued[0] == "r1"  # the held head keeps its place
+        assert "r2" not in queued  # the unrelated request got through
+    finally:
+        gate.release.set()
+        rig.close()
+
+
+class _BlockingStore:
+    """Replaces store_cache with a call that blocks until released."""
+
+    def __init__(self, rig, monkeypatch):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        real = rig.prefix.store_cache
+
+        def blocking(*args, **kwargs):
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(30)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(rig.prefix, "store_cache", blocking)
+
+
+def test_shutdown_cancels_a_commit_that_has_not_reached_the_store(
+    tmp_path, mock_tokenizer, gated, monkeypatch
+):
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "PREFILL_COMMIT_SHUTDOWN_WAIT_S", 0.2)
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    scheduler = rig.scheduler
+    _inflight_commit(rig, gate)
+    future, _ = scheduler._prefill_commits["r1"]
+    stores = []
+    real_store = rig.prefix.store_cache
+    monkeypatch.setattr(
+        rig.prefix,
+        "store_cache",
+        lambda *a, **k: (stores.append(1), real_store(*a, **k))[1],
+    )
+
+    started = time.monotonic()
+    scheduler.shutdown()
+    assert time.monotonic() - started < 10
+
+    gate.release.set()
+    assert future.result(timeout=10) is False  # bailed out, no store attempted
+    assert stores == []
+
+
+def test_shutdown_does_not_close_the_stores_under_an_active_store_call(
+    tmp_path, mock_tokenizer, monkeypatch
+):
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "PREFILL_COMMIT_SHUTDOWN_WAIT_S", 0.2)
+    monkeypatch.setattr(scheduler_module, "PREFILL_COMMIT_CANCEL_WAIT_S", 0.3)
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    blocking = _BlockingStore(rig, monkeypatch)
+    scheduler = rig.scheduler
+    closed = []
+    real_ssd_close = rig.ssd.close
+    real_boundary_shutdown = rig.boundary.shutdown
+    monkeypatch.setattr(
+        rig.ssd,
+        "close",
+        lambda *a, **k: (closed.append("ssd"), real_ssd_close(*a, **k)),
+    )
+    monkeypatch.setattr(
+        rig.boundary,
+        "shutdown",
+        lambda *a, **k: (closed.append("boundary"), real_boundary_shutdown(*a, **k)),
+    )
+    try:
+        _, state = rig.start("r1", PROMPT)
+        for _ in range(2):
+            scheduler._step_prefill_chunk(state)
+        assert blocking.entered.wait(20)
+
+        started = time.monotonic()
+        scheduler.shutdown()
+        assert time.monotonic() - started < 10  # bounded
+        assert closed == []  # worker is still inside the store call
+    finally:
+        blocking.release.set()
+        time.sleep(0.2)
+        real_ssd_close()
+        real_boundary_shutdown()
+
+
+def test_commit_executor_threads_cannot_block_interpreter_exit(
+    tmp_path, mock_tokenizer
+):
+    rig = _Rig(tmp_path, mock_tokenizer, split=False, commit_blocks=2)
+    try:
+        executor = rig.scheduler._ensure_prefill_commit_executor()
+        seen = executor.submit(lambda: threading.current_thread()).result(timeout=10)
+        assert seen.daemon
+        assert seen.name.startswith("omlx-prefill-commit")
+    finally:
+        rig.close()
+
+
+def test_reset_runs_deferred_teardowns_before_clearing_state(
+    tmp_path, mock_tokenizer, gated, monkeypatch
+):
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "FATAL_TEARDOWN_TIMEOUT_S", 10.0)
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    scheduler = rig.scheduler
+    try:
+        _inflight_commit(rig, gate)
+        _returns_promptly(scheduler._do_abort_request, "r1")
+        events = []
+        real_cleanup = rig.boundary.cleanup_request
+        real_clear = rig.prefix.clear
+        monkeypatch.setattr(
+            rig.boundary,
+            "cleanup_request",
+            lambda rid: (events.append("teardown"), real_cleanup(rid))[1],
+        )
+        monkeypatch.setattr(
+            rig.prefix, "clear", lambda: (events.append("clear"), real_clear())[1]
+        )
+        threading.Timer(0.3, gate.release.set).start()
+
+        scheduler.reset()
+
+        assert events[:2] == ["teardown", "clear"]
+        assert not scheduler._deferred_teardowns
+        assert not scheduler._prefill_commits
+    finally:
+        gate.release.set()
+        rig.close()
+
+
+def test_reset_is_fatal_when_a_commit_outlives_the_barrier(
+    tmp_path, mock_tokenizer, gated, monkeypatch
+):
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "FATAL_TEARDOWN_TIMEOUT_S", 0.2)
+    fatal = []
+    monkeypatch.setattr(scheduler_module, "fatal_exit", lambda msg: fatal.append(msg))
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    scheduler = rig.scheduler
+    try:
+        _inflight_commit(rig, gate)
+        scheduler.reset()
+        assert len(fatal) == 1
+        assert "prefill commit" in fatal[0]
+        assert "r1" in scheduler._prefill_commits  # nothing was cleared
+    finally:
+        gate.release.set()
+        rig.close()
+
+
+def test_stuck_teardown_warning_is_logged_once(
+    tmp_path, mock_tokenizer, gated, monkeypatch, caplog
+):
+    import logging
+
+    import omlx.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "PREFILL_COMMIT_STUCK_LOG_S", 0.0)
+    rig = _Rig(tmp_path, mock_tokenizer, split=True, commit_blocks=2)
+    gate = gated(rig)
+    scheduler = rig.scheduler
+    try:
+        _inflight_commit(rig, gate)
+        _returns_promptly(scheduler._do_abort_request, "r1")
+        with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+            for _ in range(3):
+                scheduler._process_finished_commits()
+        stuck = [r for r in caplog.records if "still waits" in r.getMessage()]
+        assert len(stuck) == 1
+        assert "r1" in stuck[0].getMessage()
+    finally:
+        gate.release.set()
+        rig.close()
