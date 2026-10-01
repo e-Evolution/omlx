@@ -468,6 +468,9 @@ class ProcessMemoryEnforcer:
         # prefill chunk / step boundary. See the grace check in
         # _check_and_enforce.
         self._pressure_reclaim_grace_polls: int = 0
+        # Consecutive hard-pressure polls whose abort was deferred in favor of
+        # parking a prefill victim. See _request_scheduler_park.
+        self._park_deferred_polls: int = 0
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1271,6 +1274,10 @@ class ProcessMemoryEnforcer:
     # while a reclaimable pool drains. Prefill chunks run ~5s at full step
     # size, so 5 one-second polls cover at least one chunk boundary.
     _PRESSURE_RECLAIM_GRACE_POLLS_MAX = 5
+    # Max consecutive hard-pressure polls the abort is deferred because a
+    # scheduler reports a prefill victim to park (or one just parked). Bounds
+    # the deferral if the scheduler never gets to act on the request.
+    _PARK_DEFER_POLLS_MAX = 30
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1320,6 +1327,45 @@ class ProcessMemoryEnforcer:
                 _format_gb(pool_bytes),
             )
         return requested
+
+    def _request_scheduler_park(self) -> int:
+        """Ask each scheduler to park one prefill victim instead of aborting.
+
+        Sets a GIL-atomic flag on the scheduler; the park itself runs on the
+        inference thread at the next step boundary, so the enforcer never
+        touches request or Metal state. A scheduler answers ``True`` only when
+        a victim is parkable or a park is still settling; any other answer
+        (park disabled, nothing parkable, no API) leaves the legacy abort in
+        place. Returns the number of schedulers that accepted.
+        """
+        accepted = 0
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            request = getattr(scheduler, "request_park_prefill", None)
+            if not callable(request):
+                continue
+            try:
+                if request() is True:
+                    accepted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Prefill park request failed: %s", exc)
+        return accepted
+
+    def _note_pressure_poll(self, level: str) -> None:
+        """Report this poll's pressure level to every scheduler.
+
+        Schedulers count consecutive ``ok`` polls to decide when parked
+        requests may resume (hysteresis). Called once per enforcement tick.
+        """
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            note = getattr(scheduler, "note_pressure_poll", None)
+            if not callable(note):
+                continue
+            try:
+                note(level)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Pressure poll report failed: %s", exc)
 
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
@@ -1692,6 +1738,8 @@ class ProcessMemoryEnforcer:
             self._pressure_level = "ok"
             self._over_ceiling_polls = 0
             self._pressure_reclaim_grace_polls = 0
+            self._park_deferred_polls = 0
+            self._note_pressure_poll("ok")
             return
 
         current = self._current_usage_bytes()
@@ -1716,6 +1764,10 @@ class ProcessMemoryEnforcer:
             new_level = "soft"
         else:
             new_level = "hard"
+
+        self._note_pressure_poll(new_level)
+        if new_level != "hard":
+            self._park_deferred_polls = 0
 
         if new_level == "ok":
             # The pressure episode ended (drain worked or the load finished):
@@ -1801,6 +1853,28 @@ class ProcessMemoryEnforcer:
             # max_num_seqs while pressure stays low (#1383).
             self._walk_store_cache_caps()
             return
+
+        # Park before abort: a scheduler with a parkable prefill victim pauses
+        # it (work already done survives in the prefix cache) and the abort
+        # below only runs when nothing is left to park, the deferral budget is
+        # spent, or pressure is an emergency (beyond the real ceiling).
+        if (
+            new_level == "hard"
+            and not emergency
+            and self._park_deferred_polls < self._PARK_DEFER_POLLS_MAX
+        ):
+            parked_on = self._request_scheduler_park()
+            if parked_on:
+                self._park_deferred_polls += 1
+                logger.info(
+                    "Hard memory pressure: parking a prefill victim on %d "
+                    "scheduler(s) instead of aborting (poll %d/%d)",
+                    parked_on,
+                    self._park_deferred_polls,
+                    self._PARK_DEFER_POLLS_MAX,
+                )
+                self._walk_store_cache_caps()
+                return
 
         # Recover below soft regardless of level — prevents oscillation
         # at the boundary.
