@@ -402,7 +402,7 @@ class TestSchedulerSettings:
         assert SchedulerSettings.from_dict({}).prefill_progress_commit_blocks == 0
         settings = SchedulerSettings.from_dict({"prefill_progress_commit_blocks": 4})
         assert settings.prefill_progress_commit_blocks == 4
-        for bad in ("many", None, -3):
+        for bad in ("many", None, -3, True, False):
             assert (
                 SchedulerSettings.from_dict(
                     {"prefill_progress_commit_blocks": bad}
