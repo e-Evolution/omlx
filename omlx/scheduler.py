@@ -1256,6 +1256,21 @@ PREFILL_COMMIT_CANCEL_WAIT_S = 10.0
 PREFILL_COMMIT_FINAL_STORE_WAIT_S = 120.0
 
 
+# Enforcer polls after a park during which the scheduler still reports "park
+# in progress", so the abort waits for the freed memory to return to the OS.
+PARK_SETTLE_POLLS = 3
+# A pressure monitor that has not reported for this long is considered gone;
+# parked requests then resume instead of waiting for polls that never come.
+PARK_SIGNAL_STALE_S = 60.0
+
+
+class _ParkPins(NamedTuple):
+    """Block refs and SSD hashes a parked request holds against eviction."""
+
+    block_ids: list[int]
+    hashes: list[bytes]
+
+
 class _DaemonCommitExecutor:
     """Single daemon worker thread with the ``submit``/``shutdown`` surface.
 
@@ -2158,6 +2173,19 @@ class Scheduler:
         # PREFILL_COMMIT_FINAL_STORE_WAIT_S. Added on the store worker (GIL-atomic
         # set.add), consumed by _drain_pending_async_removes on the scheduler thread.
         self._skipped_final_stores: set[str] = set()
+        # Memory-pressure park (see request_park_prefill). The flag and the
+        # poll counters are written by the enforcer thread (GIL-atomic) and
+        # consumed on the MLX thread.
+        self._park_requested: bool = False
+        self._park_settle_polls: int = 0
+        self._ok_polls: int = 0
+        self._last_pressure_poll_at: float | None = None
+        self._park_pins: dict[str, _ParkPins] = {}
+        self._park_stats: dict[str, int] = {
+            "parks": 0,
+            "resumes": 0,
+            "tokens_preserved": 0,
+        }
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -5408,6 +5436,10 @@ class Scheduler:
                     continue
                 if block_hash is not None:
                     hashes.add(bytes(block_hash))
+        # Parked requests hold no live table, but their pinned prefix must
+        # survive a hot-cache shrink too.
+        for pins in list(self._park_pins.values()):
+            hashes.update(pins.hashes)
         return hashes
 
     def _clear_memory_admission_blocker(self, request_id: str | None = None) -> None:
@@ -5493,6 +5525,11 @@ class Scheduler:
 
         request = self.waiting[0]
         request_id = request.request_id
+        if request.parked:
+            # Parked on purpose: it waits as long as pressure lasts; the
+            # client's own timeouts apply.
+            self._clear_memory_admission_blocker(request_id)
+            return None
         now = time.monotonic()
         if request_id != self._memory_admission_blocked_request_id:
             self._memory_admission_blocked_request_id = request_id
@@ -5558,6 +5595,9 @@ class Scheduler:
 
         request = self.waiting[0]
         request_id = request.request_id
+        if request.parked:
+            self._clear_store_cache_admission_blocker(request_id)
+            return None
         now = time.monotonic()
         if request_id != self._store_cache_admission_blocked_request_id:
             self._store_cache_admission_blocked_request_id = request_id
@@ -10405,6 +10445,9 @@ class Scheduler:
         otherwise be attached here; a client re-issue still resumes from them.
         Gated on the setting so the default behavior is unchanged.
         """
+        if getattr(request, "parked", False):
+            # A parked request resumes from its committed blocks by design.
+            return False
         retries = getattr(request, "prefill_oom_retries", 0)
         return (
             isinstance(retries, int)
@@ -11549,6 +11592,234 @@ class Scheduler:
         self._pending_abort_ids.discard(request.request_id)
         self._do_abort_request(request.request_id)
 
+    # ------------------------------------------------------------------
+    # Memory-pressure park: pause a prefilling request instead of aborting.
+    # ------------------------------------------------------------------
+
+    def _park_enabled(self) -> bool:
+        return getattr(self.config, "memory_pressure_park", False) is True
+
+    def note_pressure_poll(self, level: str) -> None:
+        """Record one enforcer poll (thread-safe; counters only).
+
+        Parked requests resume after ``park_resume_ok_polls`` consecutive
+        ``ok`` polls (hysteresis against flapping at the watermark).
+        """
+        self._last_pressure_poll_at = time.monotonic()
+        if level == "ok":
+            self._ok_polls += 1
+            self._park_settle_polls = 0
+        else:
+            self._ok_polls = 0
+
+    def _park_resume_allowed(self) -> bool:
+        """True once enough consecutive ok polls were seen (or no monitor runs)."""
+        seen = self._last_pressure_poll_at
+        if seen is None or time.monotonic() - seen > PARK_SIGNAL_STALE_S:
+            return True  # no live pressure monitor: never starve a parked request
+        need = getattr(self.config, "park_resume_ok_polls", 3)
+        return self._ok_polls >= max(1, need)
+
+    def is_request_parked(self, request_id: str) -> bool:
+        """Whether the request is currently parked (holds no live memory)."""
+        request = self.requests.get(request_id)
+        return bool(request is not None and request.parked)
+
+    def get_park_stats(self) -> dict[str, int]:
+        """Counters for the diagnostics/admin stats."""
+        stats = dict(self._park_stats)
+        stats["parked_now"] = sum(1 for r in list(self.waiting) if r.parked)
+        stats["pinned_requests"] = len(self._park_pins)
+        return stats
+
+    def _parkable_prefills(self) -> list[Request]:
+        """Chunked prefills that can be parked safely.
+
+        Only requests in the chunked-prefill loop qualify: their state lives
+        between steps. External-loop prefills (non-chunked, VLM) run to
+        completion inside one ``_schedule_waiting`` call and are never
+        between steps; VLM embeds and SpecPrefill patch model-wide state, so
+        they are excluded as well.
+        """
+        budget = getattr(self.config, "max_parks_per_request", 3)
+        return [
+            request
+            for request in list(self.prefilling)
+            if request.request_id in self._prefill_states
+            and request.park_count < budget
+            and request.specprefill_indices is None
+            and request.vlm_inputs_embeds is None
+        ]
+
+    def _select_park_victim(self) -> Request | None:
+        """Most recent arrival first; the oldest admitted request is protected.
+
+        The oldest request among everything admitted (prefilling or decoding)
+        is skipped while any other prefill is parkable. It is only parked
+        when it is the sole candidate, which still helps when the pressure
+        comes from outside this process.
+        """
+        candidates = self._parkable_prefills()
+        if not candidates:
+            return None
+        admitted = list(self.prefilling) + list(self.running.values())
+        oldest = min(admitted, key=lambda r: (r.arrival_time, r.request_id))
+        candidates.sort(key=lambda r: (r.arrival_time, r.request_id), reverse=True)
+        for request in candidates:
+            if request.request_id != oldest.request_id:
+                return request
+        return candidates[0]
+
+    def request_park_prefill(self) -> bool:
+        """Ask for a prefill victim to be parked (thread-safe, flag only).
+
+        Called by ProcessMemoryEnforcer on the asyncio thread at hard
+        pressure. Returns True when a victim is parkable, a park is pending,
+        or one just ran and its memory is still returning; the enforcer then
+        defers its abort. False (park disabled, nothing parkable, budget
+        spent) leaves the legacy abort in place.
+        """
+        if not self._park_enabled():
+            return False
+        if self._park_requested:
+            return True
+        try:
+            victim = self._select_park_victim()
+        except RuntimeError:  # queue mutated mid-read on the MLX thread
+            victim = True
+        if victim is not None:
+            self._park_requested = True
+            return True
+        if self._park_settle_polls > 0:
+            self._park_settle_polls -= 1
+            return True
+        return False
+
+    def _process_pending_park(self) -> bool:
+        """Park one victim if the enforcer asked (MLX thread, step start)."""
+        if not self._park_requested:
+            return False
+        self._park_requested = False
+        if not self._park_enabled():
+            return False
+        victim = self._select_park_victim()
+        if victim is None:
+            return False
+        self._park_prefill(victim, reason="hard memory pressure")
+        self._park_settle_polls = PARK_SETTLE_POLLS
+        return True
+
+    def _park_prefill(self, request: Request, reason: str) -> None:
+        """Pause a chunked prefill without an error and without blocking.
+
+        The request keeps its client stream, prompt, sampling params and
+        arrival time. Its live cache is dropped; blocks an incremental commit
+        stored stay in the prefix cache, pinned against eviction, and the
+        re-admission does a fresh prefix lookup that restores them. Teardown
+        steps run behind any in-flight commit through ``_after_commit``.
+        """
+        rid = request.request_id
+        table = (
+            self.paged_cache_manager.get_block_table(rid)
+            if self.paged_cache_manager is not None
+            else None
+        )
+        committed = table.num_tokens if table else 0
+        self._prefill_states.pop(rid, None)
+        self.prefilling = deque(r for r in self.prefilling if r.request_id != rid)
+        self._reset_request_for_reprefill(request)
+        request.parked = True
+        request.park_count += 1
+        self._clear_request_admission_bookkeeping(rid)
+        get_prefill_tracker().remove(rid)
+        # Order matters: pin first, then release the table's own refs.
+        self._after_commit(rid, lambda: self._pin_parked_blocks(rid))
+        self._release_paged_cache_for_request(rid)
+        self._drop_boundary_snapshots_for_request(rid)
+        self._enqueue_parked(request)
+        self._ok_polls = 0
+        self._park_stats["parks"] += 1
+        Scheduler._clear_cache(self)
+        budget = getattr(self.config, "max_parks_per_request", 3)
+        logger.info(
+            "Parked request %s at %d tokens committed (park %d/%d), reason: %s%s",
+            rid,
+            committed,
+            request.park_count,
+            budget,
+            reason,
+            ""
+            if _prefill_commit_blocks(self.config) > 0
+            else " (prefill_progress_commit_blocks is off: it will resume cold)",
+        )
+
+    def _enqueue_parked(self, request: Request) -> None:
+        """Queue a parked request in arrival order, ahead of unparked ones."""
+        key = (request.arrival_time, request.request_id)
+        index = 0
+        for queued in self.waiting:
+            if queued.parked and (queued.arrival_time, queued.request_id) <= key:
+                index += 1
+            else:
+                break
+        self.waiting.insert(index, request)
+
+    def _pin_parked_blocks(self, request_id: str) -> None:
+        """Hold the committed blocks of a parked request against eviction.
+
+        Takes one extra block ref per committed block (so the table's own
+        release leaves them referenced) and pins their hashes in the SSD
+        index, whose size enforcement skips them. Skipped when the request
+        was aborted or already resumed before this deferred step ran.
+        """
+        request = self.requests.get(request_id)
+        manager = self.paged_cache_manager
+        if request is None or not request.parked or manager is None:
+            return
+        table = manager.get_block_table(request_id)
+        if not table or not table.block_ids:
+            return
+        self._unpin_parked(request_id)
+        block_ids: list[int] = []
+        hashes: list[bytes] = []
+        for block_id in table.block_ids:
+            if not manager.increment_ref(block_id):
+                continue
+            block_ids.append(block_id)
+            block = manager.allocated_blocks.get(block_id)
+            block_hash = getattr(block, "block_hash", None)
+            if block_hash is not None:
+                hashes.append(bytes(block_hash))
+        if not block_ids:
+            return
+        self._park_pins[request_id] = _ParkPins(block_ids, hashes)
+        ssd = self.paged_ssd_cache_manager
+        if ssd is not None and hasattr(ssd, "pin_blocks"):
+            ssd.pin_blocks(hashes)
+
+    def _unpin_parked(self, request_id: str) -> None:
+        pins = self._park_pins.pop(request_id, None)
+        if pins is None:
+            return
+        if self.paged_cache_manager is not None:
+            self.paged_cache_manager.release_for_eviction(pins.block_ids)
+        ssd = self.paged_ssd_cache_manager
+        if ssd is not None and hasattr(ssd, "unpin_blocks"):
+            ssd.unpin_blocks(pins.hashes)
+
+    def _finish_park_resume(self, request: Request) -> None:
+        """Re-admission of a parked request: its fresh lookup holds the blocks."""
+        self._unpin_parked(request.request_id)
+        request.parked = False
+        self._park_settle_polls = 0
+        self._park_stats["resumes"] += 1
+        self._park_stats["tokens_preserved"] += request.cached_tokens or 0
+        logger.info(
+            "Resumed parked request %s: cached=%d",
+            request.request_id,
+            request.cached_tokens or 0,
+        )
+
     def request_idle_reclaim(self) -> None:
         """Enqueue a between-turn Metal reclaim (thread-safe, no Metal touch).
 
@@ -11660,6 +11931,7 @@ class Scheduler:
                 return False
 
         self._clear_request_admission_bookkeeping(request_id)
+        self._unpin_parked(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -11791,6 +12063,7 @@ class Scheduler:
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
+            or self._park_requested
         )
 
     def has_pending_route_preflight_cleanup(self) -> bool:
@@ -12503,6 +12776,12 @@ class Scheduler:
             # crosses soft_threshold. New prefills wait; in-flight requests
             # continue. First request always passes (no admitted work yet)
             # so admission can recover by completing the current generation.
+            # Parked requests sit at the front in arrival order and resume
+            # only after enough consecutive ok pressure polls; nothing newer
+            # overtakes them while they wait.
+            if self.waiting[0].parked and not self._park_resume_allowed():
+                break
+
             admitted = self._num_admitted_requests()
             if self._admission_paused and admitted:
                 logger.debug(
@@ -12635,6 +12914,8 @@ class Scheduler:
             # #2183/#2197 chunk-view and #2235 batch-KV-mutation fixes.
             with mx.stream(self._stream):
                 self._prepare_prefix_cache_for_request(request)
+            if request.parked:
+                self._finish_park_resume(request)
 
             # Determine tokens to process and cache to use
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
@@ -14609,6 +14890,11 @@ class Scheduler:
         if drained_async_removes:
             output.has_work = True
 
+        # Park a prefill victim requested by the memory enforcer. Runs before
+        # any chunk so a parked request never has a forward in flight.
+        if self._process_pending_park():
+            output.has_work = True
+
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
             self._check_memory_pressure()
@@ -14914,6 +15200,8 @@ class Scheduler:
         # Include cache stats
         if self.block_aware_cache is not None:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
+        if getattr(self.config, "memory_pressure_park", False) is True:
+            stats["park"] = self.get_park_stats()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -14986,6 +15274,10 @@ class Scheduler:
         self._deferred_teardown_since.clear()
         self._stuck_teardown_logged.clear()
         self._skipped_final_stores.clear()
+        for parked_id in list(self._park_pins):
+            self._unpin_parked(parked_id)
+        self._park_requested = False
+        self._park_settle_polls = 0
         self._prefill_commits.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()
@@ -15137,6 +15429,8 @@ class Scheduler:
         # no step-thread caller to wake here. Inflight futures are drained
         # below before the executor is asked to shut down.
         commit_store_busy = self._shutdown_prefill_commits()
+        for parked_id in list(self._park_pins):
+            self._unpin_parked(parked_id)
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().

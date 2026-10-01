@@ -52,7 +52,16 @@ def _tiny_hybrid_model():
 class _Rig:
     """A scheduler wired to real stores, plus helpers to drive prefill."""
 
-    def __init__(self, tmp_path, tokenizer, *, split, commit_blocks, tq_bits=None):
+    def __init__(
+        self,
+        tmp_path,
+        tokenizer,
+        *,
+        split,
+        commit_blocks,
+        tq_bits=None,
+        **config_overrides,
+    ):
         mx.random.seed(11)
         self.model = _tiny_hybrid_model()
         self.scheduler = Scheduler(
@@ -64,6 +73,7 @@ class _Rig:
                 chunked_prefill=True,
                 prefill_step_size=BLOCK,
                 prefill_progress_commit_blocks=commit_blocks,
+                **config_overrides,
             ),
         )
         self.paged = PagedCacheManager(

@@ -30,6 +30,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1750,6 +1751,11 @@ class PagedSSDCacheManager(CacheManager):
         # promoted into the raw-byte hot cache.  They still consume the same
         # shared SSD budget as the two main block indexes.
         self._gdn_sidecar_index = GDNCheckpointIndex(max_size_bytes)
+        # Block hashes held by parked requests: size enforcement skips them
+        # (and their GDN sidecars) so a parked prefix survives until resume.
+        # Refcounted so overlapping prompts can pin the same block.
+        self._pinned_hashes: dict[bytes, int] = {}
+        self._pin_lock = threading.Lock()
         self._hot_cache_only = hot_cache_only
         self._expected_model_name = expected_model_name
         self._expected_num_layers = expected_num_layers
@@ -4771,6 +4777,33 @@ class PagedSSDCacheManager(CacheManager):
             disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
             return min(self._max_size, disk_limit)
 
+    def pin_blocks(self, block_hashes: Iterable[bytes]) -> None:
+        """Protect blocks (and their GDN sidecars) from size-based eviction."""
+        with self._pin_lock:
+            for block_hash in block_hashes:
+                key = bytes(block_hash)
+                self._pinned_hashes[key] = self._pinned_hashes.get(key, 0) + 1
+
+    def unpin_blocks(self, block_hashes: Iterable[bytes]) -> None:
+        """Release one pin per hash taken by :meth:`pin_blocks`."""
+        with self._pin_lock:
+            for block_hash in block_hashes:
+                key = bytes(block_hash)
+                remaining = self._pinned_hashes.get(key, 0) - 1
+                if remaining > 0:
+                    self._pinned_hashes[key] = remaining
+                else:
+                    self._pinned_hashes.pop(key, None)
+
+    @property
+    def pinned_block_count(self) -> int:
+        with self._pin_lock:
+            return len(self._pinned_hashes)
+
+    def _pinned_snapshot(self) -> frozenset[bytes]:
+        with self._pin_lock:
+            return frozenset(self._pinned_hashes)
+
     def _evict_tracked_until_size(
         self,
         target_size: int,
@@ -4785,14 +4818,29 @@ class PagedSSDCacheManager(CacheManager):
         avoiding a second, competing budget for GDN history.
         """
         evicted: list[tuple[Any, Any]] = []
+        pinned = self._pinned_snapshot()
+        # Look past pinned entries so one parked prefix never blocks the walk.
+        depth = 1 + len(pinned)
+
+        def oldest_unpinned(entries: list[Any], hash_attr: str) -> list[Any]:
+            for entry in entries:
+                if getattr(entry, hash_attr) not in pinned:
+                    return [entry]
+            return []
 
         while self._tracked_ssd_size() > target_size:
             if max_count is not None and len(evicted) >= max_count:
                 break
 
-            compatible = self._index.get_lru_entries(1)
-            incompatible = self._incompatible_index.get_lru_entries(1)
-            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+            compatible = oldest_unpinned(
+                self._index.get_lru_entries(depth), "block_hash"
+            )
+            incompatible = oldest_unpinned(
+                self._incompatible_index.get_lru_entries(depth), "block_hash"
+            )
+            sidecars = oldest_unpinned(
+                self._gdn_sidecar_index.get_lru_entries(depth), "source_block_hash"
+            )
             candidates: list[tuple[float, int, Any, Any]] = []
             if compatible:
                 candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
