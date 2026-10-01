@@ -3253,3 +3253,113 @@ async def test_image_cache_reclaim_remeasures_retained_request_memory(mock_engin
         assert active_image.getpixel((0, 0)) == (0, 0, 255)
     finally:
         images.clear_image_decode_cache()
+
+
+class TestPrefillParkRequest:
+    """Hard pressure asks the scheduler to park a prefill victim before it
+    falls back to the legacy abort. Park off (the scheduler answers False or
+    has no park API) keeps the abort exactly as before."""
+
+    @pytest.fixture
+    def enforcer(self, mock_engine_pool):
+        # Two watermarks: hard (95 GB) sits below the 100 GB ceiling, so
+        # repeated hard polls are not escalated to emergency pressure.
+        return _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.85,
+            hard_threshold=0.95,
+        )
+
+    def _setup(self, enforcer, park_answer):
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=1)
+        scheduler = SimpleNamespace(
+            request_park_prefill=MagicMock(return_value=park_answer),
+            note_pressure_poll=MagicMock(),
+            adjust_store_cache_cap=MagicMock(),
+        )
+        engine.scheduler = scheduler
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        return engine, scheduler
+
+    async def _tick(self, enforcer, usage=96 * 1024**3):
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = usage
+            mock_mx.get_cache_memory.return_value = 0
+            await enforcer._check_and_enforce()
+
+    @pytest.mark.asyncio
+    async def test_park_disabled_still_aborts_as_before(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=False)
+        await self._tick(enforcer)
+        scheduler.request_park_prefill.assert_called_once()
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_scheduler_without_park_api_aborts_as_before(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=False)
+        del scheduler.request_park_prefill
+        await self._tick(enforcer)
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_parkable_victim_defers_the_abort(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=True)
+        await self._tick(enforcer)
+        scheduler.request_park_prefill.assert_called_once()
+        engine.abort_all_requests.assert_not_awaited()
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_abort_after_nothing_is_left_to_park(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=True)
+        await self._tick(enforcer)
+        engine.abort_all_requests.assert_not_awaited()
+        scheduler.request_park_prefill.return_value = False
+        await self._tick(enforcer)
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_scheduler_that_never_parks_cannot_defer_forever(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=True)
+        for _ in range(enforcer._PARK_DEFER_POLLS_MAX):
+            await self._tick(enforcer)
+        engine.abort_all_requests.assert_not_awaited()
+        await self._tick(enforcer)
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_emergency_pressure_aborts_without_parking(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=True)
+        await self._tick(enforcer, usage=103 * 1024**3)
+        scheduler.request_park_prefill.assert_not_called()
+        engine.abort_all_requests.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_truthy_non_bool_answer_is_not_a_park(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=MagicMock())
+        await self._tick(enforcer)
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_park_deferral_budget_resets_when_pressure_clears(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=True)
+        for _ in range(3):
+            await self._tick(enforcer)
+        assert enforcer._park_deferred_polls == 3
+        await self._tick(enforcer, usage=1 * 1024**3)
+        assert enforcer._park_deferred_polls == 0
+
+    @pytest.mark.asyncio
+    async def test_every_poll_reports_its_level_to_the_scheduler(self, enforcer):
+        engine, scheduler = self._setup(enforcer, park_answer=False)
+        await self._tick(enforcer, usage=1 * 1024**3)
+        scheduler.note_pressure_poll.assert_called_with("ok")
+        await self._tick(enforcer, usage=96 * 1024**3)
+        scheduler.note_pressure_poll.assert_called_with("hard")
+        assert scheduler.note_pressure_poll.call_count == 2

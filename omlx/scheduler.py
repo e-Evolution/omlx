@@ -1763,6 +1763,11 @@ class SchedulerConfig:
     # completed blocks, and a re-issue of the same prompt resumes from the last
     # committed block boundary instead of prefilling from token zero.
     prefill_progress_commit_blocks: int = 0
+    # Park (pause without error) the most recent prefilling request under hard
+    # memory pressure instead of aborting; see Scheduler.request_park_prefill.
+    memory_pressure_park: bool = False
+    max_parks_per_request: int = 3
+    park_resume_ok_polls: int = 3
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
