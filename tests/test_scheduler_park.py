@@ -471,7 +471,10 @@ def test_settling_after_a_park_defers_the_abort_for_a_few_polls(
         rig.scheduler.request_park_prefill()
         step(rig)
         # Memory is returning to the OS; the enforcer must not abort yet.
-        answers = [rig.scheduler.request_park_prefill() for _ in range(6)]
+        answers = []
+        for _ in range(6):
+            rig.scheduler.note_pressure_poll("hard")
+            answers.append(rig.scheduler.request_park_prefill())
         assert answers[0] is True
         assert answers[-1] is False
     finally:
@@ -502,7 +505,6 @@ def test_committed_blocks_are_pinned_while_parked_and_released_after_resume(
         rig.ssd._evict_tracked_until_size(0)
         table, remaining = rig.probe(PROMPT_B)
         assert table is not None and table.num_tokens >= BLOCK
-        assert scheduler.get_active_hot_cache_block_hashes() >= set(pins.hashes)
 
         finish_ok_polls(rig, 1)
         step_until(rig, lambda: "young" in prefilling_ids(rig))
@@ -607,6 +609,157 @@ def test_reset_and_shutdown_release_every_pin(tmp_path, mock_tokenizer):
         rig.scheduler.reset()
         assert not rig.scheduler._park_pins
         assert rig.ssd.pinned_block_count == 0
+    finally:
+        rig.close()
+
+
+# --- Leaks, resume bursts, hot cache, settle polls -----------------------------
+
+
+def test_abort_of_a_parked_request_with_a_commit_in_flight_leaves_no_pins(
+    tmp_path, mock_tokenizer, gated
+):
+    rig = make_rig(tmp_path, mock_tokenizer, ok_polls=1)
+    gate = None
+    try:
+        scheduler = rig.scheduler
+        _, young = prefill_two(rig)
+        gate = gated(rig)
+        for _ in range(8):
+            if "young" in scheduler._prefill_commits:
+                break
+            scheduler.step()
+        assert not scheduler._prefill_commits["young"][0].done()
+        scheduler.request_park_prefill()
+        scheduler._process_pending_park()
+        assert scheduler._teardown_pending("young")
+
+        assert scheduler.abort_request("young")
+        scheduler.step()  # the abort runs while the commit is still in flight
+        gate.release.set()
+        rig.drain()
+        step(rig, 3)
+
+        assert not young.parked  # an aborted request is no longer parked
+        assert "young" not in scheduler._park_pins
+        assert rig.ssd.pinned_block_count == 0
+    finally:
+        if gate is not None:
+            gate.release.set()
+        rig.close()
+
+
+def _park_three(rig):
+    """r1 prefilling (protected); r2, r3, r4 parked, all unpinned-ready."""
+    for i, (rid, prompt) in enumerate(
+        [("r1", PROMPT_A), ("r2", PROMPT_B), ("r3", PROMPT_C), ("r4", PROMPT_D)]
+    ):
+        submit(rig, rid, prompt, arrival=float(i + 1), max_tokens=50)
+    step_until(rig, lambda: len(prefilling_ids(rig)) == 4)
+    for _ in range(3):
+        rig.scheduler.request_park_prefill()
+        step(rig)
+    assert waiting_ids(rig) == ["r2", "r3", "r4"]
+
+
+def _resumed(rig):
+    return rig.scheduler.get_park_stats()["resumes"]
+
+
+def test_parked_requests_resume_one_per_hysteresis_window(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer, ok_polls=2)
+    try:
+        _park_three(rig)
+        finish_ok_polls(rig, 2)
+        step(rig, 2)
+        assert _resumed(rig) == 1  # not a burst of three
+
+        step(rig, 3)  # no new polls: the streak was consumed by the resume
+        assert _resumed(rig) == 1
+
+        finish_ok_polls(rig, 2)
+        step(rig, 2)
+        assert _resumed(rig) == 2
+    finally:
+        rig.close()
+
+
+def test_the_max_hold_escape_resumes_one_request_at_a_time(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer, ok_polls=3)
+    try:
+        _park_three(rig)
+        rig.scheduler.note_pressure_poll("soft")
+        for request in list(rig.scheduler.waiting):
+            request.parked_at -= scheduler_module.PARK_MAX_HOLD_S + 1
+        step(rig, 2)
+        assert _resumed(rig) == 1
+        step(rig, 3)  # still no polls: the escape does not chain
+        assert _resumed(rig) == 1
+    finally:
+        rig.close()
+
+
+def test_a_stale_monitor_resumes_one_request_per_step(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        _park_three(rig)
+        rig.scheduler._last_pressure_poll_at = (
+            time.monotonic() - scheduler_module.PARK_SIGNAL_STALE_S - 1
+        )
+        rig.scheduler._schedule_waiting()
+        assert _resumed(rig) == 1
+    finally:
+        rig.close()
+
+
+def test_a_hot_cache_shrink_reclaims_parked_blocks_that_stay_restorable(
+    tmp_path, mock_tokenizer
+):
+    rig = make_rig(tmp_path, mock_tokenizer, ok_polls=1)
+    try:
+        rig.ssd._hot_cache_max_bytes = 64 * 1024**2
+        rig.ssd._hot_cache_enabled = True
+        old, young = prefill_two(rig)
+        scheduler = rig.scheduler
+        scheduler.request_park_prefill()
+        step(rig)
+        rig.drain()
+        pins = scheduler._park_pins["young"]
+        assert pins.hashes
+        assert set(pins.hashes) & set(rig.ssd._hot_cache)  # blocks sit in RAM
+
+        protected = scheduler.get_active_hot_cache_block_hashes()
+        assert not protected & set(pins.hashes)  # parked blocks are not RAM-pinned
+        rig.ssd.shrink_hot_cache_to(0, protected_hashes=protected)
+        assert not set(pins.hashes) & set(rig.ssd._hot_cache)
+
+        # Dirty evictions were written back: SSD LRU still holds them (pinned).
+        rig.ssd._evict_tracked_until_size(0)
+        table, _ = rig.probe(PROMPT_B)
+        assert table is not None and table.num_tokens >= BLOCK
+
+        finish_ok_polls(rig, 1)
+        step_until(rig, lambda: "young" in prefilling_ids(rig))
+        assert young.cached_tokens >= BLOCK
+    finally:
+        rig.close()
+
+
+def test_the_settle_window_counts_enforcer_polls_not_queries(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer, max_parks=1)
+    try:
+        submit(rig, "only", PROMPT_A, arrival=1.0)
+        step_until(rig, lambda: prefilling_ids(rig) == ["only"])
+        rig.scheduler._park_hold_applies = lambda head: True  # isolate the park
+        rig.scheduler.request_park_prefill()
+        step(rig)
+        # Repeated queries within one poll never consume the window.
+        assert all(rig.scheduler.request_park_prefill() for _ in range(10))
+        for _ in range(scheduler_module.PARK_SETTLE_POLLS):
+            rig.scheduler.note_pressure_poll("hard")
+            assert rig.scheduler.request_park_prefill() is True
+        rig.scheduler.note_pressure_poll("hard")
+        assert rig.scheduler.request_park_prefill() is False
     finally:
         rig.close()
 
