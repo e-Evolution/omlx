@@ -394,7 +394,39 @@ class TestSchedulerSettings:
             "chunked_prefill": False,
             "prefill_priority": "context",
             "decode_fairness": True,
+            "prefill_progress_commit_blocks": 0,
         }
+
+    def test_prefill_progress_commit_blocks_from_dict(self):
+        """Off by default; a positive count round-trips; junk falls back to off."""
+        assert SchedulerSettings.from_dict({}).prefill_progress_commit_blocks == 0
+        settings = SchedulerSettings.from_dict({"prefill_progress_commit_blocks": 4})
+        assert settings.prefill_progress_commit_blocks == 4
+        for bad in ("many", None, -3):
+            assert (
+                SchedulerSettings.from_dict(
+                    {"prefill_progress_commit_blocks": bad}
+                ).prefill_progress_commit_blocks
+                == 0
+            )
+
+    def test_prefill_progress_commit_blocks_reaches_scheduler_config(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert settings.to_scheduler_config().prefill_progress_commit_blocks == 0
+        settings.scheduler.prefill_progress_commit_blocks = 3
+        assert settings.to_scheduler_config().prefill_progress_commit_blocks == 3
+
+    def test_prefill_progress_commit_blocks_env_override(self, tmp_path):
+        with patch.dict(
+            os.environ, {"OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "2"}, clear=False
+        ):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.scheduler.prefill_progress_commit_blocks == 2
+
+    def test_prefill_progress_commit_blocks_must_not_be_negative(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.scheduler.prefill_progress_commit_blocks = -1
+        assert any("prefill_progress_commit_blocks" in e for e in settings.validate())
 
     def test_decode_fairness_from_dict(self):
         """Defaults on; explicit false round-trips."""
