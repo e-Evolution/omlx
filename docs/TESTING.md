@@ -200,3 +200,9 @@ Run `python -m pytest -q tests/test_video.py tests/test_image_utils.py tests/tes
 # Engine idle timing tests
 
 Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visibility.py` to check that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The cases cover a request longer than its TTL, release with a pending unload, cancelled release, redundant releases, and models with a held lease, an active request, or a waiting request.
+
+# Incremental prefill commit tests
+
+Run `python -m pytest -q tests/test_scheduler_prefill_progress_commit.py tests/test_settings.py -k "prefill_progress or commit"` to check `scheduler.prefill_progress_commit_blocks` (also `OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS`; 0 = off, the default). The cases drive the real chunked and external prefill loops on a small initialized Qwen3.5 hybrid model (inline and split-GDN snapshots) and a small dense model, against real paged-SSD, boundary-snapshot and prefix stores, and compare restored-prefix logits with a cold forward pass. They cover commits every N blocks, a request aborted mid-prefill whose same-prompt re-issue resumes from the last committed boundary, completion after commits (same stored prefix, no duplicate blocks or leftover snapshot markers), a commit window longer than the restored prefix, TurboQuant windows matching whole-prefix conversion bit for bit, the memory-pressure skip, and the cold retry after a prefill memory failure.
+
+Mocked tests do not replace hardware validation: with a real model, abort a long prompt mid-prefill (for example with a low memory ceiling and two concurrent prompts), re-issue it, and check that the log reports a prefix cache restore at the last committed boundary instead of a full prefill.

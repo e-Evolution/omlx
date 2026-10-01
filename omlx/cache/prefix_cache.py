@@ -899,6 +899,7 @@ class BlockAwarePrefixCache(CacheManager):
         hot_cache_write_back: bool = True,
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
+        cache_covers_suffix_only: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -926,6 +927,11 @@ class BlockAwarePrefixCache(CacheManager):
                 ordinary prefix matching.
             _store_tail_terminal: Persist the trailing partial block as a tail
                 block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
+            cache_covers_suffix_only: ``cache_data`` holds only the tokens
+                after the request's existing block table (an incremental
+                commit during prefill), never the whole sequence. Without this
+                a window longer than the stored prefix is indistinguishable
+                from a full-sequence cache.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -1342,8 +1348,10 @@ class BlockAwarePrefixCache(CacheManager):
                 # BatchGenerator.extract_cache() currently returns full-sequence cache.
                 # When existing_tokens > 0, slicing with relative indices would save
                 # wrong KV ranges for new blocks and corrupt future cache hits.
-                cache_uses_global_indices = existing_tokens > 0 and cache_seq_len >= (
-                    existing_tokens + 1
+                cache_uses_global_indices = (
+                    not cache_covers_suffix_only
+                    and existing_tokens > 0
+                    and cache_seq_len >= (existing_tokens + 1)
                 )
                 if cache_uses_global_indices:
                     cache_start = global_start
