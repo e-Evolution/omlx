@@ -2159,8 +2159,15 @@ class Scheduler:
         # poll counters are written by the enforcer thread (GIL-atomic) and
         # consumed on the MLX thread.
         self._park_requested: bool = False
-        self._park_settle_polls: int = 0
+        # Enforcer polls since the latest park, or None when no park is
+        # settling. Counted in note_pressure_poll, never per query.
+        self._polls_since_park: int | None = None
         self._ok_polls: int = 0
+        # Hysteresis between resumes: at most one parked request resumes per
+        # scheduling pass, and the next one needs a fresh ok streak (or, for
+        # the max-hold escape, as many polls since the last resume).
+        self._park_resumed_this_pass: bool = False
+        self._polls_since_resume: int = 1 << 30
         self._last_pressure_poll_at: float | None = None
         self._last_pressure_level: str = "ok"
         self._park_pins: dict[str, _ParkPins] = {}
@@ -5354,10 +5361,11 @@ class Scheduler:
                     continue
                 if block_hash is not None:
                     hashes.add(bytes(block_hash))
-        # Parked requests hold no live table, but their pinned prefix must
-        # survive a hot-cache shrink too.
-        for pins in list(self._park_pins.values()):
-            hashes.update(pins.hashes)
+        # Parked requests are deliberately absent: parking exists because RAM
+        # is short, so a shrink may reclaim their blocks. That is safe because
+        # a dirty hot-cache eviction is written back to the SSD
+        # (PagedSSDCacheManager._handle_hot_cache_eviction) where the park pin
+        # keeps them from LRU eviction, and resume restores them from there.
         return hashes
 
     def _clear_memory_admission_blocker(self, request_id: str | None = None) -> None:
@@ -11022,9 +11030,12 @@ class Scheduler:
         """
         self._last_pressure_poll_at = time.monotonic()
         self._last_pressure_level = level
+        self._polls_since_resume = min(self._polls_since_resume + 1, 1 << 30)
+        if self._polls_since_park is not None:
+            self._polls_since_park += 1
         if level == "ok":
             self._ok_polls += 1
-            self._park_settle_polls = 0
+            self._polls_since_park = None  # pressure gone: nothing left to settle
         else:
             self._ok_polls = 0
 
@@ -11040,12 +11051,20 @@ class Scheduler:
         """Whether a parked head still blocks admission.
 
         Never when nothing is admitted (admission must be able to recover),
-        and not past PARK_MAX_HOLD_S unless the last pressure was hard.
+        and not past PARK_MAX_HOLD_S unless the last pressure was hard. Every
+        escape resumes one request per scheduling pass, and the max-hold
+        escape also waits ``park_resume_ok_polls`` polls after the previous
+        resume, so a burst of resumes cannot re-trigger hard pressure.
         """
+        if self._park_resumed_this_pass:
+            return True
         if self._park_resume_allowed() or not self._num_admitted_requests():
             return False
+        need = max(1, getattr(self.config, "park_resume_ok_polls", 3))
         held_s = time.monotonic() - head.parked_at
-        return held_s < PARK_MAX_HOLD_S or self._last_pressure_level == "hard"
+        if held_s >= PARK_MAX_HOLD_S and self._last_pressure_level != "hard":
+            return self._polls_since_resume < need
+        return True
 
     def is_request_parked(self, request_id: str) -> bool:
         """Whether the request is currently parked (holds no live memory)."""
@@ -11110,17 +11129,21 @@ class Scheduler:
             return False
         if self._park_requested:
             return True
+        victim_may_exist = False
         try:
-            victim = self._select_park_victim()
-        except RuntimeError:  # queue mutated mid-read on the MLX thread
-            victim = True
-        if victim is not None:
+            victim_may_exist = self._select_park_victim() is not None
+        except RuntimeError:
+            # The queues mutated mid-read on the MLX thread; assume a victim
+            # exists and let the step-boundary selection decide.
+            victim_may_exist = True
+        if victim_may_exist:
             self._park_requested = True
             return True
-        if self._park_settle_polls > 0:
-            self._park_settle_polls -= 1
-            return True
-        return False
+        # A park just ran and its memory is still returning to the OS.
+        return (
+            self._polls_since_park is not None
+            and self._polls_since_park <= PARK_SETTLE_POLLS
+        )
 
     def _process_pending_park(self) -> bool:
         """Park one victim if the enforcer asked (MLX thread, step start)."""
@@ -11133,7 +11156,7 @@ class Scheduler:
         if victim is None:
             return False
         self._park_prefill(victim, reason="hard memory pressure")
-        self._park_settle_polls = PARK_SETTLE_POLLS
+        self._polls_since_park = 0
         return True
 
     def _park_prefill(self, request: Request, reason: str) -> None:
@@ -11161,7 +11184,7 @@ class Scheduler:
         self._clear_request_admission_bookkeeping(rid)
         get_prefill_tracker().remove(rid)
         # Order matters: pin first, then release the table's own refs.
-        self._after_commit(rid, lambda: self._pin_parked_blocks(rid))
+        self._after_commit(rid, lambda: self._pin_parked_blocks(rid, request))
         self._release_paged_cache_for_request(rid)
         self._drop_boundary_snapshots_for_request(rid)
         self._enqueue_parked(request)
@@ -11192,17 +11215,21 @@ class Scheduler:
                 break
         self.waiting.insert(index, request)
 
-    def _pin_parked_blocks(self, request_id: str) -> None:
+    def _pin_parked_blocks(self, request_id: str, request: Request) -> None:
         """Hold the committed blocks of a parked request against eviction.
 
         Takes one extra block ref per committed block (so the table's own
         release leaves them referenced) and pins their hashes in the SSD
         index, whose size enforcement skips them. Skipped when the request
-        was aborted or already resumed before this deferred step ran.
+        was aborted, reset or already resumed before this deferred step ran:
+        the request must still be the registered, parked one.
         """
-        request = self.requests.get(request_id)
         manager = self.paged_cache_manager
-        if request is None or not request.parked or manager is None:
+        if (
+            self.requests.get(request_id) is not request
+            or not request.parked
+            or manager is None
+        ):
             return
         table = manager.get_block_table(request_id)
         if not table or not table.block_ids:
@@ -11239,7 +11266,11 @@ class Scheduler:
         """Re-admission of a parked request: its fresh lookup holds the blocks."""
         self._unpin_parked(request.request_id)
         request.parked = False
-        self._park_settle_polls = 0
+        self._polls_since_park = None
+        # One resume per hysteresis window: consume the ok streak.
+        self._ok_polls = 0
+        self._polls_since_resume = 0
+        self._park_resumed_this_pass = True
         self._park_stats["resumes"] += 1
         self._park_stats["tokens_preserved"] += request.cached_tokens or 0
         logger.info(
@@ -11360,6 +11391,8 @@ class Scheduler:
 
         self._clear_request_admission_bookkeeping(request_id)
         self._unpin_parked(request_id)
+        # A deferred pin step must not re-pin an aborted request's blocks.
+        request.parked = False
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -12179,6 +12212,7 @@ class Scheduler:
         # Track SpecPrefill: these requests must be alone (RoPE patching affects whole model)
         batch_specprefill_status: bool | None = None
 
+        self._park_resumed_this_pass = False
         while (
             self.waiting
             and self._num_admitted_requests() < self._effective_max_num_seqs()
@@ -14647,7 +14681,8 @@ class Scheduler:
         for parked_id in list(self._park_pins):
             self._unpin_parked(parked_id)
         self._park_requested = False
-        self._park_settle_polls = 0
+        self._polls_since_park = None
+        self._park_resumed_this_pass = False
         self._prefill_commits.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()
