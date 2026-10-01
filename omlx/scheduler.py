@@ -1262,6 +1262,8 @@ PARK_SETTLE_POLLS = 3
 # A pressure monitor that has not reported for this long is considered gone;
 # parked requests then resume instead of waiting for polls that never come.
 PARK_SIGNAL_STALE_S = 60.0
+# Longest a parked head holds admission on a non-hard pressure level.
+PARK_MAX_HOLD_S = 300.0
 
 
 class _ParkPins(NamedTuple):
@@ -2180,6 +2182,7 @@ class Scheduler:
         self._park_settle_polls: int = 0
         self._ok_polls: int = 0
         self._last_pressure_poll_at: float | None = None
+        self._last_pressure_level: str = "ok"
         self._park_pins: dict[str, _ParkPins] = {}
         self._park_stats: dict[str, int] = {
             "parks": 0,
@@ -11606,6 +11609,7 @@ class Scheduler:
         ``ok`` polls (hysteresis against flapping at the watermark).
         """
         self._last_pressure_poll_at = time.monotonic()
+        self._last_pressure_level = level
         if level == "ok":
             self._ok_polls += 1
             self._park_settle_polls = 0
@@ -11619,6 +11623,17 @@ class Scheduler:
             return True  # no live pressure monitor: never starve a parked request
         need = getattr(self.config, "park_resume_ok_polls", 3)
         return self._ok_polls >= max(1, need)
+
+    def _park_hold_applies(self, head: "Request") -> bool:
+        """Whether a parked head still blocks admission.
+
+        Never when nothing is admitted (admission must be able to recover),
+        and not past PARK_MAX_HOLD_S unless the last pressure was hard.
+        """
+        if self._park_resume_allowed() or not self._num_admitted_requests():
+            return False
+        held_s = time.monotonic() - head.parked_at
+        return held_s < PARK_MAX_HOLD_S or self._last_pressure_level == "hard"
 
     def is_request_parked(self, request_id: str) -> bool:
         """Whether the request is currently parked (holds no live memory)."""
@@ -11729,6 +11744,7 @@ class Scheduler:
         self.prefilling = deque(r for r in self.prefilling if r.request_id != rid)
         self._reset_request_for_reprefill(request)
         request.parked = True
+        request.parked_at = time.monotonic()
         request.park_count += 1
         self._clear_request_admission_bookkeeping(rid)
         get_prefill_tracker().remove(rid)
@@ -12779,7 +12795,7 @@ class Scheduler:
             # Parked requests sit at the front in arrival order and resume
             # only after enough consecutive ok pressure polls; nothing newer
             # overtakes them while they wait.
-            if self.waiting[0].parked and not self._park_resume_allowed():
+            if self.waiting[0].parked and self._park_hold_applies(self.waiting[0]):
                 break
 
             admitted = self._num_admitted_requests()
