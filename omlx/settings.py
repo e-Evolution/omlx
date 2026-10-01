@@ -366,7 +366,12 @@ class SchedulerSettings:
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
         commit_blocks = data.get("prefill_progress_commit_blocks", 0)
-        if not isinstance(commit_blocks, int) or commit_blocks < 0:
+        # bool is an int subclass: True must not silently become 1 block.
+        if (
+            not isinstance(commit_blocks, int)
+            or isinstance(commit_blocks, bool)
+            or commit_blocks < 0
+        ):
             commit_blocks = 0
         return cls(
             max_concurrent_requests=value,
