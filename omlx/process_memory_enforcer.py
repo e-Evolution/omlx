@@ -1553,6 +1553,21 @@ class ProcessMemoryEnforcer:
             if adjust is not None:
                 adjust(self._pressure_level)
 
+    @staticmethod
+    async def _abort_all_requests(engine: Any, *, spare_parked: bool) -> Any:
+        """Call ``abort_all_requests``, passing ``spare_parked`` explicitly.
+
+        Engines without parking (DFlash, distributed) have a no-argument hook
+        and cannot hold parked requests, so the keyword is dropped for them.
+        A model held by parked requests only is NOT idle (they own a collector,
+        so ``has_active_requests`` is true): LRU eviction skips it, and only
+        this explicit abort (``spare_parked=False``) lets an unload drain it.
+        """
+        try:
+            return await engine.abort_all_requests(spare_parked=spare_parked)
+        except TypeError:
+            return await engine.abort_all_requests()
+
     async def _abort_loaded_requests_for_memory_emergency(self) -> int:
         """Abort active requests on loaded models without unloading them."""
         aborted_total = 0
@@ -1566,7 +1581,11 @@ class ProcessMemoryEnforcer:
                 continue
 
             try:
-                result = abort_all()
+                # Emergency: parked requests are aborted too.
+                try:
+                    result = abort_all(spare_parked=False)
+                except TypeError:
+                    result = abort_all()
                 if inspect.isawaitable(result):
                     result = await result
             except Exception as exc:  # noqa: BLE001
@@ -1887,7 +1906,11 @@ class ProcessMemoryEnforcer:
                             and entry.engine is not None
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
-                            result = await entry.engine.abort_all_requests()
+                            # The model is about to be unloaded: parked
+                            # requests would be orphaned, abort them too.
+                            result = await self._abort_all_requests(
+                                entry.engine, spare_parked=False
+                            )
                             aborted = max(0, int(result or 0))
                             if aborted > 0:
                                 logger.warning(
@@ -1916,7 +1939,13 @@ class ProcessMemoryEnforcer:
                             and entry.engine is not None
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
-                            aborted = await entry.engine.abort_all_requests()
+                            # Only the non-emergency path keeps the model
+                            # loaded and lets parked requests resume; an
+                            # emergency unload must abort them, or they keep
+                            # the engine non-idle and the unload never drains.
+                            aborted = await self._abort_all_requests(
+                                entry.engine, spare_parked=not emergency
+                            )
                         if not emergency:
                             logger.warning(
                                 "Hard memory pressure: aborted %d request(s) on "
