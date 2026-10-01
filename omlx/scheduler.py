@@ -1240,6 +1240,12 @@ def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     ) or _is_turboquant_kv_cache(cache_obj)
 
 
+def _prefill_commit_blocks(config: Any) -> int:
+    """``prefill_progress_commit_blocks`` of a config, 0 when unset or invalid."""
+    value = getattr(config, "prefill_progress_commit_blocks", 0)
+    return value if isinstance(value, int) and value > 0 else 0
+
+
 class _BoundaryStoreUnavailable(Exception):
     """No boundary-aligned snapshot exists for non-sliceable cache state.
 
@@ -1702,6 +1708,12 @@ class SchedulerConfig:
     decode_fairness: bool = True
     # Set by the engine when MoE expert offload wrapped the model.
     moe_offload_active: bool = False
+    # Commit completed prefill blocks to the prefix cache every N blocks while
+    # a prompt is still being prefilled (0 = off, blocks are stored only when
+    # the request finishes). A request aborted mid-prefill then keeps its
+    # completed blocks, and a re-issue of the same prompt resumes from the last
+    # committed block boundary instead of prefilling from token zero.
+    prefill_progress_commit_blocks: int = 0
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -2065,6 +2077,9 @@ class Scheduler:
             "max_rows": 0,
             "failures": 0,
         }
+        # request_id -> (future, committed token count) of the in-flight
+        # incremental prefill commit (see _commit_prefill_progress).
+        self._prefill_commits: dict[str, tuple[concurrent.futures.Future, int]] = {}
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -2615,8 +2630,14 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        incremental_commit: bool = False,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
+
+        ``incremental_commit`` marks a mid-prefill commit: ``cache_to_store``
+        holds only the tokens after the request's existing block table, and
+        the table stays alive so the next commit (or the final store) extends
+        it instead of re-storing from token zero.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
         - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
@@ -2650,6 +2671,7 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         self._store_cache_thread_id = threading.get_ident()
+        window_kwargs = {"cache_covers_suffix_only": True} if incremental_commit else {}
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
             # access. store_cache eventually drives _extract_tensor_bytes,
@@ -2674,6 +2696,7 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         _store_tail_terminal=store_tail_terminal,
+                        **window_kwargs,
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2687,7 +2710,10 @@ class Scheduler:
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
                         _store_tail_terminal=store_tail_terminal,
+                        **window_kwargs,
                     )
+            if incremental_commit:
+                return
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -4247,6 +4273,10 @@ class Scheduler:
                     self._emit_prefill_tail_snapshot(
                         request, prompt_cache, total_tokens
                     )
+            if vlm_embeds is None:
+                Scheduler._commit_prefill_progress(
+                    self, request, prompt_cache, base_size + processed_tokens
+                )
 
             Scheduler._check_post_prefill_memory(
                 self,
@@ -6503,6 +6533,9 @@ class Scheduler:
                 self._emit_prefill_tail_snapshot(
                     state.request, state.cache, total_tokens
                 )
+        Scheduler._commit_prefill_progress(
+            self, state.request, state.cache, state.base_size + state.tokens_processed
+        )
 
         # Progress callback so the admin UI prefilling list advances during
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
@@ -7313,6 +7346,260 @@ class Scheduler:
                 else {}
             ),
         )
+
+    def _prefill_commit_blocked_by_pressure(self) -> bool:
+        """True while memory sits at or above the soft limit.
+
+        A commit slices KV, quantizes it and materializes a snapshot, all of
+        which allocate; doing that when the guard is already struggling would
+        add to the pressure it is meant to survive. The hard limit lies above
+        the soft one, so this also covers hard pressure.
+        """
+        limit = self._memory_limit_bytes
+        if limit <= 0:
+            return False
+        try:
+            return self._current_usage_bytes() >= limit
+        except Exception:
+            return True
+
+    def _prefill_commit_window(
+        self, prompt_cache: list[Any], start: int, end: int
+    ) -> list[Any] | None:
+        """Detached cache list holding KV tokens ``[start, end)`` of a prefill.
+
+        KV layers become windowed copies, TurboQuant layers get the same
+        conversion the finished request would receive, and non-sliceable layers
+        pass through untouched. Returns None for a layout whose window cannot
+        be stored faithfully (composite or unknown sliceable caches).
+
+        The final store quantizes the whole fp16 prefix with the same
+        per-vector codec (norm, fixed-seed rotation, midpoints), so converting
+        a window yields byte-identical blocks. The layer signature is stamped
+        by the same ``_apply_turboquant_kv_convert`` rules.
+        """
+        from mlx_vlm.turboquant import TurboQuantKVCache, _slice_state_range
+
+        window: list[Any] = []
+        for layer in prompt_cache:
+            if type(layer) in (_MLXKVCache, _vlm_cache.KVCache):
+                if layer.keys is None or layer.offset < end:
+                    return None
+                piece = type(layer)()
+                piece.keys = layer.keys[..., start:end, :]
+                piece.values = layer.values[..., start:end, :]
+                piece.offset = end - start
+                window.append(piece)
+            elif type(layer).__name__ == "TurboQuantKVCache":
+                # A restored TurboQuant prefix keeps quantizing in place, so
+                # the window is a slice of the packed state.
+                if layer.keys is None or layer.offset < end:
+                    return None
+                piece = TurboQuantKVCache(
+                    bits=layer.bits,
+                    seed=layer.seed,
+                    key_bits=layer.key_bits,
+                    value_bits=layer.value_bits,
+                )
+                piece.key_codec = layer.key_codec
+                piece.value_codec = layer.value_codec
+                piece.keys = _slice_state_range(layer.keys, start, end)
+                piece.values = _slice_state_range(layer.values, start, end)
+                piece.offset = end - start
+                window.append(piece)
+            elif type(layer).__name__ in _KNOWN_SLICEABLE_CACHE_TYPES or type(
+                layer
+            ).__name__ in ("CacheList", "BatchRotatingKVCache"):
+                return None
+            else:
+                window.append(layer)
+        if self._turboquant_kv_bits is not None and self._turboquant_eligible(
+            prompt_cache
+        ):
+            self._apply_turboquant_kv_convert(window)
+        return window
+
+    def _reap_prefill_commit(self, request_id: str) -> None:
+        """Retire a finished commit: drop snapshot markers it consumed.
+
+        Runs on the inference thread. The commit worker moves (split-GDN) or
+        reads (inline) the staged snapshot of every committed boundary, so
+        their markers must not reach the final store, which would try to load
+        a moved file. A failed commit leaves them in place for the next try.
+        """
+        pending = (getattr(self, "_prefill_commits", None) or {}).get(request_id)
+        if pending is None:
+            return
+        future, committed_tokens = pending
+        if not future.done():
+            return
+        del self._prefill_commits[request_id]
+        try:
+            ok = bool(future.result())
+        except Exception:
+            ok = False
+        if not ok:
+            return
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if snapshots:
+            for token_count in [tc for tc in snapshots if tc <= committed_tokens]:
+                del snapshots[token_count]
+
+    def _settle_prefill_commits(self, request_id: str) -> None:
+        """Wait for an in-flight commit before its request is torn down.
+
+        Teardown releases the block table and removes the snapshot directory,
+        which the commit worker is still reading. Commits are a few blocks, so
+        the wait is short; the blocks it stores stay in the prefix cache.
+        """
+        pending = (getattr(self, "_prefill_commits", None) or {}).get(request_id)
+        if pending is None:
+            return
+        try:
+            pending[0].result(timeout=60)
+        except Exception as e:
+            logger.warning("Prefill commit for %s did not settle: %s", request_id, e)
+        self._reap_prefill_commit(request_id)
+        self._prefill_commits.pop(request_id, None)
+
+    def _commit_prefill_progress(
+        self, request: "Request", prompt_cache: list[Any], total_tokens: int
+    ) -> None:
+        """Make completed prefill blocks durable while the prompt is prefilling.
+
+        Every ``prefill_progress_commit_blocks`` completed blocks, store them in
+        the prefix cache under the request's own block table, which stays alive
+        so the next commit and the final store extend it. A request aborted
+        later keeps these blocks: a re-issue of the same prompt matches them
+        and resumes at the last committed boundary.
+        """
+        commit_blocks = _prefill_commit_blocks(getattr(self, "config", None))
+        if commit_blocks <= 0:
+            return
+        try:
+            self._commit_prefill_progress_unchecked(
+                request, prompt_cache, total_tokens, commit_blocks
+            )
+        except Exception as e:
+            # Durability is best effort; it must never fail the prefill.
+            logger.warning(
+                "Prefill progress commit failed for %s: %s", request.request_id, e
+            )
+
+    def _commit_prefill_progress_unchecked(
+        self,
+        request: "Request",
+        prompt_cache: list[Any],
+        total_tokens: int,
+        commit_blocks: int,
+    ) -> None:
+        rid = request.request_id
+        block_size = self.config.paged_cache_block_size
+        if (
+            block_size <= 0
+            or self.block_aware_cache is None
+            or self.paged_cache_manager is None
+            or self.paged_ssd_cache_manager is None
+            or self._store_cache_executor is None
+        ):
+            return
+        # Prompts that are not a plain token prefix cannot be keyed by token.
+        if (
+            getattr(request, "vlm_extra_keys_for_cache", None)
+            or getattr(request, "vlm_extra_key_ranges_for_cache", None)
+            or getattr(request, "specprefill_indices", None) is not None
+            or self._specprefill_active_request_id == rid
+        ):
+            return
+        prompt = request.prompt_token_ids
+        aligned = min(total_tokens, len(prompt)) // block_size * block_size
+
+        self._reap_prefill_commit(rid)
+        if rid in self._prefill_commits:
+            return  # previous commit still running
+        table = self.paged_cache_manager.get_block_table(rid)
+        existing = table.num_tokens if table else 0
+        if existing % block_size or (aligned - existing) // block_size < commit_blocks:
+            return
+        if self._prefill_commit_blocked_by_pressure():
+            return
+
+        window = self._prefill_commit_window(prompt_cache, existing, aligned)
+        if window is None:
+            if not getattr(self, "_prefill_commit_layout_logged", False):
+                self._prefill_commit_layout_logged = True
+                logger.info(
+                    "Prefill progress commit disabled for this cache layout "
+                    "(composite or non-standard sliceable layers)"
+                )
+            return
+        tokens = list(prompt[:aligned])
+        provider = None
+        with mx.stream(self._stream):
+            extracted, model_cache_config = self._extract_cache_states(window)
+            if _prompt_cache_needs_snapshots(prompt_cache):
+                override = self._get_boundary_store_override(rid, tokens)
+                if override is None:
+                    return
+                tokens, boundary_cache, _, provider = override
+                if (
+                    getattr(provider, "tail_terminal_token_count", None) is not None
+                    or len(tokens) <= existing
+                ):
+                    return
+                extracted = self._merge_boundary_with_full_cache(
+                    boundary_cache, extracted
+                )
+            arrays = self._collect_arrays_from_extracted_cache(extracted)
+            if provider is not None:
+                for snapshot_cache in provider.iter_in_memory_extracted():
+                    arrays.extend(
+                        self._collect_arrays_from_extracted_cache(snapshot_cache)
+                    )
+            if arrays:
+                # Concrete on this thread before the worker slices them (MLX
+                # streams are thread-local; see _async_store_cache_worker).
+                mx.eval(*arrays)
+
+        future = self._store_cache_executor.submit(
+            self._commit_prefill_worker,
+            rid,
+            tokens,
+            extracted,
+            model_cache_config,
+            provider,
+        )
+        self._prefill_commits[rid] = (future, len(tokens))
+        logger.debug(
+            "Committing prefill progress for %s: %d -> %d tokens",
+            rid,
+            existing,
+            len(tokens),
+        )
+
+    def _commit_prefill_worker(
+        self,
+        request_id: str,
+        tokens: list[int],
+        window_cache: list[Any],
+        model_cache_config: Any | None,
+        snapshots: Any | None,
+    ) -> bool:
+        """Store a committed prefill window; True when the table covers it."""
+        self._async_store_cache_worker(
+            request_id,
+            tokens,
+            window_cache,
+            model_cache_config,
+            snapshots,
+            None,
+            None,
+            None,
+            True,
+            incremental_commit=True,
+        )
+        table = self.paged_cache_manager.get_block_table(request_id)
+        return bool(table is not None and table.num_tokens >= len(tokens))
 
     def _resolve_generation_prompt_start(self, request: "Request") -> None:
         """Locate the generation prompt; accept it only if its tokens end the prompt."""
@@ -9889,6 +10176,23 @@ class Scheduler:
         self._unreconstructible_cache_model = result
         return result
 
+    def _retry_prefills_cold_after_oom(self, request: Request) -> bool:
+        """Keep the cold retry that _requeue_or_fail_prefill promises.
+
+        Re-attaching a cached prefix reproduced the oversized SDPA span that
+        failed the first attempt, so a request requeued after a prefill memory
+        failure prefills from token zero. With incremental commits enabled the
+        failed attempt leaves committed blocks in the prefix cache, which would
+        otherwise be attached here; a client re-issue still resumes from them.
+        Gated on the setting so the default behavior is unchanged.
+        """
+        retries = getattr(request, "prefill_oom_retries", 0)
+        return (
+            isinstance(retries, int)
+            and retries > 0
+            and _prefill_commit_blocks(getattr(self, "config", None)) > 0
+        )
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
@@ -9904,6 +10208,7 @@ class Scheduler:
         if (
             self.block_aware_cache is not None
             and not self._model_has_unreconstructible_cache()
+            and not self._retry_prefills_cold_after_oom(request)
         ):
             # Use paged cache
             fetch_started = time.perf_counter()
@@ -11136,6 +11441,9 @@ class Scheduler:
                 return False
 
         self._clear_request_admission_bookkeeping(request_id)
+        # Committed prefill blocks stay in the prefix cache; let an in-flight
+        # commit finish before the table and snapshots are released below.
+        self._settle_prefill_commits(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -11323,6 +11631,7 @@ class Scheduler:
         must do the same or every failure strands a snapshot set until
         process exit (#3226).
         """
+        self._settle_prefill_commits(request_id)
         self._boundary_cache_snapshots.pop(request_id, None)
         if self._boundary_snapshot_store is not None:
             try:
@@ -13063,6 +13372,7 @@ class Scheduler:
         very memory pressure that triggered the rejection) and orphan
         ``_request_tables`` entries.
         """
+        self._settle_prefill_commits(request_id)
         if self.block_aware_cache is not None:
             self.block_aware_cache.release_cache(request_id)
         elif self.paged_cache_manager is not None:
@@ -13113,6 +13423,9 @@ class Scheduler:
             if finished_drafter is not None:
                 finished_drafter.release_request(request_id)
             request = self.running.get(request_id)
+            # A mid-prefill commit still in flight must land (and retire its
+            # consumed snapshot markers) before the final store reads them.
+            self._settle_prefill_commits(request_id)
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
@@ -13839,6 +14152,7 @@ class Scheduler:
         for request in retry_candidates:
             request.generation_overflow_retries += 1
             request_id = request.request_id
+            self._settle_prefill_commits(request_id)
             self._boundary_cache_snapshots.pop(request_id, None)
             if self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_request(request_id)
