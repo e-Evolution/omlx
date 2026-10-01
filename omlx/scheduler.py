@@ -1205,6 +1205,14 @@ def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
     ) or _is_turboquant_kv_cache(cache_obj)
 
 
+# Bounded wait for in-flight prefill commits at shutdown only; the hot path
+# never waits (see Scheduler._after_commit).
+PREFILL_COMMIT_SHUTDOWN_WAIT_S = 30.0
+# A teardown deferred behind a commit that has not finished after this long
+# is logged once; it stays pending and is dropped at shutdown.
+PREFILL_COMMIT_STUCK_LOG_S = 60.0
+
+
 def _prefill_commit_blocks(config: Any) -> int:
     """``prefill_progress_commit_blocks`` of a config, 0 when unset or invalid."""
     value = getattr(config, "prefill_progress_commit_blocks", 0)
@@ -2060,6 +2068,17 @@ class Scheduler:
         # request_id -> (future, committed token count) of the in-flight
         # incremental prefill commit (see _commit_prefill_progress).
         self._prefill_commits: dict[str, tuple[concurrent.futures.Future, int]] = {}
+        # Own single-thread executor so commits never queue behind the
+        # post-finish final stores (28GB+ memcpys) on _store_cache_executor.
+        self._prefill_commit_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            None
+        )
+        # request_id -> destructive teardown steps (release block table,
+        # retire snapshots, ...) postponed until that request's in-flight
+        # commit has finished. Touched on the scheduler thread only.
+        self._deferred_teardowns: dict[str, list[Callable[[], None]]] = {}
+        self._deferred_teardown_since: dict[str, float] = {}
+        self._stuck_teardown_logged: set[str] = set()
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
@@ -2377,6 +2396,7 @@ class Scheduler:
                     max_workers=1,
                     thread_name_prefix="omlx-store-cache",
                 )
+                self._ensure_prefill_commit_executor()
                 # Gate caps the post-completion store-cache pipeline so a burst
                 # of finishes cannot pile up unbounded KV caches in memory while
                 # the single writer drains. Cap starts at max_concurrent_requests
@@ -2613,8 +2633,13 @@ class Scheduler:
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
         incremental_commit: bool = False,
+        after_commit: concurrent.futures.Future | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
+
+        ``after_commit`` is the request's in-flight incremental commit: the
+        store waits for it here, on this worker, so the two never race on the
+        block table and the inference thread never waits.
 
         ``incremental_commit`` marks a mid-prefill commit: ``cache_to_store``
         holds only the tokens after the request's existing block table, and
@@ -2653,6 +2678,8 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         self._store_cache_thread_id = threading.get_ident()
+        if after_commit is not None:
+            concurrent.futures.wait([after_commit])
         window_kwargs = {"cache_covers_suffix_only": True} if incremental_commit else {}
         try:
             # Hold _mx_buffer_access_lock across the worker's mx-buffer
@@ -6881,13 +6908,34 @@ class Scheduler:
             self._apply_turboquant_kv_convert(window)
         return window
 
+    def _ensure_prefill_commit_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        executor = self._prefill_commit_executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="omlx-prefill-commit"
+            )
+            self._prefill_commit_executor = executor
+        return executor
+
+    def _retire_committed_markers(self, request_id: str, committed_tokens: int) -> None:
+        """Drop snapshot markers a commit covering ``committed_tokens`` consumed.
+
+        The commit worker moves (split-GDN) or reads (inline) the staged
+        snapshot of every committed boundary, so their markers must not reach
+        the final store, which would try to load a moved file.
+        """
+        snapshots = self._boundary_cache_snapshots.get(request_id)
+        if snapshots:
+            for token_count in [tc for tc in snapshots if tc <= committed_tokens]:
+                del snapshots[token_count]
+
     def _reap_prefill_commit(self, request_id: str) -> None:
         """Retire a finished commit: drop snapshot markers it consumed.
 
-        Runs on the inference thread. The commit worker moves (split-GDN) or
-        reads (inline) the staged snapshot of every committed boundary, so
-        their markers must not reach the final store, which would try to load
-        a moved file. A failed commit leaves them in place for the next try.
+        Runs on the inference thread and never waits. A failed commit leaves
+        its markers in place for the next try.
         """
         pending = (getattr(self, "_prefill_commits", None) or {}).get(request_id)
         if pending is None:
@@ -6898,31 +6946,93 @@ class Scheduler:
         del self._prefill_commits[request_id]
         try:
             ok = bool(future.result())
-        except Exception:
+        except Exception as e:
+            logger.warning("Prefill commit for %s failed: %s", request_id, e)
             ok = False
-        if not ok:
-            return
-        snapshots = self._boundary_cache_snapshots.get(request_id)
-        if snapshots:
-            for token_count in [tc for tc in snapshots if tc <= committed_tokens]:
-                del snapshots[token_count]
+        if ok:
+            self._retire_committed_markers(request_id, committed_tokens)
 
-    def _settle_prefill_commits(self, request_id: str) -> None:
-        """Wait for an in-flight commit before its request is torn down.
+    def _inflight_commit_future(
+        self, request_id: str
+    ) -> concurrent.futures.Future | None:
+        """The request's commit future while it is still running, else None."""
+        self._reap_prefill_commit(request_id)
+        pending = (getattr(self, "_prefill_commits", None) or {}).get(request_id)
+        return pending[0] if pending is not None else None
+
+    def _after_commit(self, request_id: str, teardown: Callable[[], None]) -> bool:
+        """Run a destructive teardown step once the request's commit is done.
 
         Teardown releases the block table and removes the snapshot directory,
-        which the commit worker is still reading. Commits are a few blocks, so
-        the wait is short; the blocks it stores stay in the prefix cache.
+        which the commit worker may still be reading or moving. Never waits:
+        with no commit in flight the step runs now; otherwise it is queued and
+        runs from ``_process_finished_commits`` on the scheduler thread, after
+        the commit finished (successfully or not). Returns True when deferred.
         """
-        pending = (getattr(self, "_prefill_commits", None) or {}).get(request_id)
-        if pending is None:
-            return
+        if self._inflight_commit_future(request_id) is None:
+            self._run_deferred_teardowns(request_id)  # keep submission order
+            self._run_teardown_step(request_id, teardown)
+            return False
+        self._deferred_teardowns.setdefault(request_id, []).append(teardown)
+        self._deferred_teardown_since.setdefault(request_id, time.monotonic())
+        logger.debug(
+            "Deferring teardown of %s until its prefill commit ends", request_id
+        )
+        return True
+
+    def _teardown_pending(self, request_id: str) -> bool:
+        """True while a deferred teardown of this request id has not run."""
+        return request_id in self._deferred_teardowns
+
+    def _run_teardown_step(
+        self, request_id: str, teardown: Callable[[], None]
+    ) -> None:
         try:
-            pending[0].result(timeout=60)
+            teardown()
         except Exception as e:
-            logger.warning("Prefill commit for %s did not settle: %s", request_id, e)
-        self._reap_prefill_commit(request_id)
-        self._prefill_commits.pop(request_id, None)
+            logger.warning("Teardown step for %s failed: %s", request_id, e)
+
+    def _run_deferred_teardowns(self, request_id: str) -> None:
+        steps = self._deferred_teardowns.pop(request_id, None)
+        self._deferred_teardown_since.pop(request_id, None)
+        self._stuck_teardown_logged.discard(request_id)
+        for teardown in steps or ():
+            self._run_teardown_step(request_id, teardown)
+
+    def _process_finished_commits(self) -> None:
+        """Retire finished commits and run the teardowns waiting on them.
+
+        Called at the start of every step on the scheduler thread; only reads
+        future state, so commit workers never touch scheduler state.
+        """
+        for request_id in list(self._prefill_commits):
+            self._reap_prefill_commit(request_id)
+            if request_id not in self._prefill_commits:
+                self._run_deferred_teardowns(request_id)
+        now = time.monotonic()
+        for request_id, since in self._deferred_teardown_since.items():
+            if (
+                now - since >= PREFILL_COMMIT_STUCK_LOG_S
+                and request_id not in self._stuck_teardown_logged
+            ):
+                self._stuck_teardown_logged.add(request_id)
+                logger.warning(
+                    "Teardown of %s still waits for its prefill commit after %.0fs",
+                    request_id,
+                    now - since,
+                )
+
+    def _wait_for_prefill_commits(self, timeout: float) -> int:
+        """Block until every commit ends or ``timeout``; returns the stragglers.
+
+        Reset and shutdown only: the hot path never waits on a commit.
+        """
+        futures = [future for future, _ in self._prefill_commits.values()]
+        not_done: set = set()
+        if futures:
+            _done, not_done = concurrent.futures.wait(futures, timeout=timeout)
+        self._process_finished_commits()
+        return len(not_done)
 
     def _commit_prefill_progress(
         self, request: "Request", prompt_cache: list[Any], total_tokens: int
@@ -7023,7 +7133,7 @@ class Scheduler:
                 # streams are thread-local; see _async_store_cache_worker).
                 mx.eval(*arrays)
 
-        future = self._store_cache_executor.submit(
+        future = self._ensure_prefill_commit_executor().submit(
             self._commit_prefill_worker,
             rid,
             tokens,
@@ -10853,9 +10963,6 @@ class Scheduler:
                 return False
 
         self._clear_request_admission_bookkeeping(request_id)
-        # Committed prefill blocks stay in the prefix cache; let an in-flight
-        # commit finish before the table and snapshots are released below.
-        self._settle_prefill_commits(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -10902,24 +11009,32 @@ class Scheduler:
         # forever (#766).
         self._cleanup_specprefill(request_id)
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
-            block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, "block_table"):
-                block_table = request.block_table
-            if block_table:
-                released = self.paged_cache_manager.release_for_eviction(
-                    block_table.block_ids
-                )
-                if released > 0:
-                    logger.debug(
-                        f"Released {released} blocks for eviction on abort "
-                        f"(request {request_id})"
+        # Release blocks for eviction (same as _cleanup_finished) and drop the
+        # request's block-aware entry, boundary snapshots (RAM and SSD). Blocks
+        # an incremental prefill commit stored stay in the prefix cache; if a
+        # commit is still running, these steps wait for it (without blocking
+        # this thread) because the worker is using the table and snapshots.
+        def release_cache_state() -> None:
+            if self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+                if block_table is None and hasattr(request, "block_table"):
+                    block_table = request.block_table
+                if block_table:
+                    released = self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
                     )
+                    if released > 0:
+                        logger.debug(
+                            f"Released {released} blocks for eviction on abort "
+                            f"(request {request_id})"
+                        )
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
+            self._boundary_cache_snapshots.pop(request_id, None)
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id)
 
-        # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear_request_entry(request_id)
+        self._after_commit(request_id, release_cache_state)
 
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
@@ -10932,11 +11047,6 @@ class Scheduler:
             self.model.clear_vlm_position_state()
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
-
-        # Drop any boundary snapshot for this request.
-        self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
-            self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
         get_prefill_tracker().remove(request_id)
@@ -10980,6 +11090,7 @@ class Scheduler:
             or self.prefilling
             or self.running
             or self._pending_async_removes
+            or self._deferred_teardowns
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
@@ -11034,6 +11145,11 @@ class Scheduler:
             return 1
         return max(1, self.config.max_num_seqs)
 
+    def _drop_snapshots_now(self, request_id: str) -> None:
+        self._boundary_cache_snapshots.pop(request_id, None)
+        if self._boundary_snapshot_store is not None:
+            self._boundary_snapshot_store.cleanup_request(request_id)
+
     def _drop_boundary_snapshots_for_request(self, request_id: str) -> None:
         """Release a failed request's boundary snapshots (RAM and SSD).
 
@@ -11043,17 +11159,20 @@ class Scheduler:
         must do the same or every failure strands a snapshot set until
         process exit (#3226).
         """
-        self._settle_prefill_commits(request_id)
-        self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
-            try:
-                self._boundary_snapshot_store.cleanup_request(request_id)
-            except Exception as e:
-                logger.debug(
-                    "Boundary snapshot store cleanup failed for %s: %s",
-                    request_id,
-                    e,
-                )
+
+        def drop() -> None:
+            self._boundary_cache_snapshots.pop(request_id, None)
+            if self._boundary_snapshot_store is not None:
+                try:
+                    self._boundary_snapshot_store.cleanup_request(request_id)
+                except Exception as e:
+                    logger.debug(
+                        "Boundary snapshot store cleanup failed for %s: %s",
+                        request_id,
+                        e,
+                    )
+
+        self._after_commit(request_id, drop)
 
     def fail_all_requests(self) -> list[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -11754,6 +11873,11 @@ class Scheduler:
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
             if self._should_defer_for_cache_freshness(request):
+                break
+            if self._teardown_pending(request.request_id):
+                # A previous run of this id is still being torn down behind
+                # its prefill commit; the head waits (no blocking) so the
+                # deferred cleanup cannot hit the new run's state.
                 break
 
             request = self.waiting.popleft()
@@ -12743,11 +12867,16 @@ class Scheduler:
         very memory pressure that triggered the rejection) and orphan
         ``_request_tables`` entries.
         """
-        self._settle_prefill_commits(request_id)
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.release_cache(request_id)
-        elif self.paged_cache_manager is not None:
-            self.paged_cache_manager.delete_block_table(request_id)
+
+        def release_table() -> None:
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.release_cache(request_id)
+            elif self.paged_cache_manager is not None:
+                self.paged_cache_manager.delete_block_table(request_id)
+
+        # An in-flight prefill commit is still using the table: wait for it
+        # without blocking this thread.
+        self._after_commit(request_id, release_table)
 
         # SpecPrefill primes an independent ``_draft_prefix_cache`` in
         # ``_try_specprefill_scoring`` whose block refs are tracked
@@ -12765,6 +12894,19 @@ class Scheduler:
                     request_id,
                     exc_info=True,
                 )
+
+    def _release_finished_table(
+        self, request_id: str, request: "Request | None" = None
+    ) -> None:
+        """Release a finished request's blocks for eviction; drop its entry."""
+        block_table = None
+        if self.paged_cache_manager:
+            block_table = self.paged_cache_manager.get_block_table(request_id)
+            if block_table is None and request is not None:
+                block_table = getattr(request, "block_table", None)
+        if block_table and self.paged_cache_manager:
+            self.paged_cache_manager.release_for_eviction(block_table.block_ids)
+        self.block_aware_cache.clear_request_entry(request_id)
 
     def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
@@ -12794,9 +12936,16 @@ class Scheduler:
             if finished_drafter is not None:
                 finished_drafter.release_request(request_id)
             request = self.running.get(request_id)
-            # A mid-prefill commit still in flight must land (and retire its
-            # consumed snapshot markers) before the final store reads them.
-            self._settle_prefill_commits(request_id)
+            # A mid-prefill commit still in flight consumes its snapshot
+            # markers and extends the block table. Retire those markers from
+            # the final store's view now (assuming success: a failed commit
+            # only costs the cached tail), and chain the store after the
+            # commit on its worker so the two never race on the table.
+            commit_future = self._inflight_commit_future(request_id)
+            if commit_future is not None:
+                self._retire_committed_markers(
+                    request_id, self._prefill_commits[request_id][1]
+                )
 
             # Store cache for future reuse (G2-async): submit to background
             # executor so the post-finish 28GB+ memcpy doesn't block response
@@ -13023,6 +13172,7 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        after_commit=commit_future,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -13113,34 +13263,24 @@ class Scheduler:
                                 block_size,
                                 available_boundaries,
                             )
-                            block_table = None
-                            if self.paged_cache_manager:
-                                block_table = self.paged_cache_manager.get_block_table(
-                                    request_id
-                                )
-                            if block_table and self.paged_cache_manager:
-                                self.paged_cache_manager.release_for_eviction(
-                                    block_table.block_ids
-                                )
-                            self.block_aware_cache.clear_request_entry(request_id)
+                            self._after_commit(
+                                request_id,
+                                lambda rid=request_id: self._release_finished_table(
+                                    rid
+                                ),
+                            )
                         except Exception as e:
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
                             )
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
-                        block_table = None
-                        if self.paged_cache_manager:
-                            block_table = self.paged_cache_manager.get_block_table(
-                                request_id
-                            )
-                            if block_table is None and hasattr(request, "block_table"):
-                                block_table = request.block_table
-                        if block_table and self.paged_cache_manager:
-                            self.paged_cache_manager.release_for_eviction(
-                                block_table.block_ids
-                            )
-                        self.block_aware_cache.clear_request_entry(request_id)
+                        self._after_commit(
+                            request_id,
+                            lambda rid=request_id, req=request: (
+                                self._release_finished_table(rid, req)
+                            ),
+                        )
 
             # Remove from running
             if request_id in self.running:
@@ -13194,7 +13334,12 @@ class Scheduler:
             # an async store_future is in flight, defer cleanup until the
             # worker finishes (handled in _drain_pending_async_removes).
             if self._boundary_snapshot_store is not None and store_future is None:
-                self._boundary_snapshot_store.cleanup_request(request_id)
+                self._after_commit(
+                    request_id,
+                    lambda rid=request_id: self._boundary_snapshot_store.cleanup_request(
+                        rid
+                    ),
+                )
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -13522,10 +13667,10 @@ class Scheduler:
         for request in retry_candidates:
             request.generation_overflow_retries += 1
             request_id = request.request_id
-            self._settle_prefill_commits(request_id)
-            self._boundary_cache_snapshots.pop(request_id, None)
-            if self._boundary_snapshot_store is not None:
-                self._boundary_snapshot_store.cleanup_request(request_id)
+            self._after_commit(
+                request_id,
+                lambda rid=request_id: self._drop_snapshots_now(rid),
+            )
             get_prefill_tracker().remove(request_id)
             if request.generation_overflow_retries > max_generation_overflow_retries:
                 failed_ids.append(request_id)
@@ -13677,6 +13822,10 @@ class Scheduler:
             get_decode_activity().publish(
                 self._decode_activity_key, len(self.running)
             )
+
+        # Retire finished prefill commits and run the teardowns that waited
+        # for them (never blocks: only reads future state).
+        self._process_finished_commits()
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
@@ -14014,6 +14163,12 @@ class Scheduler:
         # use the same bounded teardown barrier as shutdown() before aborting
         # requests or clearing caches. The drain performs the request-local
         # cleanup only after every future has completed.
+        if self._wait_for_prefill_commits(FATAL_TEARDOWN_TIMEOUT_S):
+            fatal_exit(
+                "Scheduler reset timed out after "
+                f"{FATAL_TEARDOWN_TIMEOUT_S:.0f}s waiting for prefill commit(s)"
+            )
+            return
         inflight = list(self._inflight_store_futures.values())
         if inflight:
             logger.info(
@@ -14055,6 +14210,10 @@ class Scheduler:
         self._pending_async_removes.clear()
         self._inflight_store_futures.clear()
         self._inflight_store_info.clear()
+        self._deferred_teardowns.clear()
+        self._deferred_teardown_since.clear()
+        self._stuck_teardown_logged.clear()
+        self._prefill_commits.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()
         self.batch_generator = None
@@ -14135,6 +14294,36 @@ class Scheduler:
 
         logger.info("Deep reset completed - all caches cleared")
 
+    def _shutdown_prefill_commits(self) -> None:
+        """Finish or safely abandon prefill commits and their teardowns.
+
+        The bounded wait is acceptable here only. A commit that outlives it
+        is abandoned: its pending teardowns are dropped (the snapshot
+        directories are removed by ``cleanup_all`` and the process is going
+        away), and its executor is not joined.
+        """
+        executor = self._prefill_commit_executor
+        stragglers = self._wait_for_prefill_commits(PREFILL_COMMIT_SHUTDOWN_WAIT_S)
+        if stragglers:
+            logger.warning(
+                "Abandoning %d prefill commit(s) still running at shutdown "
+                "(%d pending teardown(s) dropped)",
+                stragglers,
+                len(self._deferred_teardowns),
+            )
+        elif executor is not None:
+            try:
+                executor.submit(clear_thread_streams).result(timeout=10)
+            except Exception as e:
+                logger.warning("Prefill commit worker stream cleanup failed: %s", e)
+        self._deferred_teardowns.clear()
+        self._deferred_teardown_since.clear()
+        self._stuck_teardown_logged.clear()
+        self._prefill_commits.clear()
+        if executor is not None:
+            executor.shutdown(wait=False)
+        self._prefill_commit_executor = None
+
     def _store_persistence_progress(self):
         manager = self.paged_ssd_cache_manager
         thread_id = getattr(self, "_store_cache_thread_id", None)
@@ -14157,6 +14346,7 @@ class Scheduler:
         # The store-cache gate is a non-blocking counter (#1496), so there is
         # no step-thread caller to wake here. Inflight futures are drained
         # below before the executor is asked to shut down.
+        self._shutdown_prefill_commits()
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
