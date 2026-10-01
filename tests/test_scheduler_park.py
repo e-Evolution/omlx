@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import test_scheduler_prefill_progress_commit as commit_rig
 from test_scheduler_prefill_progress_commit import BLOCK, _returns_promptly, _Rig
 
+import omlx.scheduler as scheduler_module
 from omlx.request import Request, RequestStatus, SamplingParams
 
 # Controllable commit worker fixture shared with the incremental-commit suite.
@@ -209,6 +210,7 @@ def test_a_sole_prefill_is_parkable_when_pressure_comes_from_elsewhere(
     try:
         only = submit(rig, "only", PROMPT_A, arrival=1.0)
         step_until(rig, lambda: prefilling_ids(rig) == ["only"])
+        rig.scheduler._park_hold_applies = lambda head: True  # isolate the park
         assert rig.scheduler.request_park_prefill() is True
         step(rig)
         assert only.parked and waiting_ids(rig) == ["only"]
@@ -276,6 +278,44 @@ def test_no_resume_before_the_required_consecutive_ok_polls(tmp_path, mock_token
             rig, lambda: "young" in prefilling_ids(rig) or young.output_token_ids
         )
         assert not young.parked
+    finally:
+        rig.close()
+
+
+def _parked_young(rig, level):
+    prefill_two(rig)
+    rig.scheduler.request_park_prefill()
+    step(rig)
+    assert waiting_ids(rig) == ["young"]
+    rig.scheduler.note_pressure_poll(level)
+    return rig.scheduler.requests["young"]
+
+
+def test_parked_head_passes_when_nothing_is_admitted(
+    tmp_path, mock_tokenizer, monkeypatch
+):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        _parked_young(rig, "soft")
+        monkeypatch.setattr(rig.scheduler, "_num_admitted_requests", lambda: 0)
+        assert rig.scheduler._park_hold_applies(rig.scheduler.waiting[0]) is False
+        step_until(rig, lambda: "young" in prefilling_ids(rig))
+    finally:
+        rig.close()
+
+
+def test_parked_head_is_released_after_the_max_hold_unless_hard(
+    tmp_path, mock_tokenizer
+):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        young = _parked_young(rig, "soft")
+        scheduler = rig.scheduler
+        assert scheduler._park_hold_applies(young) is True  # fresh park holds
+        young.parked_at -= scheduler_module.PARK_MAX_HOLD_S + 1
+        assert scheduler._park_hold_applies(young) is False  # soft: bounded
+        scheduler.note_pressure_poll("hard")
+        assert scheduler._park_hold_applies(young) is True  # hard: still held
     finally:
         rig.close()
 
@@ -427,6 +467,7 @@ def test_settling_after_a_park_defers_the_abort_for_a_few_polls(
     try:
         submit(rig, "only", PROMPT_A, arrival=1.0)
         step_until(rig, lambda: prefilling_ids(rig) == ["only"])
+        rig.scheduler._park_hold_applies = lambda head: True  # isolate the park
         rig.scheduler.request_park_prefill()
         step(rig)
         # Memory is returning to the OS; the enforcer must not abort yet.

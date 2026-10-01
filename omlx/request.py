@@ -248,6 +248,7 @@ class Request:
     # keeps its client stream and place in line and resumes from its last
     # committed prefix. ``parked`` is True from the park until the resume.
     parked: bool = False
+    parked_at: float = 0.0  # time.monotonic() of the latest park
     park_count: int = 0  # Parks taken so far (bounded by max_parks_per_request)
 
     # Request-scoped tool schemas used by protocol output parsers.
