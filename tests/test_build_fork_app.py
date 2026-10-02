@@ -283,7 +283,9 @@ def test_default_env_enables_d1_and_park(bfa):
     assert bfa.FORK_ENV == {
         "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
         "OMLX_MEMORY_PRESSURE_PARK": "true",
+        "OMLX_MLX_CACHE_LIMIT_GB": "16",
     }
+    assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
 
 
 # ------------------------------------------------------------ updater patch
