@@ -1163,3 +1163,89 @@ class TestReportRaggedControlEngaged:
 
     def test_not_engaged_is_flagged_invalid(self):
         assert "not valid" in self._md(False)
+
+
+class TestClassifyP5Session:
+    GUARD = (
+        "oMLX memory guard aborted this request mid-prefill: Request aborted: "
+        "process memory limit exceeded (usage 106.2 GB)"
+    )
+    # Normal answer that merely talks about the guard (the original false positive).
+    TALKS = (
+        "The process_memory_enforcer module enforces a memory limit exceeded "
+        "policy and aborted requests are reported with prefill_memory_exceeded. "
+    ) * 5
+
+    def test_answer_that_discusses_memory_code_is_success(self):
+        r = bm.classify_p5_session(self.TALKS, "Warning: x\n", 0)
+        assert r["ok"] is True
+        assert r["memory_failure"] is False
+        assert r["recovered"] is False
+
+    def test_guard_abort_in_stderr_is_failure(self):
+        r = bm.classify_p5_session("", self.GUARD, 1)
+        assert r["ok"] is False
+        assert r["memory_failure"] is True
+        assert r["memory_signature"] is True
+
+    def test_error_line_on_stdout_is_failure(self):
+        out = "Error: prefill_memory_exceeded for request 12\n"
+        r = bm.classify_p5_session(out, "", 1)
+        assert r["memory_failure"] is True and r["ok"] is False
+
+    def test_signature_mid_line_on_stdout_is_not_a_failure(self):
+        out = "x" * 300 + "\nthe text says Error: prefill_memory_exceeded here"
+        r = bm.classify_p5_session(out, "", 0)
+        assert r["memory_failure"] is False and r["ok"] is True
+
+    @pytest.mark.parametrize(
+        "sig",
+        [
+            "process memory limit exceeded",
+            "prefill_memory_exceeded",
+            "prefill_memory_aborted",
+            "memory_admission_stalled",
+            "Model 'Qwen3.8' is busy",
+        ],
+    )
+    def test_each_signature_detected(self, sig):
+        assert bm.classify_p5_session("", f"boom {sig}", 1)["memory_failure"]
+
+    def test_recovered_when_signature_but_full_output_exit_zero(self):
+        r = bm.classify_p5_session("a" * 400, self.GUARD, 0)
+        assert r["recovered"] is True
+        assert r["memory_failure"] is False
+        assert r["ok"] is True
+
+    def test_exit_nonzero_or_short_output_is_not_ok(self):
+        assert bm.classify_p5_session("a" * 400, "", 1)["ok"] is False
+        assert bm.classify_p5_session("a" * 50, "", 0)["ok"] is False
+        assert bm.classify_p5_session("a" * 400, "", None)["ok"] is False
+
+
+def _p5s(variant, mode, completed, manual, n=3):
+    return {
+        "variant": variant,
+        "mode": mode,
+        "sessions": n,
+        "completed": completed,
+        "manual_interventions": manual,
+        "rows": [],
+    }
+
+
+class TestEvalP5:
+    def test_pass_when_fork_with_clean_and_baseline_fails(self):
+        v = bm.eval_p5(_p5s("fork", "with", 3, 0), _p5s("upstream", "without", 0, 3))
+        assert v["verdict"] == "PASS"
+
+    def test_fail_when_fork_with_needs_a_human(self):
+        v = bm.eval_p5(_p5s("fork", "with", 2, 1), _p5s("upstream", "without", 0, 3))
+        assert v["verdict"] == "FAIL"
+
+    def test_inconclusive_when_baseline_never_failed(self):
+        v = bm.eval_p5(_p5s("fork", "with", 3, 0), _p5s("upstream", "without", 3, 0))
+        assert v["verdict"] != "PASS"
+
+    def test_missing_summary_is_inconclusive(self):
+        assert bm.eval_p5(None, None)["verdict"] == "INCONCLUSIVE"

@@ -20,6 +20,8 @@
 #   SESSIONS [3]         concurrent pi sessions
 #   PROVIDER [omlx]      pi provider name;  MODEL [Qwen3.8-27B-oQ4e-mtp]
 #   MODE [with]          with | without | both
+#   VARIANT [fork]       fork | upstream; output goes to $OUT/p5/<VARIANT>-<MODE>
+#                        so the two servers never overwrite each other
 #   PROVIDER_EXT []      path of the pi-omlx provider extension; REQUIRED for
 #                        "without": runs `pi -ne -e $PROVIDER_EXT` so only the
 #                        provider is loaded (no pi-omlx-unattended).
@@ -34,6 +36,7 @@ SESSIONS="${SESSIONS:-3}"
 PROVIDER="${PROVIDER:-omlx}"
 MODEL="${MODEL:-Qwen3.8-27B-oQ4e-mtp}"
 MODE="${MODE:-with}"
+VARIANT="${VARIANT:-fork}"
 TIMEOUT_S="${TIMEOUT_S:-5400}"
 SERVER_LOG="${SERVER_LOG:-}"
 OUT="${OUT:-/tmp/omlx-unattended-bench}/p5"
@@ -54,7 +57,7 @@ curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 \
   || { echo "no healthy server on port ${PORT}" >&2; exit 2; }
 
 run_mode() {
-  local mode="$1" dir="$OUT/$1" pids=() start end i
+  local mode="$1" dir="$OUT/${VARIANT}-$1" pids=() start end i
   mkdir -p "$dir"
   local ext_args=()
   if [ "$mode" = "without" ]; then
@@ -68,12 +71,14 @@ run_mode() {
     local files=() f
     for f in $(file_set "$i"); do files+=("@$REPO/$f"); done
     (
+      SECONDS=0
       cd "$REPO" || exit 99
       pi -p --no-session --provider "$PROVIDER" --model "$MODEL" ${ext_args[@]+"${ext_args[@]}"} \
         "${files[@]}" \
         "Read the attached files and write about 200 words per file on its responsibilities. Do not call tools." \
         >"$dir/session$i.out" 2>"$dir/session$i.err"
       echo $? >"$dir/session$i.exit"
+      echo "$SECONDS" >"$dir/session$i.wall"
     ) &
     pids+=($!)
     sleep 2
@@ -88,35 +93,9 @@ run_mode() {
   kill "$wd" 2>/dev/null
   end=$(date +%s)
 
-  python3 - "$dir" "$mode" "$SESSIONS" "$((end - start))" "$SERVER_LOG" "$log_off" <<'PY'
-import json, re, sys
-from pathlib import Path
-d, mode, n, wall, log, off = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
-completed = manual = mem_err = 0
-rows = []
-pat = re.compile(r"memory|aborted|limit exceeded|prefill_memory", re.I)
-for i in range(n):
-    out = (d / f"session{i}.out").read_text(errors="replace") if (d / f"session{i}.out").exists() else ""
-    err = (d / f"session{i}.err").read_text(errors="replace") if (d / f"session{i}.err").exists() else ""
-    ex = (d / f"session{i}.exit")
-    code = int(ex.read_text().strip()) if ex.exists() else None
-    mem = bool(pat.search(out + err))
-    ok = code == 0 and len(out.strip()) > 200 and not mem
-    completed += ok
-    manual += (not ok)  # needs a human: crashed, timed out, empty, or surfaced a memory error
-    mem_err += mem
-    rows.append({"session": i, "exit": code, "out_chars": len(out), "memory_error_text": mem, "ok": ok})
-aborts = None
-if log and Path(log).exists():
-    with open(log, "rb") as f:
-        f.seek(off)
-        aborts = len(re.findall(r"[Aa]borted \d+ request", f.read().decode("utf-8", "replace")))
-(d.parent / f"p5-{mode}-summary.json").write_text(json.dumps(
-    {"mode": mode, "sessions": n, "completed": completed, "manual_interventions": manual,
-     "memory_errors_seen": mem_err, "wall_s": wall, "server_aborts": aborts, "rows": rows}, indent=2))
-print(json.dumps({"mode": mode, "completed": completed, "manual_interventions": manual,
-                  "memory_errors_seen": mem_err, "wall_s": wall, "server_aborts": aborts}))
-PY
+  python3 "$(dirname "$0")/p5_summarize.py" "$dir" --variant "$VARIANT" --mode "$mode" \
+    --sessions "$SESSIONS" --wall-s "$((end - start))" \
+    --server-log "$SERVER_LOG" --log-offset "$log_off"
 }
 
 case "$MODE" in

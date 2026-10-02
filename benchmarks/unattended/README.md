@@ -118,11 +118,18 @@ $PY benchmarks/unattended/bench_premises.py --variant fork --serve --port 8001 \
     --allow-port 8001 --max-concurrent 3
 # wait for the READY line, then terminal 2:
 SERVER_LOG=~/.omlx-bench/fork-P6/logs/server.log MODE=with   benchmarks/unattended/p5_pi_unattended.sh
-SERVER_LOG=~/.omlx-bench/fork-P6/logs/server.log MODE=without \
+SERVER_LOG=~/.omlx-bench/fork-P6/logs/server.log MODE=without VARIANT=fork \
   PROVIDER_EXT=<path of the pi-omlx provider extension> benchmarks/unattended/p5_pi_unattended.sh
 # stop terminal 1 with Ctrl-C when done.
 ```
 
 The user's pi key is the one copied from `~/.omlx/settings.json` into the bench
 base path, so pi authenticates without extra setup. Summaries land in
-`<out>/p5/` and `report.py` includes them.
+`<out>/p5/p5-<variant>-<mode>-summary.json` (session files in
+`<out>/p5/<variant>-<mode>/`, `VARIANT` defaults to `fork`; use `VARIANT=upstream`
+against the upstream server so runs never overwrite each other). A session is a
+memory failure only when an oMLX error signature appears in stderr or on an
+`Error:` stdout line (`bench_metrics.classify_p5_session`); a signature followed
+by exit 0 with a full answer counts as recovered, i.e. success. The P5 verdict
+passes when fork-with has 0 manual interventions and upstream-without shows the
+failure mode. `report.py` includes it.

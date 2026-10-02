@@ -1057,3 +1057,121 @@ def eval_p4(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
         # Information only (no longer a criterion).
         "row_ratios": ratios,
     }
+
+
+# ---------------------------------------------------------------------------
+# P5 - pi-driven unattended batch
+# ---------------------------------------------------------------------------
+
+# oMLX error signatures. Plain words such as "memory" or "aborted" are NOT
+# signatures: the sessions summarize oMLX source and would match them.
+P5_MEMORY_SIGNATURE = re.compile(
+    r"oMLX memory guard"
+    r"|process memory limit exceeded"
+    r"|prefill_memory_exceeded"
+    r"|prefill_memory_aborted"
+    r"|memory_admission_stalled"
+    r"|Model '[^']*' is busy"
+)
+P5_MIN_OUTPUT_CHARS = 200
+
+
+def classify_p5_session(out: str, err: str, exit_code: int | None) -> dict[str, Any]:
+    """Classify one pi session.
+
+    A memory signature only counts in stderr or on a stdout line that starts
+    with "Error:". A session that saw a signature but still exited 0 with a
+    full answer was recovered (extension or auto-continue) and is a success.
+    """
+    err_hit = bool(P5_MEMORY_SIGNATURE.search(err or ""))
+    out_hit = any(
+        line.lstrip().startswith("Error:") and P5_MEMORY_SIGNATURE.search(line)
+        for line in (out or "").splitlines()
+    )
+    signature = err_hit or out_hit
+    complete = exit_code == 0 and len((out or "").strip()) > P5_MIN_OUTPUT_CHARS
+    recovered = signature and complete
+    memory_failure = signature and not complete
+    return {
+        "memory_signature": signature,
+        "memory_failure": memory_failure,
+        "recovered": recovered,
+        "ok": complete and not memory_failure,
+    }
+
+
+def summarize_p5(
+    d: Path,
+    variant: str,
+    mode: str,
+    n: int,
+    wall_s: int | None,
+    log_text: str | None = None,
+) -> dict[str, Any]:
+    """Build the P5 summary for one variant/mode directory of session files."""
+
+    def read(p: Path) -> str:
+        return p.read_text(errors="replace") if p.exists() else ""
+
+    rows = []
+    for i in range(n):
+        out, err = read(d / f"session{i}.out"), read(d / f"session{i}.err")
+        ex, wl = read(d / f"session{i}.exit").strip(), read(d / f"session{i}.wall").strip()
+        code = int(ex) if ex else None
+        row = {
+            "session": i,
+            "exit": code,
+            "out_chars": len(out),
+            "wall_s": int(wl) if wl.isdigit() else None,
+        }
+        row.update(classify_p5_session(out, err, code))
+        rows.append(row)
+    aborts = (
+        None
+        if log_text is None
+        else len(re.findall(r"[Aa]borted \d+ request", log_text))
+    )
+    return {
+        "variant": variant,
+        "mode": mode,
+        "sessions": n,
+        "completed": sum(r["ok"] for r in rows),
+        "manual_interventions": sum(not r["ok"] for r in rows),
+        "memory_failures": sum(r["memory_failure"] for r in rows),
+        "recovered": sum(r["recovered"] for r in rows),
+        "wall_s": wall_s,
+        "server_aborts": aborts,
+        "rows": rows,
+    }
+
+
+def eval_p5(
+    fork_with: dict[str, Any] | None, baseline: dict[str, Any] | None
+) -> dict[str, Any]:
+    """P5: with the extension the batch needs no human; the baseline does."""
+    if not fork_with or not baseline:
+        return _inconclusive("need fork-with and upstream-without P5 summaries")
+    n = fork_with.get("sessions")
+    fw_ok = (
+        fork_with.get("completed") == n and fork_with.get("manual_interventions") == 0
+    )
+    base_manual = baseline.get("manual_interventions") or 0
+    checks = [
+        _check(
+            "fork+extension completes unattended",
+            fw_ok,
+            f"completed {fork_with.get('completed')}/{n}, "
+            f"manual {fork_with.get('manual_interventions')}",
+        ),
+        _check(
+            "baseline shows the failure mode",
+            base_manual > 0,
+            f"upstream without extension: manual {base_manual}/"
+            f"{baseline.get('sessions')}",
+        ),
+    ]
+    if fw_ok and base_manual == 0:
+        v = _inconclusive("baseline never failed; the run did not create pressure")
+        v["checks"] = checks
+        return v
+    return {"verdict": _verdict(checks), "checks": checks}
