@@ -416,67 +416,205 @@ class TestEvalP2:
         assert bm.eval_p2([_p2(0, 20.0)], [], pool_limit_gb=21.0)["verdict"] == "PASS"
 
 
-def _p3(identical=True, b3_line=3, rows_ok=True):
-    rows = []
-    for name in ("20k", "45k", "135k"):
-        alone = {"ok": rows_ok, "text": "abc def", "completion_tokens": 7}
-        batched = {
-            "ok": rows_ok,
-            "text": "abc def" if identical else "abc xyz",
-            "completion_tokens": 7,
-        }
-        rows.append({"name": name, "alone": alone, "batched": batched})
+BASE_TEXT = " ".join(f"w{i}" for i in range(200))
+CHUNK = 5  # chars per streamed chunk in the fixtures -> 32 tokens = 160 chars
+
+
+def _out(text, ok=True):
+    return {
+        "ok": ok,
+        "text": text,
+        "completion_tokens": 200,
+        "chunk_chars": [CHUNK] * 100,
+    }
+
+
+def _p3row(name, diverge_at=None, degenerate=False, ok=True, cold_differs=False):
+    b3 = BASE_TEXT
+    if degenerate:
+        b3 = "alpha beta gamma delta " * 60
+    elif diverge_at is not None:
+        b3 = BASE_TEXT[:diverge_at] + "#" + BASE_TEXT[diverge_at + 1 :]
+    return {
+        "name": name,
+        "alone": _out(BASE_TEXT + (" x" if cold_differs else ""), ok),
+        "alone_restored": _out(BASE_TEXT, ok),
+        "batched": _out(b3, ok),
+    }
+
+
+def _p3(diverge_at=None, degenerate=False, batch_b=3, rows_ok=True, cold_differs=False):
+    rows = [
+        _p3row(n, diverge_at, degenerate, rows_ok, cold_differs)
+        for n in ("20k", "45k", "135k")
+    ]
     log = bm.parse_server_log("")
-    log["tq_batched_fused_max_b"] = b3_line
+    log["batch_max_b"] = batch_b
     return _run({"rows": rows}, log=log)
+
+
+class TestTextMetrics:
+    def test_distinct4_all_unique(self):
+        assert bm.distinct_ngram_ratio(BASE_TEXT, 4) == 1.0
+
+    def test_distinct4_loop_is_low(self):
+        assert bm.distinct_ngram_ratio("a b c d " * 50, 4) < 0.05
+
+    def test_distinct4_too_short_is_none(self):
+        assert bm.distinct_ngram_ratio("a b c", 4) is None
+
+    def test_is_degenerate_relative_and_floor(self):
+        assert bm.is_degenerate(0.9, 0.4)  # < 0.5 * 0.9
+        assert not bm.is_degenerate(0.9, 0.46)
+        assert bm.is_degenerate(0.4, 0.25)  # below absolute floor 0.3
+        assert not bm.is_degenerate(0.2, 0.19)  # baseline already below floor
+        assert not bm.is_degenerate(None, 0.9)
+        assert not bm.is_degenerate(0.9, None)
+
+    def test_first_divergence(self):
+        assert bm.first_divergence("abcdef", "abcxyz") == 3
+        assert bm.first_divergence("abc", "abc") is None
+        assert bm.first_divergence("abc", "abcd") == 3
+
+    def test_prefix_chars_counts_first_n_chunks(self):
+        assert bm.prefix_chars([3, 4, 5, 6], 2) == 7
+        assert bm.prefix_chars([3, 4], 32) == 7
+
+    def test_chunk_index_at_char(self):
+        assert bm.chunk_index_at_char([5, 5, 5], 0) == 0
+        assert bm.chunk_index_at_char([5, 5, 5], 7) == 1
+        assert bm.chunk_index_at_char([5, 5, 5], 99) == 3
+
+    def test_spread(self):
+        assert bm.spread([3.0, None, 1.0, 2.0]) == (1.0, 3.0)
+        assert bm.spread([]) == (None, None)
+
+
+def _chunks(start, rate, n):
+    return [start + k / rate for k in range(n)]
+
+
+class TestAggregateDecodeRate:
+    def test_sum_of_row_rates_over_common_window(self):
+        rows = [
+            {"chunk_times": _chunks(0.0, 10.0, 101), "completion_tokens": 101}
+            for _ in range(3)
+        ]
+        assert bm.aggregate_decode_rate(rows)["rate"] == pytest.approx(30.0)
+
+    def test_window_excludes_rows_not_yet_decoding(self):
+        rows = [
+            {"chunk_times": _chunks(0.0, 10.0, 301), "completion_tokens": 301},
+            {"chunk_times": _chunks(0.0, 10.0, 301), "completion_tokens": 301},
+            {"chunk_times": _chunks(10.0, 10.0, 301), "completion_tokens": 301},
+        ]
+        r = bm.aggregate_decode_rate(rows)
+        assert r["window_s"] == pytest.approx(20.0)
+        assert r["rate"] == pytest.approx(30.0, rel=0.01)
+
+    def test_tokens_per_chunk_scaling(self):
+        rows = [
+            {"chunk_times": _chunks(0.0, 10.0, 101), "completion_tokens": 202}
+            for _ in range(3)
+        ]
+        assert bm.aggregate_decode_rate(rows)["rate"] == pytest.approx(60.0, rel=0.02)
+
+    def test_no_common_window(self):
+        rows = [
+            {"chunk_times": _chunks(0.0, 10.0, 11), "completion_tokens": 11},
+            {"chunk_times": _chunks(100.0, 10.0, 11), "completion_tokens": 11},
+        ]
+        r = bm.aggregate_decode_rate(rows)
+        assert r["rate"] is None and r["window_s"] is None
+
+    def test_missing_timestamps(self):
+        assert bm.aggregate_decode_rate([{"completion_tokens": 5}])["rate"] is None
+
+
+class TestParseBatchLog:
+    def test_mtp_batch_line(self):
+        m = bm.parse_server_log("INFO Lightning MTP batch activated for 3 sequences\n")
+        assert m["mtp_batch_max"] == 3 and m["batch_max_b"] == 3
+
+    def test_batch_max_uses_both_sources(self):
+        m = bm.parse_server_log(
+            "Lightning MTP batch activated for 2 sequences\n"
+            "TurboQuant batched attention: per-row fused path (B=3)\n"
+        )
+        assert m["batch_max_b"] == 3
+        assert bm.parse_server_log("")["batch_max_b"] == 0
 
 
 class TestEvalP3:
     def test_pass(self):
-        assert bm.eval_p3([_p3()], [_p3(identical=False)])["verdict"] == "PASS"
+        assert bm.eval_p3([_p3()], [_p3(diverge_at=10)])["verdict"] == "PASS"
 
-    def test_fail_on_mismatch(self):
-        r = bm.eval_p3([_p3(identical=False)], [])
+    def test_fail_on_divergence_inside_first_32_tokens(self):
+        r = bm.eval_p3([_p3(diverge_at=100)], [])
         assert r["verdict"] == "FAIL"
+        assert any("32" in c["name"] and not c["ok"] for c in r["checks"])
+
+    def test_late_divergence_is_allowed(self):
+        r = bm.eval_p3([_p3(diverge_at=300)], [])
+        assert r["verdict"] == "PASS"
+        assert r["fork"]["detail"][0]["first_divergence_chars"] == 300
+
+    def test_fail_on_degeneration(self):
+        r = bm.eval_p3([_p3(degenerate=True)], [])
+        assert r["verdict"] == "FAIL"
+        assert any("degenerat" in c["name"] and not c["ok"] for c in r["checks"])
 
     def test_fail_when_batch_not_exercised(self):
-        r = bm.eval_p3([_p3(b3_line=0)], [])
+        r = bm.eval_p3([_p3(batch_b=2)], [])
         assert r["verdict"] == "FAIL"
         assert any("batch" in c["name"] and not c["ok"] for c in r["checks"])
 
     def test_fail_when_request_failed(self):
         assert bm.eval_p3([_p3(rows_ok=False)], [])["verdict"] == "FAIL"
 
-    def test_upstream_mismatch_count_reported(self):
-        r = bm.eval_p3([_p3()], [_p3(identical=False)])
-        assert r["upstream"]["mismatched_rows"] == 3
-        assert r["fork"]["mismatched_rows"] == 0
+    def test_upstream_detail_is_reported_not_judged(self):
+        r = bm.eval_p3([_p3()], [_p3(diverge_at=10, degenerate=False)])
+        d = r["upstream"]["detail"][0]
+        assert d["first_divergence_chars"] == 10
+        assert d["diverged_in_prefix"] is True
+        assert r["upstream"]["batch_max_b"] == 3
+        up = bm.eval_p3([_p3()], [_p3(degenerate=True)])["upstream"]
+        assert up["degenerate_rows"] == 3
+        assert up["detail"][0]["d4_b3"] < up["detail"][0]["d4_b1"]
 
-    def test_common_prefix_len(self):
-        assert bm.common_prefix_len("abcdef", "abcxyz") == 3
-        assert bm.common_prefix_len("", "a") == 0
+    def test_cold_vs_restored_is_informational(self):
+        r = bm.eval_p3([_p3(cold_differs=True)], [])
+        assert r["verdict"] == "PASS"
+        assert r["fork"]["cold_vs_restored_mismatched_rows"] == 3
 
 
 def _p4(
     serial_wall,
     conc_wall,
     decs_serial=(20.0, 20.0, 20.0),
-    decs_conc=(12.0, 12.0, 12.0),
+    rates_conc=(10.0, 10.0, 10.0),
     aborts=0,
     ok=True,
+    start_offsets=(0.0, 0.0, 0.0),
 ):
     log = bm.parse_server_log("")
     log["aborts_total"] = aborts
+    conc = [
+        _req(
+            dec=r,
+            ok=ok,
+            completion_tokens=201,
+            chunk_times=_chunks(off, r, 201),
+        )
+        for r, off in zip(rates_conc, start_offsets)
+    ]
     return _run(
         {
             "serial": {
                 "wall_s": serial_wall,
                 "requests": [_req(dec=d, ok=ok) for d in decs_serial],
             },
-            "concurrent": {
-                "wall_s": conc_wall,
-                "requests": [_req(dec=d, ok=ok) for d in decs_conc],
-            },
+            "concurrent": {"wall_s": conc_wall, "requests": conc},
         },
         log=log,
     )
@@ -484,28 +622,58 @@ def _p4(
 
 class TestEvalP4:
     def test_pass(self):
-        assert bm.eval_p4([_p4(600, 400)], [_p4(600, 500)])["verdict"] == "PASS"
+        r = bm.eval_p4([_p4(600, 400)], [_p4(600, 500)])
+        assert r["verdict"] == "PASS"
+        assert r["fork"]["aggregate_decode_tps"] == pytest.approx(30.0, rel=0.02)
 
-    def test_fail_when_concurrent_not_faster(self):
+    def test_equal_wall_passes(self):
+        assert bm.eval_p4([_p4(600, 600)], [])["verdict"] == "PASS"
+
+    def test_fail_when_concurrent_slower(self):
         assert bm.eval_p4([_p4(600, 650)], [])["verdict"] == "FAIL"
 
     def test_fail_on_abort(self):
         assert bm.eval_p4([_p4(600, 400, aborts=1)], [])["verdict"] == "FAIL"
 
-    def test_fail_when_row_below_half(self):
-        assert (
-            bm.eval_p4([_p4(600, 400, decs_conc=(12.0, 9.0, 12.0))], [])["verdict"]
-            == "FAIL"
-        )
+    def test_fail_when_aggregate_below_single_row(self):
+        r = bm.eval_p4([_p4(600, 400, rates_conc=(5.0, 5.0, 5.0))], [])
+        assert r["verdict"] == "FAIL"
+        assert any("aggregate" in c["name"] and not c["ok"] for c in r["checks"])
+
+    def test_per_row_ratio_is_information_only(self):
+        r = bm.eval_p4([_p4(600, 400, rates_conc=(10.0, 10.0, 10.0))], [])
+        assert r["verdict"] == "PASS"
+        assert r["row_ratios"] == [0.5, 0.5, 0.5]
+        assert all("per-row" not in c["name"] for c in r["checks"])
+
+    def test_fail_without_common_decode_window(self):
+        r = bm.eval_p4([_p4(600, 400, start_offsets=(0.0, 0.0, 500.0))], [])
+        assert r["verdict"] == "FAIL"
+        assert any("no window" in c["detail"] for c in r["checks"])
 
     def test_fail_when_request_failed(self):
         assert bm.eval_p4([_p4(600, 400, ok=False)], [])["verdict"] == "FAIL"
 
-    def test_exactly_half_passes(self):
-        assert (
-            bm.eval_p4([_p4(600, 400, decs_conc=(10.0, 10.0, 10.0))], [])["verdict"]
-            == "PASS"
-        )
+
+class TestEvalP6Attribution:
+    def test_spread_and_attribution(self):
+        up = [_run({"request": _req(p, 20)}) for p in (990, 1000, 1010)]
+        off = [_run({"request": _req(p, 20)}) for p in (940, 950, 960)]
+        fk = [_run({"request": _req(p, 20)}) for p in (900, 910, 920)]
+        r = bm.eval_p6(up, fk, off)
+        assert r["fork"]["prefill_tps_min"] == 900
+        assert r["fork"]["prefill_tps_max"] == 920
+        assert r["fork_off"]["prefill_tps"] == 950
+        a = r["attribution"]
+        assert a["prefill_pct_forkoff_vs_upstream"] == pytest.approx(-5.0)
+        assert a["prefill_pct_fork_vs_forkoff"] == pytest.approx(-4.2105, abs=0.01)
+        assert r["verdict"] == "FAIL"  # verdict stays fork vs upstream
+
+    def test_without_fork_off(self):
+        up = [_run({"request": _req(1000, 20)})]
+        fk = [_run({"request": _req(1000, 20)})]
+        r = bm.eval_p6(up, fk)
+        assert r["fork_off"] is None and r["attribution"] == {}
 
 
 class TestPromptSizing:
@@ -554,20 +722,6 @@ class TestSafety:
         assert bm.port_allowed(8002, allow=[])
         assert not bm.port_allowed(8001, allow=[])
         assert bm.port_allowed(8001, allow=[8001])
-
-
-class TestP3CacheRestoreInfo:
-    def test_alone_cached_mismatch_is_counted_separately(self):
-        run = _p3()
-        for row in run["scenario"]["rows"]:
-            row["alone_cached"] = {
-                "ok": True,
-                "text": "different",
-                "completion_tokens": 7,
-            }
-        s = bm.eval_p3([run], [])
-        assert s["verdict"] == "PASS"  # spec compares B=1 vs B=3 only
-        assert s["fork"]["cache_restore_mismatched_rows"] == 3
 
 
 import bench_premises as bp  # noqa: E402
@@ -645,3 +799,29 @@ class TestVariantConfig:
         assert s["scheduler"]["memory_pressure_park"] is False
         assert s["scheduler"]["max_batched_decode_context_tokens"] == 0
         assert s["memory"]["mlx_cache_limit_gb"] == 0.0
+
+
+class TestPerFeatureVariants:
+    def test_d1_only(self):
+        env = bp.variant_env("fork-d1only", "P6")
+        assert env["OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS"] == "4"
+        assert env["OMLX_MEMORY_PRESSURE_PARK"] == "false"
+        assert env["OMLX_MLX_CACHE_LIMIT_GB"] == "0"
+        assert env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] == "0"
+
+    def test_cachelimit_only(self):
+        env = bp.variant_env("fork-cachelimit-only", "P6")
+        assert env["OMLX_MLX_CACHE_LIMIT_GB"] == "16"
+        assert env["OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS"] == "0"
+
+    def test_fork_off_p3_batching_allowed(self):
+        assert (
+            bp.variant_env("fork-off", "P3")["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"]
+            == "0"
+        )
+
+    def test_variant_names_include_all(self):
+        assert {"upstream", "fork", "fork-off", "fork-d1only"} <= set(bp.VARIANTS)
+
+    def test_p3_plan_cold_then_restored_then_batched(self):
+        assert bp.P3_PHASES == ("cold", "alone_restored", "batched")

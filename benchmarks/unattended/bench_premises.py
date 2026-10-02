@@ -72,6 +72,14 @@ FORK_OFF_ENV = {
     "OMLX_MLX_CACHE_LIMIT_GB": "0",
     "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "0",
 }
+# Fork code with exactly one feature on (P6 prefill-delta attribution).
+FORK_ONLY_ON = {
+    "fork-d1only": {"OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4"},
+    "fork-cachelimit-only": {"OMLX_MLX_CACHE_LIMIT_GB": "16"},
+}
+VARIANTS = ["upstream", "fork", "fork-off", *FORK_ONLY_ON]
+# P3 flow: cold B=1 (populates the prefix cache), B=1 restored, B=3 restored.
+P3_PHASES = ("cold", "alone_restored", "batched")
 # settings.json keys that only exist in the fork (stripped for upstream).
 FORK_ONLY_SETTINGS = {
     "scheduler": [
@@ -102,6 +110,7 @@ def variant_env(variant: str, premise: str) -> dict[str, str]:
     if variant == "upstream":
         return {}
     env = dict(FORK_ON_ENV if variant == "fork" else FORK_OFF_ENV)
+    env.update(FORK_ONLY_ON.get(variant, {}))
     if premise == "P3":
         # Disable the T5b gate so the three rows really batch.
         env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] = "0"
@@ -494,6 +503,7 @@ async def stream_chat(
     name: str = "",
     cancel_after_s: float | None = None,
     keep_text: bool = False,
+    keep_chunks: bool = False,
 ) -> dict[str, Any]:
     body = {
         "model": MODEL,
@@ -559,6 +569,11 @@ async def stream_chat(
     )
     if keep_text:
         result["text"] = fin["text"]
+    if keep_chunks:
+        # Per-chunk arrival times (relative to the run start) and sizes: the
+        # raw material for the steady-decode window and the 32-token prefix.
+        result["chunk_times"] = [round(t - t_zero, 3) for t in fin["chunk_times"]]
+        result["chunk_chars"] = fin["chunk_chars"]
     return result
 
 
@@ -665,53 +680,59 @@ async def scenario_p2(ctx: Ctx) -> dict[str, Any]:
 
 
 async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
+    """Like-for-like batch correctness (all arms read from the prefix cache).
+
+    1. cold B=1 per prompt: populates the prefix cache only.
+    2. B=1 restored per prompt: the reference output.
+    3. B=3 restored, started together: the short suffix prefills finish
+       quickly, so all three rows DECODE in one batch.
+    """
     lens = [("20k", 20_000), ("45k", 45_000), ("135k", 135_000)]
     mt = ctx.mt(ctx.args.p3_max_tokens)
     prompts = {
         name: ctx.corpus.prompt(ctx.seed("P3", name), ctx.n(nom)) for name, nom in lens
     }
     rows: dict[str, dict[str, Any]] = {name: {"name": name} for name, _ in lens}
-    for name, _ in lens:  # B=1, cold cache
-        rows[name]["alone"] = await ctx.chat(
-            prompts[name], mt, SAMPLING_GREEDY, name=f"{name}-alone", keep_text=True
+
+    async def one(name: str, tag: str) -> dict[str, Any]:
+        return await ctx.chat(
+            prompts[name],
+            mt,
+            SAMPLING_GREEDY,
+            name=f"{name}-{tag}",
+            keep_text=True,
+            keep_chunks=True,
         )
+
+    for name, _ in lens:  # cold: populate the prefix cache
+        rows[name]["alone"] = await one(name, "cold")
+    for name, _ in lens:  # B=1, restored
+        rows[name]["alone_restored"] = await one(name, "alone-restored")
     off = ctx.server.log_size()
     t = time.time()
     order = [name for name, _ in reversed(lens)]  # longest first
-    batched = await asyncio.gather(
-        *[
-            ctx.chat(
-                prompts[nm], mt, SAMPLING_GREEDY, name=f"{nm}-batched", keep_text=True
-            )
-            for nm in order
-        ]
-    )
+    batched = await asyncio.gather(*[one(nm, "batched") for nm in order])
     batched_wall = round(time.time() - t, 2)
     for nm, res in zip(order, batched):
         rows[nm]["batched"] = res
     batch_log = bm.parse_server_log(ctx.server.log_since(off))
-    for name, _ in lens:  # B=1 again, now restored from the prefix cache
-        rows[name]["alone_cached"] = await ctx.chat(
-            prompts[name],
-            mt,
-            SAMPLING_GREEDY,
-            name=f"{name}-alone-cached",
-            keep_text=True,
-        )
     return {
         "rows": [rows[name] for name, _ in lens],
         "batched_wall_s": batched_wall,
         "batched_log_window": {
+            "batch_max_b": batch_log["batch_max_b"],
             "tq_batched_fused_rows": batch_log["tq_batched_fused_rows"],
+            "mtp_batch_rows": batch_log["mtp_batch_rows"],
             "restores": batch_log["restores"],
         },
-        "note": "batched arm hits the prefix cache populated by the B=1 arm (guarantees overlapping decode)",
+        "phases": list(P3_PHASES),
+        "note": "cold B=1 only populates the cache; B=1 restored vs B=3 restored is the comparison",
     }
 
 
 async def scenario_p4(ctx: Ctx) -> dict[str, Any]:
     lens = [("20k", 20_000), ("45k", 45_000), ("90k", 90_000)]
-    mt = ctx.mt(512)
+    mt = ctx.mt(ctx.args.p4_max_tokens)
 
     def prompts(arm: str) -> list[str]:
         return [
@@ -729,7 +750,15 @@ async def scenario_p4(ctx: Ctx) -> dict[str, Any]:
     t = time.time()
     order = list(reversed(range(len(lens))))
     res = await asyncio.gather(
-        *[ctx.chat(conc_prompts[i], mt, name=f"{lens[i][0]}-concurrent") for i in order]
+        *[
+            ctx.chat(
+                conc_prompts[i],
+                mt,
+                name=f"{lens[i][0]}-concurrent",
+                keep_chunks=True,
+            )
+            for i in order
+        ]
     )
     conc_wall = round(time.time() - t, 2)
     conc = [None] * len(lens)
@@ -764,7 +793,7 @@ def scenario_ok(premise: str, sc: dict[str, Any]) -> bool:
         return all(
             okreq(row[k])
             for row in sc["rows"]
-            for k in ("alone", "batched", "alone_cached")
+            for k in ("alone", "alone_restored", "batched")
         )
     if premise == "P4":
         return all(
@@ -851,6 +880,9 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
         "cache_condition": "cold: unique nonce prefix per prompt, fresh SSD cache dir per server start",
         "p1_cancel_fraction": args.p1_cancel_fraction,
         "p3_max_tokens": args.p3_max_tokens,
+        "p4_max_tokens": args.p4_max_tokens,
+        "p3_flow": "cold B=1 (cache populate) -> B=1 restored -> B=3 restored (started together, "
+        "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0 in fork variants, max_concurrent_requests=3)",
     }
 
 
@@ -983,9 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument(
-        "--variant", choices=["upstream", "fork", "fork-off"], required=True
-    )
+    ap.add_argument("--variant", choices=VARIANTS, required=True)
     ap.add_argument("--premise", choices=[*ALL_PREMISES, "all"], default="all")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--out", default=DEFAULT_OUT)
@@ -1012,6 +1042,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--p1-cancel-fraction", type=float, default=0.6)
     ap.add_argument("--p3-max-tokens", type=int, default=512)
+    ap.add_argument(
+        "--p4-max-tokens",
+        type=int,
+        default=512,
+        help="tokens per P4 request (raise it to widen the all-three-decoding window)",
+    )
     ap.add_argument("--settle-s", type=float, default=5.0)
     ap.add_argument(
         "--keep-cache",

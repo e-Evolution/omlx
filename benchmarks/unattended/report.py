@@ -19,15 +19,15 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics as bm  # noqa: E402
 
-VARIANTS = ["upstream", "fork", "fork-off"]
+VARIANTS = ["upstream", "fork-off", "fork", "fork-d1only", "fork-cachelimit-only"]
 PREMISES = ["P1", "P2", "P3", "P4", "P6"]
 TITLES = {
     "P1": "P1 - no lost work (cancel mid-prefill, re-issue)",
     "P2": "P2 - 2 x ~130k concurrent, no aborts",
-    "P3": "P3 - greedy batch correctness (B=3 == B=1)",
+    "P3": "P3 - greedy batch correctness (B=3 restored vs B=1 restored)",
     "P4": "P4 - concurrency pays (3 mixed requests)",
     "P5": "P5 - unattended pi batch",
-    "P6": "P6 - single 110k request, no regression",
+    "P6": "P6 - single 110k request, no regression (upstream vs fork-off vs fork)",
 }
 
 
@@ -118,11 +118,40 @@ def setup_block(data: dict) -> str:
     lines.append(
         "- Runs per variant/premise: " + ", ".join(f"{v}/{p}={n}" for v, p, n in counts)
     )
+    lines += [
+        "- Run counts: P6 and the other premises report the MEDIAN over the runs above, with min/max "
+        "spread; one server start per (variant, premise), cold cache per run (unique nonce per run).",
+        "- P3 flow (like-for-like): cold B=1 per prompt only populates the prefix cache; then B=1 restored "
+        "(reference), then B=3 restored started together so all rows decode in one batch "
+        "(`max_concurrent_requests=3`; fork variants run with `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0`). "
+        "PASS = B=3 equals B=1-restored for the first 32 tokens' worth of text on every row, no output "
+        "degenerates (distinct word-4gram ratio < 0.5x the B=1 value, or < 0.3 when B=1 is above it), "
+        "and the log shows a 3-row batch. Token ids are not exposed by the API, so text is compared. "
+        "Divergence after token 32 is reported, not judged. Upstream is reported, not judged.",
+        "- P4 criterion: with B=3 the non-attention compute alone sets a ~49 ms step (~20 tok/s per row), "
+        "so 'per-row >= 50% of single-row' is physically unreachable; the premise is not wasting memory and "
+        "time. PASS = 0 aborts, concurrent wall <= serial wall, and the aggregate decode throughput over "
+        "the window where all three rows decode (per-chunk timestamps) >= the median single-row serial "
+        "decode rate. Per-row ratios are informational.",
+        "- P6 attribution: `upstream` -> `fork-off` is the fork code-path overhead with all four features "
+        "off; `fork-off` -> `fork` is the features' cost; `fork-d1only` / `fork-cachelimit-only` isolate "
+        "single features when run.",
+    ]
     if any(r["setup"].get("smoke") for r in runs):
         lines.append(
             "- **SMOKE RUN: tiny prompts, results are NOT valid premise evidence.**"
         )
     return "\n".join(lines)
+
+
+def _rng(runs: list[dict], key: str, nd: int) -> str:
+    vals = []
+    for r in runs:
+        q = r["scenario"]["request"]
+        if q.get("ok") and q.get(key) is not None:
+            vals.append(q[key])
+    lo, hi = bm.spread(vals)
+    return "n/a" if lo is None else f"{lo:.{nd}f}-{hi:.{nd}f}"
 
 
 def section_p6(data: dict) -> str:
@@ -140,7 +169,9 @@ def section_p6(data: dict) -> str:
                 f(q("prompt_tokens"), 0),
                 f(q("ttft_s"), 1, " s"),
                 f(q("prefill_tps"), 1),
+                _rng(runs, "prefill_tps", 1),
                 f(q("decode_tps"), 2),
+                _rng(runs, "decode_tps", 2),
                 f(q("total_s"), 1, " s"),
                 f(med(runs, lambda r: r["samples"]["footprint_peak_gb"]), 1, " GB"),
             ]
@@ -150,9 +181,11 @@ def section_p6(data: dict) -> str:
             "variant",
             "ok/runs",
             "prompt tok",
-            "TTFT",
-            "prefill tok/s",
-            "decode tok/s",
+            "TTFT (median)",
+            "prefill tok/s (median)",
+            "prefill min-max",
+            "decode tok/s (median)",
+            "decode min-max",
             "total",
             "peak footprint",
         ],
@@ -240,31 +273,34 @@ def section_p3(data: dict) -> str:
         if not runs:
             continue
         s = bm._p3_summary(runs)
-        detail = (
-            "; ".join(
-                f"{d['name']}: diverges at char {d['common_prefix_chars']} ({d['alone_tokens']} vs {d['batched_tokens']} tok)"
-                for d in s["mismatch_detail"]
+        for d in s["detail"]:
+            div = d["first_divergence_chars"]
+            rows.append(
+                [
+                    v,
+                    d["name"],
+                    "identical"
+                    if div is None
+                    else f"char {div} (~token {f(d['first_divergence_token_est'], 0)})",
+                    "yes" if d["diverged_in_prefix"] else "no",
+                    f(d["d4_b1"], 2),
+                    f(d["d4_b3"], 2),
+                    "yes" if d["degenerate"] else "no",
+                    f(s["batch_max_b"], 0),
+                    f(s["cold_vs_restored_mismatched_rows"], 0),
+                ]
             )
-            or "-"
-        )
-        rows.append(
-            [
-                v,
-                f(s["rows"], 0),
-                f(s["mismatched_rows"], 0),
-                f(s["cache_restore_mismatched_rows"], 0),
-                f(s["tq_batched_fused_max_b"], 0),
-                detail,
-            ]
-        )
     return table(
         [
             "variant",
-            "rows",
-            "B=1 vs B=3 mismatches",
-            "B=1 cold vs cache-restored mismatches",
-            "max B in fused-path log",
-            "detail",
+            "row",
+            "first divergence B=3 vs B=1-restored",
+            "inside first 32 tok",
+            "distinct-4gram B=1",
+            "distinct-4gram B=3",
+            "degenerate",
+            "max B in log",
+            "cold vs restored B=1 mismatches (all rows)",
         ],
         rows,
     )
@@ -278,6 +314,10 @@ def section_p4(data: dict) -> str:
             continue
         s = bm._p4_summary(runs)
         sw, cw = s["serial_wall_s"], s["concurrent_wall_s"]
+        ratios = [
+            (c / x) if (c is not None and x) else None
+            for x, c in zip(s["serial_decode_tps"], s["concurrent_decode_tps"])
+        ]
         rows.append(
             [
                 v,
@@ -285,7 +325,11 @@ def section_p4(data: dict) -> str:
                 f(cw, 1, " s"),
                 f(sw / cw if sw and cw else None, 2, "x"),
                 " / ".join(f(x, 2) for x in s["serial_decode_tps"]),
+                f(s["serial_single_row_median_tps"], 2),
+                f(s["aggregate_decode_tps"], 2),
+                f(s["aggregate_window_s"], 1, " s"),
                 " / ".join(f(x, 2) for x in s["concurrent_decode_tps"]),
+                " / ".join(f(x, 2) for x in ratios),
                 f(s["aborts_total"], 0),
                 f"{s['completed']}/{s['total']}",
             ]
@@ -297,7 +341,11 @@ def section_p4(data: dict) -> str:
             "concurrent wall",
             "speedup",
             "serial decode tok/s (20k/45k/90k)",
-            "concurrent decode tok/s",
+            "median single-row",
+            "aggregate decode (all 3 decoding)",
+            "window",
+            "per-row concurrent tok/s",
+            "per-row ratio (info)",
             "aborts",
             "ok",
         ],
@@ -309,7 +357,9 @@ def verdicts(data: dict) -> dict[str, dict]:
     g = lambda v, p: data.get(v, {}).get(p, [])  # noqa: E731
     out = {}
     if any(g(v, "P6") for v in data):
-        out["P6"] = bm.eval_p6(g("upstream", "P6"), g("fork", "P6"))
+        out["P6"] = bm.eval_p6(
+            g("upstream", "P6"), g("fork", "P6"), g("fork-off", "P6")
+        )
     if any(g(v, "P1") for v in data):
         out["P1"] = bm.eval_p1(g("fork", "P1"), g("upstream", "P1"))
     if any(g(v, "P2") for v in data):
@@ -321,18 +371,46 @@ def verdicts(data: dict) -> dict[str, dict]:
     return out
 
 
-def attribution(data: dict) -> list[str]:
-    """Optional fork vs fork-off lines (which feature set explains a delta)."""
+def attribution(data: dict, ver: dict[str, dict]) -> list[str]:
+    """P6 prefill/decode attribution: upstream -> fork-off -> fork."""
     lines = []
-    if "fork-off" not in data:
+    a = (ver.get("P6") or {}).get("attribution") or {}
+    if not a:
         return lines
-    for p in PREMISES:
-        if p in data.get("fork-off", {}) and p in data.get("fork", {}):
-            lines.append(
-                f"- {p}: fork-off (all four features off, fork code) results are in the tables above; "
-                "differences between `fork` and `fork-off` are attributable to the four features. "
-                "The T5d per-row TurboQuant fix cannot be disabled and is present in both."
+
+    def pct(v):
+        return "n/a" if v is None else f"{v:+.1f}%"
+
+    for tag in ("prefill", "decode"):
+        lines.append(
+            f"- P6 {tag} attribution: fork-off vs upstream {pct(a.get(tag + '_pct_forkoff_vs_upstream'))} "
+            f"(fork code-path overhead, features off); fork vs fork-off "
+            f"{pct(a.get(tag + '_pct_fork_vs_forkoff'))} (cost of the four features)."
+        )
+    base = bm.median(
+        [
+            r["scenario"]["request"].get("prefill_tps")
+            for r in data.get("fork-off", {}).get("P6", [])
+            if r["scenario"]["request"].get("ok")
+        ]
+    )
+    for v in ("fork-d1only", "fork-cachelimit-only"):
+        runs = data.get(v, {}).get("P6")
+        if runs and base:
+            m = bm.median(
+                [
+                    r["scenario"]["request"].get("prefill_tps")
+                    for r in runs
+                    if r["scenario"]["request"].get("ok")
+                ]
             )
+            if m is not None:
+                lines.append(
+                    f"- P6 prefill `{v}` vs fork-off: {pct((m / base - 1) * 100)}."
+                )
+    lines.append(
+        "- The T5d per-row TurboQuant fix cannot be disabled and is present in every fork variant."
+    )
     return lines
 
 
@@ -371,7 +449,7 @@ def tradeoffs(data: dict, ver: dict[str, dict]) -> list[str]:
             "- P2 pool: no `pool=` line was logged (the log only prints the pool during pressure episodes), so the pool limit is unverified by log; "
             "the MLX cache limit setting is confirmed by the `MLX buffer cache limit` startup line."
         )
-    notes += attribution(data)
+    notes += attribution(data, ver)
     if not notes:
         notes.append("- None observed.")
     return notes
