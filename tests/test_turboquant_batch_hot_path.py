@@ -16,7 +16,7 @@ import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import dynamic_roll
 from mlx_vlm.models.qwen3_5 import language as q35_lang
-from mlx_vlm.turboquant import TurboQuantKVCache, _slice_state
+from mlx_vlm.turboquant import TurboQuantKVCache
 
 from omlx.patches import turboquant_attention as tqa
 from omlx.turboquant_kv import BatchTurboQuantKVCache
@@ -117,7 +117,6 @@ def test_verify_with_padding_mask_does_not_dequantize_the_batch(new_len, monkeyp
         return original(self, *a, **k)
 
     monkeypatch.setattr(BatchTurboQuantKVCache, "dequantize", spy)
-    mask = mask[..., : keys._state.norms.shape[2]] if hasattr(keys, "_state") else mask
     out = q35_lang._qwen3_5_left_padded_attention(
         q, keys, values, cache=batch, scale=SCALE, mask=mask
     )
@@ -299,7 +298,6 @@ def test_ragged_kernel_row_shorter_than_query_block_is_zero_not_nan():
     batch, refs, q, keys, values, _ = _build([1500, 2500], 4)
     # Make row 0 own only 2 columns (< q_len 4): its first two queries sit in
     # the padding and attend nothing.
-    total = keys._state.norms.shape[2] if hasattr(keys, "_state") else None
     ks, vs = batch._unwrap(keys), batch._unwrap(values)
     from omlx.turboquant_kv import _state_length
 
@@ -330,3 +328,17 @@ def test_ragged_kernel_declines_wider_blocks_and_non_mse(monkeypatch):
     batch, refs, q, keys, values, _ = _build([1500, 2500], 9)
     ks, vs = batch._unwrap(keys), batch._unwrap(values)
     assert tqa._ragged_batched_attention(batch, q, ks, vs, SCALE) is None
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+def test_ragged_kernel_unrolled_and_single_token_loops_agree(new_len, monkeypatch):
+    batch, refs, q, keys, values, _ = _build([1800, 5200, 9100], new_len)
+    ks, vs = batch._unwrap(keys), batch._unwrap(values)
+    outs = []
+    for unroll in (1, 2, 4):
+        monkeypatch.setattr(tqa, "_RAGGED_UNROLL", unroll)
+        out = tqa._ragged_batched_attention(batch, q, ks, vs, SCALE)
+        mx.eval(out)
+        outs.append(out)
+    assert _max_abs(outs[0], outs[1]) < 1e-3
+    assert _max_abs(outs[0], outs[2]) < 1e-3
