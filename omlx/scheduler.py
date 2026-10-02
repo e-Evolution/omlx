@@ -4637,10 +4637,10 @@ class Scheduler:
                     self._emit_prefill_tail_snapshot(
                         request, prompt_cache, total_tokens
                     )
-            if vlm_embeds is None:
-                Scheduler._commit_prefill_progress(
-                    self, request, prompt_cache, base_size + processed_tokens
-                )
+            # Media prompts commit too, under the request's own cache keys.
+            Scheduler._commit_prefill_progress(
+                self, request, prompt_cache, base_size + processed_tokens
+            )
 
             Scheduler._check_post_prefill_memory(
                 self,
@@ -8002,6 +8002,28 @@ class Scheduler:
                 "Prefill progress commit failed for %s: %s", request.request_id, e
             )
 
+    def _note_prefill_commit_skip(
+        self, request: "Request", key: str, detail: str
+    ) -> None:
+        """Log why a prefill commit did not run, once per request and reason.
+
+        Every early return of the commit path ends here, so a prefill that
+        never becomes durable always says why in the server log.
+        """
+        seen = getattr(request, "_prefill_commit_skips", None)
+        if seen is None:
+            seen = set()
+            try:
+                request._prefill_commit_skips = seen
+            except AttributeError:
+                return
+        if key in seen:
+            return
+        seen.add(key)
+        logger.info(
+            "Prefill progress commit skipped for %s: %s", request.request_id, detail
+        )
+
     def _commit_prefill_progress_unchecked(
         self,
         request: "Request",
@@ -8010,6 +8032,7 @@ class Scheduler:
         commit_blocks: int,
     ) -> None:
         rid = request.request_id
+        skip = self._note_prefill_commit_skip
         block_size = self.config.paged_cache_block_size
         if (
             block_size <= 0
@@ -8018,30 +8041,89 @@ class Scheduler:
             or self.paged_ssd_cache_manager is None
             or self._store_cache_executor is None
         ):
+            skip(
+                request,
+                "stores",
+                "no paged block size, prefix cache, SSD cache or store executor",
+            )
+            return
+        if getattr(request, "skip_cache_store", False):
+            skip(request, "skip_cache_store", "the request opted out of cache stores")
+            return
+        if self._model_has_unreconstructible_cache():
+            skip(
+                request, "unreconstructible", "the model's cache layout is not storable"
+            )
             return
         # Prompts that are not a plain token prefix cannot be keyed by token.
         if (
-            getattr(request, "vlm_extra_keys_for_cache", None)
-            or getattr(request, "vlm_extra_key_ranges_for_cache", None)
-            or getattr(request, "specprefill_indices", None) is not None
+            getattr(request, "specprefill_indices", None) is not None
             or self._specprefill_active_request_id == rid
         ):
+            skip(request, "specprefill", "sparse prefill (SpecPrefill) is active")
+            return
+        # Media prompts commit under the cache keys their final store uses. Those
+        # keys come from the whole prompt before prefill starts and a block's key
+        # depends only on where the block ends, never on later tokens, so the
+        # committed prefix is exactly what a re-issue's lookup asks for. Models
+        # that insist on prefilling the media prefix in one piece cannot resume
+        # from a committed part of it.
+        extra_keys = getattr(request, "vlm_extra_keys_for_cache", None)
+        extra_start = getattr(request, "vlm_extra_key_token_start_for_cache", None)
+        extra_ranges = getattr(request, "vlm_extra_key_ranges_for_cache", None)
+        has_media_keys = bool(extra_keys or extra_ranges)
+        if has_media_keys and self._minimum_prefill_prefix(request) > 0:
+            skip(
+                request,
+                "atomic_media_prefix",
+                "the model needs an atomic multimodal prefix",
+            )
             return
         prompt = request.prompt_token_ids
         aligned = min(total_tokens, len(prompt)) // block_size * block_size
 
         self._reap_prefill_commit(rid)
         if rid in self._prefill_commits:
-            return  # previous commit still running
+            skip(request, "in_flight", "the previous commit is still running")
+            return
         table = self.paged_cache_manager.get_block_table(rid)
         existing = table.num_tokens if table else 0
-        if existing % block_size or (aligned - existing) // block_size < commit_blocks:
+        if existing % block_size:
+            skip(
+                request,
+                "unaligned_table",
+                f"the block table holds {existing} tokens, off the "
+                f"{block_size}-token block grid",
+            )
+            return
+        if (aligned - existing) // block_size < commit_blocks:
+            skip(
+                request,
+                "below_threshold",
+                f"{(aligned - existing) // block_size} of {commit_blocks} "
+                f"blocks complete past {existing} tokens (first commit pending)",
+            )
             return
         if self._prefill_commit_blocked_by_pressure():
+            try:
+                usage = f"{self._current_usage_bytes() / 1024**3:.1f}GB"
+            except Exception:
+                usage = "unknown"
+            skip(
+                request,
+                "pressure",
+                f"memory usage {usage} is at or above the soft limit "
+                f"{self._memory_limit_bytes / 1024**3:.1f}GB",
+            )
             return
 
         window = self._prefill_commit_window(prompt_cache, existing, aligned)
         if window is None:
+            skip(
+                request,
+                "layout",
+                "composite or non-standard sliceable cache layers",
+            )
             if not getattr(self, "_prefill_commit_layout_logged", False):
                 self._prefill_commit_layout_logged = True
                 logger.info(
@@ -8056,12 +8138,29 @@ class Scheduler:
             if _prompt_cache_needs_snapshots(prompt_cache):
                 override = self._get_boundary_store_override(rid, tokens)
                 if override is None:
+                    held = len(self._boundary_cache_snapshots.get(rid) or {})
+                    skip(
+                        request,
+                        "no_snapshot",
+                        f"no recurrent-state snapshot at or before {aligned} "
+                        f"tokens ({held} held)",
+                    )
                     return
                 tokens, boundary_cache, _, provider = override
-                if (
-                    getattr(provider, "tail_terminal_token_count", None) is not None
-                    or len(tokens) <= existing
-                ):
+                if getattr(provider, "tail_terminal_token_count", None) is not None:
+                    skip(
+                        request,
+                        "tail_terminal",
+                        "the newest snapshot is an off-grid tail",
+                    )
+                    return
+                if len(tokens) <= existing:
+                    skip(
+                        request,
+                        "no_new_snapshot",
+                        f"the newest snapshot ({len(tokens)} tokens) is not "
+                        f"past the committed {existing}",
+                    )
                     return
                 extracted = self._merge_boundary_with_full_cache(
                     boundary_cache, extracted
@@ -8084,13 +8183,17 @@ class Scheduler:
             extracted,
             model_cache_config,
             provider,
+            extra_key_args=(
+                (extra_keys, extra_start, extra_ranges) if has_media_keys else None
+            ),
         )
         self._prefill_commits[rid] = (future, len(tokens))
-        logger.debug(
-            "Committing prefill progress for %s: %d -> %d tokens",
+        logger.info(
+            "Committing prefill progress for %s: tokens [%d, %d)%s",
             rid,
             existing,
             len(tokens),
+            " under media cache keys" if has_media_keys else "",
         )
 
     def _commit_prefill_worker(
@@ -8100,8 +8203,12 @@ class Scheduler:
         window_cache: list[Any],
         model_cache_config: Any | None,
         snapshots: Any | None,
+        extra_key_args: tuple[Any, Any, Any] | None = None,
     ) -> bool:
         """Store a committed prefill window; True when the table covers it.
+
+        ``extra_key_args`` are the request's media cache keys (keys, token
+        start, ranges), passed exactly as its final store passes them.
 
         Cancellation is checked under ``_commit_store_lock`` before the store
         call, the only step that touches the stores; shutdown takes that lock
@@ -8110,15 +8217,16 @@ class Scheduler:
         with self._commit_store_lock:
             if self._commit_cancelled.is_set():
                 return False
+            extra_keys, extra_start, extra_ranges = extra_key_args or (None, None, None)
             self._async_store_cache_worker(
                 request_id,
                 tokens,
                 window_cache,
                 model_cache_config,
                 snapshots,
-                None,
-                None,
-                None,
+                extra_keys,
+                extra_start,
+                extra_ranges,
                 True,
                 incremental_commit=True,
             )
@@ -11922,24 +12030,65 @@ class Scheduler:
         stats["pinned_requests"] = len(self._park_pins)
         return stats
 
-    def _parkable_prefills(self) -> list[Request]:
-        """Chunked prefills that can be parked safely.
+    def _park_exclusion_reason(self, request: Request) -> str | None:
+        """Why ``request`` cannot be parked now, or None when it can.
 
         Only requests in the chunked-prefill loop qualify: their state lives
-        between steps. External-loop prefills (non-chunked, VLM) run to
-        completion inside one ``_schedule_waiting`` call and are never
-        between steps; VLM embeds and SpecPrefill patch model-wide state, so
-        they are excluded as well.
+        between steps. External-loop prefills (non-chunked, media prompts) run
+        to completion inside one ``_schedule_waiting`` call and are never
+        between steps; media embeddings and SpecPrefill patch model-wide state,
+        so they are excluded as well. A text prompt on a VLM engine takes the
+        chunked loop like any other model and is parkable.
         """
         budget = getattr(self.config, "max_parks_per_request", 3)
+        if request.request_id in self.running:
+            return "decoding, not in chunked prefill"
+        if request.park_count >= budget:
+            return f"park budget spent ({request.park_count}/{budget})"
+        if request.specprefill_indices is not None:
+            return "SpecPrefill sparse prefill patches model-wide state"
+        if request.vlm_inputs_embeds is not None:
+            return (
+                "multimodal prompt (fused media embeddings) prefills in the "
+                "external loop, not between steps"
+            )
+        if request.request_id not in self._prefill_states:
+            return "prefill runs in the external loop, not between steps"
+        return None
+
+    def _parkable_prefills(self) -> list[Request]:
+        """Chunked prefills that can be parked safely."""
         return [
             request
             for request in list(self.prefilling)
-            if request.request_id in self._prefill_states
-            and request.park_count < budget
-            and request.specprefill_indices is None
-            and request.vlm_inputs_embeds is None
+            if self._park_exclusion_reason(request) is None
         ]
+
+    def _log_no_parkable_victim(self) -> None:
+        """Say once per request why a park was wanted and nobody could be parked."""
+        try:
+            admitted = list(self.requests.values())
+            queued = {r.request_id for r in list(self.waiting)}
+        except RuntimeError:
+            return  # the queues mutated mid-read on the MLX thread
+        for request in admitted:
+            if request.request_id in queued or request.is_finished():
+                continue
+            reason = self._park_exclusion_reason(request)
+            if reason is None or reason in getattr(request, "_park_skip_logged", ()):
+                continue
+            try:
+                request._park_skip_logged = (
+                    *getattr(request, "_park_skip_logged", ()),
+                    reason,
+                )
+            except AttributeError:
+                continue
+            logger.info(
+                "Park skipped for %s: %s (memory pressure falls back to abort)",
+                request.request_id,
+                reason,
+            )
 
     def _select_park_victim(self) -> Request | None:
         """Most recent arrival first; the oldest admitted request is protected.
@@ -11983,6 +12132,7 @@ class Scheduler:
         if victim_may_exist:
             self._park_requested = True
             return True
+        self._log_no_parkable_victim()
         # A park just ran and its memory is still returning to the OS.
         return (
             self._polls_since_park is not None
@@ -11998,6 +12148,7 @@ class Scheduler:
             return False
         victim = self._select_park_victim()
         if victim is None:
+            self._log_no_parkable_victim()
             return False
         self._park_prefill(victim, reason="hard memory pressure")
         self._polls_since_park = 0
