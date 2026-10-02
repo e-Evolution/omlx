@@ -130,3 +130,6 @@ tq_batch_memory.md
 .claude/
 issues.md
 clusterPlan.md
+
+# Fork app build output (packaging/build_fork_app.py)
+packaging/_fork_dist/
