@@ -168,7 +168,13 @@ def test_patched_sdpa_array_mask_matches_single_row(new_len):
 
 
 def test_foreign_array_mask_is_honored_not_replaced():
+    from omlx.turboquant_kv import mark_own_padding_mask
+
     batch, rows, q, keys, values = _build([1200, 2400], 1)
+    # The padding mask is recognised structurally (cache.make_mask leaves a
+    # signature for the step); a mask the cache did not build for this call
+    # carries none and must keep the masked path.
+    mark_own_padding_mask(0, 0, 0)
     mask = mx.ones((2, 1, 1, 2401), dtype=mx.bool_)  # attends the padding too
     out = _sdpa(batch, q, keys, values, mask)
     dk, dv = batch.dequantize(keys, values)

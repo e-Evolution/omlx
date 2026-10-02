@@ -178,6 +178,75 @@ def _filter_state(state, indices):
     raise TypeError(f"Unsupported state type: {type(state)!r}")
 
 
+def _map_state_arrays(state, fn):
+    """Apply ``fn`` to every token-axis array of a state (shape [B, H, T(, X)])."""
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(fn(state.norms), fn(state.indices))
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            fn(state.norms),
+            fn(state.mse_indices),
+            fn(state.residual_norms),
+            fn(state.qjl_signs),
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            fn(state.radii), tuple(fn(level) for level in state.level_indices)
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            fn(state.norms),
+            _map_state_arrays(state.polar_state, fn),
+            fn(state.residual_norms),
+            fn(state.qjl_signs),
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _map_state_arrays(state.low, fn), _map_state_arrays(state.high, fn)
+        )
+    raise TypeError(f"Unsupported state type: {type(state)!r}")
+
+
+def _roll_state_rows(state, shifts: List[int], length: int, slack: int):
+    """Roll each batch row of a packed state right by its own shift.
+
+    Row ``b`` becomes ``[tail(shift_b) | head(length - shift_b) | slack]`` along
+    the token axis -- exactly ``dynamic_roll(..., axis=2)`` on the dequantized
+    values, but on the packed codes, so no dequantize/re-quantize pass and no
+    value change. ``slack`` zero columns are appended so the next append does
+    not have to reallocate and copy the whole cache. Rows with a zero shift are
+    plain views up to the final batch concatenate.
+    """
+
+    def roll(array):
+        pieces = []
+        for b, shift in enumerate(shifts):
+            shift = min(int(shift), length)
+            row = array[b : b + 1, :, :length]
+            if shift:
+                row = mx.concatenate(
+                    [row[:, :, length - shift :], row[:, :, : length - shift]], axis=2
+                )
+            if slack:
+                pad_shape = (1, row.shape[1], slack, *row.shape[3:])
+                row = mx.concatenate([row, mx.zeros(pad_shape, dtype=row.dtype)], axis=2)
+            pieces.append(row)
+        return pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=0)
+
+    return _map_state_arrays(state, roll)
+
+
+def _async_eval_state(*states):
+    """Start evaluating the arrays of ``states`` without blocking the host."""
+    arrays = []
+    for state in states:
+        _map_state_arrays(state, lambda a: arrays.append(a) or a)
+    if arrays:
+        mx.async_eval(*arrays)
+
+
 def _concat_state_batch(states):
     """Concatenate a list of states along batch dimension (axis 0)."""
     if not states:
@@ -239,6 +308,30 @@ def _empty_state_batch_like(state, batch_size: int):
 
 
 # ---------------------------------------------------------------------------
+# Own padding-mask signature
+# ---------------------------------------------------------------------------
+# The decode/verify attention replacement may only substitute per-row slices
+# for a mask when that mask IS the left-padding + causal mask the cache built.
+# Comparing arrays (``array_equal(...).item()``) is a GPU sync on every layer,
+# so ``make_mask`` leaves a structural signature (query rows, physical column
+# count BEFORE the append, batch size) and the attention side checks it. The
+# model builds the mask once per forward from the first cache, before any layer
+# appends, so layers 2..N see the same signature.
+
+_OWN_PADDING_MASK = None
+
+
+def mark_own_padding_mask(n: int, phys: int, batch: int, window_size=None) -> None:
+    global _OWN_PADDING_MASK
+    _OWN_PADDING_MASK = None if window_size is not None else (n, phys, batch)
+
+
+def is_own_padding_mask(n: int, total: int, batch: int) -> bool:
+    """True iff the last padding mask built is for ``n`` rows ending at ``total``."""
+    return _OWN_PADDING_MASK == (n, total - n, batch)
+
+
+# ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
 
@@ -255,7 +348,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
     def __init__(self, left_padding: List[int], bits: float = 4.0, seed: int = 0):
         super().__init__(bits=bits, seed=seed)
         self.group_size = 0
+        self._pads_host = None
         self.left_padding = mx.array(left_padding)
+        # Known from the Python list: no device readback needed for the
+        # per-layer attention routing (see host_left_padding()).
+        self._pads_host = tuple(int(p) for p in left_padding)
         self._batch_size = len(left_padding)
         # B=1: offset is int (parent-compatible, zero overhead decode)
         # B>1: offset is mx.array (per-request, needs override)
@@ -264,6 +361,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         else:
             self.offset = -left_padding[0]
         self._right_padding = None
+        self._right_padding_host = None
         # Written physical column count (B>1 only; B=1 uses the parent's int
         # offset). Rows are end-aligned, but this must NOT be derived from
         # offset.max(): once filter() removes the last zero-left-padding row,
@@ -272,6 +370,36 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # also must not be derived from _state_length(self.keys): that is the
         # step-allocated capacity, not the written end.
         self._phys_end = 0
+
+    # ---- left_padding with a host mirror ----------------------------------
+    # Attention routing needs the per-row padding as Python ints on EVERY
+    # attention layer of EVERY decode step. Reading the device array back
+    # (``tolist``/``max().item()``) is a GPU sync that breaks MLX lazy-graph
+    # pipelining, so the host copy is derived once per change instead and
+    # carried along by the mutators below, which know the values.
+
+    @property
+    def left_padding(self):
+        return self._left_padding
+
+    @left_padding.setter
+    def left_padding(self, value):
+        self._left_padding = value
+        self._pads_host = None
+
+    def _set_left_padding(self, array, host):
+        self._left_padding = array
+        self._pads_host = None if host is None else tuple(int(p) for p in host)
+
+    def host_left_padding(self):
+        """Per-row left padding as a tuple of ints (one readback per change)."""
+        if self._pads_host is None:
+            self._pads_host = tuple(int(p) for p in self._left_padding.tolist())
+        return self._pads_host
+
+    def max_left_padding(self) -> int:
+        pads = self.host_left_padding()
+        return max(pads) if pads else 0
 
     @property
     def _idx(self):
@@ -342,7 +470,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         if (
             isinstance(offset, mx.array)
             and offset.size == 1
-            and int(self.left_padding.max().item()) == 0
+            and self.max_left_padding() == 0
         ):
             return create_attention_mask(N, offset.item(), return_array, window_size)
         # B>1 (or a left-padded survivor after filter()): delegate to mlx-lm's
@@ -355,6 +483,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # row departs, offset.max() undercounts and blinds the survivors to
         # their own tail context.
         phys = self._phys_end
+        mark_own_padding_mask(N, phys, len(self.host_left_padding()), window_size)
         return create_causal_mask(
             N, offset=phys, window_size=window_size, left_padding=self.left_padding
         )
@@ -379,32 +508,49 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 raise ValueError(
                     "Left padding can only be added to an empty BatchTurboQuantKVCache"
                 )
+            host_before = self._pads_host
+            host_add = [int(p) for p in left_padding]
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
+            if host_before is not None and len(host_before) == len(host_add):
+                self._pads_host = tuple(a + b for a, b in zip(host_before, host_add))
             self.offset -= (
                 left_padding
                 if isinstance(self.offset, mx.array)
-                else left_padding[0].item()
+                else host_add[0]
             )
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
+            self._right_padding_host = [int(p) for p in right_padding]
 
     def finalize(self):
         if self._right_padding is None:
             return
         padding = self._right_padding
+        host_padding = getattr(self, "_right_padding_host", None)
+        if host_padding is None:
+            host_padding = [int(p) for p in padding.tolist()]
         if self.keys is not None:
-            k_fp16, v_fp16 = self.dequantize()
-            k_rolled = dynamic_roll(k_fp16, padding[:, None], axis=2)
-            v_rolled = dynamic_roll(v_fp16, padding[:, None], axis=2)
-            self.keys = self.key_codec.quantize(k_rolled)
-            self.values = self.value_codec.quantize(v_rolled)
-            mx.eval(self.keys, self.values)
+            # Roll the rejected tail of a speculative block to the front of
+            # each row on the PACKED codes. The previous implementation
+            # dequantized the whole batch, rolled it and re-quantized it every
+            # ragged cycle: ~1.3 s per cycle at 3 x 45k tokens, and lossy.
+            length = self._phys_end
+            slack = int(getattr(self, "cache_step", 256) or 0)
+            self.keys = _roll_state_rows(self.keys, host_padding, length, slack)
+            self.values = _roll_state_rows(self.values, host_padding, length, slack)
+            _async_eval_state(self.keys, self.values)
         self.offset -= (
-            padding if isinstance(self.offset, mx.array) else padding[0].item()
+            padding if isinstance(self.offset, mx.array) else host_padding[0]
         )
+        host_before = self._pads_host
         self.left_padding += padding
+        if host_before is not None and len(host_before) == len(host_padding):
+            self._pads_host = tuple(a + b for a, b in zip(host_before, host_padding))
         self._right_padding = None
+        self._right_padding_host = None
+        self._cached_state = None
+        self._cached_state_offset = -1
 
     def filter(self, batch_indices):
         self._ensure_array_offset()
@@ -412,14 +558,18 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.keys = _filter_state(self.keys, batch_indices)
             self.values = _filter_state(self.values, batch_indices)
         self.offset = self.offset[batch_indices]
+        host_before = self._pads_host
         self.left_padding = self.left_padding[batch_indices]
+        if host_before is not None and isinstance(batch_indices, (list, tuple, range)):
+            self._pads_host = tuple(host_before[int(i)] for i in batch_indices)
         # Shift left to drop shared padding, mirroring BatchKVCache.filter().
         # The turboquant_skip_last layer is a stock BatchKVCache that compacts
         # here, and the model feeds every attention layer ONE mask built from
         # the first (TQ) layer's _phys_end. Skipping the same compaction
         # leaves that mask min_left_pad columns wider than the dense layer's
         # keys and crashes the next decode step (#2237).
-        min_left_pad = int(self.left_padding.min().item())
+        host_pads = self.host_left_padding()
+        min_left_pad = min(host_pads) if host_pads else 0
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = _slice_state_range(
@@ -429,7 +579,10 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                     self.values, min_left_pad, self._phys_end
                 )
             self._phys_end -= min_left_pad
-            self.left_padding = self.left_padding - min_left_pad
+            self._set_left_padding(
+                self.left_padding - min_left_pad,
+                [p - min_left_pad for p in host_pads],
+            )
         self._cached_state = None
         self._cached_state_offset = -1
 
@@ -480,8 +633,13 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.keys = o_ks
             self.values = o_vs
 
+        host_s, host_o = self._pads_host, other._pads_host
         self.offset = mx.concatenate([s_off, o_off])
         self.left_padding = mx.concatenate([s_lp, o_lp])
+        if host_s is not None and host_o is not None:
+            self._pads_host = tuple(p + (max_idx - s_idx) for p in host_s) + tuple(
+                p + (max_idx - o_idx) for p in host_o
+            )
         self._phys_end = max_idx
         self._cached_state = None
         self._cached_state_offset = -1
@@ -491,7 +649,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.value_codec = other.value_codec
 
     def extract(self, idx: int) -> TurboQuantKVCache:
-        padding = self.left_padding[idx].item()
+        padding = self.host_left_padding()[idx]
         total = (
             self.offset[idx].item()
             if isinstance(self.offset, mx.array)
