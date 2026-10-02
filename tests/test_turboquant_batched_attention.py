@@ -412,3 +412,49 @@ def test_greedy_decode_b3_equals_b1_vlm_left_padded_decode_path():
     worst = max(_max_abs(blg[i], single_logits[i]) for i in range(3))
     assert worst < 5e-2, f"max logits diff {worst:.4f}"
     assert batched == singles
+
+
+# ---------------------------------------------------------------------------
+# Debug control: route B=1 through the ragged multi-row kernel
+# ---------------------------------------------------------------------------
+
+
+def _b1_case(new_len):
+    k, v = _kv(1, 3000, 21)
+    c = BatchTurboQuantKVCache([0], bits=BITS)
+    c.update_and_fetch(k, v)
+    mx.random.seed(22)
+    q = mx.random.normal((1, N_Q, new_len, D)).astype(mx.float16)
+    nk, nv = _kv(1, new_len, 23)
+    keys, values = c.update_and_fetch(nk, nv)
+    return c, q, keys, values
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+def test_force_ragged_b1_flag_routes_through_ragged_kernel(
+    new_len, monkeypatch, tmp_path
+):
+    flag = tmp_path / "ragged.flag"
+    flag.write_text("1")
+    monkeypatch.setenv("OMLX_DEBUG_FORCE_RAGGED_B1", str(flag))
+    from omlx import debug_numerics
+
+    debug_numerics._flag_cache.clear()
+    c, q, keys, values = _b1_case(new_len)
+    mask = None if new_len == 1 else "causal"
+    tqa._LOGGED_PATHS.clear()
+    out = _sdpa(c, q, keys, values, mask)
+    assert "ragged" in tqa._LOGGED_PATHS
+    if new_len == 1:
+        ref = c.decode_attention(q, keys_state=keys, values_state=values, scale=SCALE)
+    else:
+        ref = tqa._decode_multirow_attention(c, q, keys, values, SCALE)
+    assert _max_abs(out, ref) < 3e-3
+
+
+def test_b1_without_flag_keeps_fused_single_row_path(monkeypatch):
+    monkeypatch.delenv("OMLX_DEBUG_FORCE_RAGGED_B1", raising=False)
+    c, q, keys, values = _b1_case(1)
+    tqa._LOGGED_PATHS.clear()
+    _sdpa(c, q, keys, values, None)
+    assert "ragged" not in tqa._LOGGED_PATHS

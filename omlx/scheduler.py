@@ -63,6 +63,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
+from . import debug_numerics as _debug_numerics
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
@@ -13321,6 +13322,14 @@ class Scheduler:
                         if parser_session is not None:
                             request.output_text = prefix_text + request.output_text
                     request.think_prefix_sent = True
+
+            if _debug_numerics.dump_enabled():
+                _debug_numerics.record_logprobs(
+                    request_id,
+                    request.num_prompt_tokens,
+                    response.token,
+                    getattr(response, "logprobs", None),
+                )
 
             # Immediately discard logprobs if not requested to free memory (~800KB per response)
             # This prevents accumulation of large MLX arrays during streaming
