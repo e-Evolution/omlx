@@ -88,6 +88,9 @@ FORK_ONLY_ON = {
 VARIANTS = ["upstream", "fork", "fork-off", *FORK_ONLY_ON]
 # P3 flow: cold B=1 (populates the prefix cache), B=1 restored, B=3 restored.
 P3_PHASES = ("cold", "alone_restored", "batched")
+# Controls run after the comparison: B=1 restored again (run-to-run
+# determinism) and B=1 forced through the ragged B>1 attention kernel.
+P3_CONTROL_PHASES = ("alone_restored2", "ragged_b1")
 # settings.json keys that only exist in the fork (stripped for upstream).
 FORK_ONLY_SETTINGS = {
     "scheduler": [
@@ -123,6 +126,16 @@ def variant_env(variant: str, premise: str) -> dict[str, str]:
         # Disable the T5b gate so the three rows really batch.
         env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] = "0"
     return env
+
+
+def debug_env(variant: str, premise: str, base: Path) -> dict[str, str]:
+    """Opt-in fork debug switches for P3 (logprob dump + forced ragged B=1)."""
+    if variant == "upstream" or premise != "P3":
+        return {}
+    return {
+        "OMLX_DEBUG_LOGPROB_DUMP": str(base / "logprob_dump"),
+        "OMLX_DEBUG_FORCE_RAGGED_B1": str(base / "force_ragged_b1.flag"),
+    }
 
 
 def build_settings(
@@ -243,6 +256,11 @@ class Server:
         self.base = BENCH_BASE_ROOT / tag
         self.cache_dir = f"{CACHE_ROOT}/{tag}"
         self.env = variant_env(variant, premise)
+        self.env.update(debug_env(variant, premise, self.base))
+        dump = self.env.get("OMLX_DEBUG_LOGPROB_DUMP")
+        self.dump_dir = Path(dump) if dump else None
+        flag = self.env.get("OMLX_DEBUG_FORCE_RAGGED_B1")
+        self.ragged_flag = Path(flag) if flag else None
         self.proc: subprocess.Popen | None = None
         self.known_pids: dict[int, str] = {}  # pid -> process start time
         self.stdout_path = out / "logs" / f"{tag}.stdout.log"
@@ -730,6 +748,10 @@ async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
     2. B=1 restored per prompt: the reference output.
     3. B=3 restored, started together: the short suffix prefills finish
        quickly, so all three rows DECODE in one batch.
+    4. Controls (fork only): B=1 restored again (run-to-run determinism) and
+       B=1 restored through the ragged B>1 kernel (kernel numerics vs
+       batching). With the fork's logprob dump every token carries its top-5
+       logprobs, so the first divergence is judged by its near-tie margin.
     """
     lens = [("20k", 20_000), ("45k", 45_000), ("135k", 135_000)]
     mt = ctx.mt(ctx.args.p3_max_tokens)
@@ -737,6 +759,16 @@ async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
         name: ctx.corpus.prompt(ctx.seed("P3", name), ctx.n(nom)) for name, nom in lens
     }
     rows: dict[str, dict[str, Any]] = {name: {"name": name} for name, _ in lens}
+    dump_dir = ctx.server.dump_dir
+
+    def attach_lp(name: str, phase: str, res: dict[str, Any], paths: list[Path]):
+        if dump_dir is None:
+            return
+        path = bm.pick_dump(paths, res.get("prompt_tokens"))
+        if path is None and len(paths) == 1:
+            path = paths[0]
+        if path is not None:
+            rows[name].setdefault("logprobs", {})[phase] = bm.load_logprob_dump(path)
 
     async def one(name: str, tag: str) -> dict[str, Any]:
         return await ctx.chat(
@@ -748,20 +780,45 @@ async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
             keep_chunks=True,
         )
 
+    async def alone(name: str, key: str, tag: str) -> None:
+        before = bm.dump_listing(dump_dir) if dump_dir else set()
+        rows[name][key] = await one(name, tag)
+        if dump_dir:
+            attach_lp(name, key, rows[name][key], bm.new_dumps(dump_dir, before))
+
     for name, _ in lens:  # cold: populate the prefix cache
         rows[name]["alone"] = await one(name, "cold")
-    for name, _ in lens:  # B=1, restored
-        rows[name]["alone_restored"] = await one(name, "alone-restored")
+    for name, _ in lens:  # B=1, restored (reference)
+        await alone(name, "alone_restored", "alone-restored")
     off = ctx.server.log_size()
+    before = bm.dump_listing(dump_dir) if dump_dir else set()
     t = time.time()
     order = [name for name, _ in reversed(lens)]  # longest first
     batched = await asyncio.gather(*[one(nm, "batched") for nm in order])
     batched_wall = round(time.time() - t, 2)
+    new_paths = bm.new_dumps(dump_dir, before) if dump_dir else []
     for nm, res in zip(order, batched):
         rows[nm]["batched"] = res
+        attach_lp(nm, "batched", res, new_paths)
     batch_log = bm.parse_server_log(ctx.server.log_since(off))
+    if dump_dir is not None:  # controls (fork only: they need the debug hooks)
+        for name, _ in lens:
+            await alone(name, "alone_restored2", "alone-restored2")
+        ctl_off = ctx.server.log_size()
+        flag = ctx.server.ragged_flag
+        flag.write_text("1")
+        try:
+            await asyncio.sleep(1.0)  # the server polls the flag file
+            for name, _ in lens:
+                await alone(name, "ragged_b1", "ragged-b1")
+        finally:
+            flag.unlink(missing_ok=True)
+    forced_seen = (
+        "B=1, forced" in ctx.server.log_since(ctl_off) if dump_dir is not None else None
+    )
     return {
         "rows": [rows[name] for name, _ in lens],
+        "ragged_b1_forced_logged": forced_seen,
         "batched_wall_s": batched_wall,
         "batched_log_window": {
             "batch_max_b": batch_log["batch_max_b"],
@@ -770,6 +827,7 @@ async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
             "restores": batch_log["restores"],
         },
         "phases": list(P3_PHASES),
+        "control_phases": list(P3_CONTROL_PHASES) if dump_dir is not None else [],
         "note": "cold B=1 only populates the cache; B=1 restored vs B=3 restored is the comparison",
     }
 
