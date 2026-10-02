@@ -19,7 +19,6 @@ from mlx_lm.models.cache import (
     _BaseCache,
     create_attention_mask,
     create_causal_mask,
-    dynamic_roll,
 )
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,

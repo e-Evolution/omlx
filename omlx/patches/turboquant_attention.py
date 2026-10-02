@@ -292,11 +292,15 @@ def _fused_multirow_mse_attention(
 # Ragged (left-padded) batch kernel envelope. Same register-array argument as
 # the multi-row kernel: q and o accumulators scale with QRows.
 _RAGGED_MAX_Q_ROWS = 8
+# Tokens scored per online-softmax update. 0 = auto: 2 for one/two rows, 4 above
+# (measured 3 x {20k, 45k, 90k} rows: L=1 1.80 -> 1.45 ms, L=3 5.7 -> 3.5 ms,
+# L=5 9.3 -> 4.6 ms per layer). 8 spills registers (L=3: 10 ms).
+_RAGGED_UNROLL = 0
 _RAGGED_EMPTY_BLOCK_MAX = -1.0e30
 
 
 @cache
-def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
+def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int, unroll: int = 1):
     """Pass 1 of the ragged-batch MSE attention (decode and verify).
 
     ``_fused_mse_multirow_2pass1_kernel`` extended for end-aligned, left-padded
@@ -312,7 +316,10 @@ def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
       ``exp(max - max)`` for the first block).
 
     ``QRows`` query rows end at ``token_count`` (the causal tail is applied
-    inline), exactly like the multi-row kernel.
+    inline), exactly like the multi-row kernel. ``unroll`` > 1 scores that many
+    tokens per iteration before one online-softmax update (one rescale and
+    fewer ``exp`` per token); tokens whose causal visibility depends on the row
+    (the last ``QRows`` positions) and the remainder take the one-token loop.
     """
     from mlx_vlm import turboquant as _tq
 
@@ -331,12 +338,67 @@ def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         val_bits, elems_per_lane, "val_codebook", "v_bit_off" if v_misaligned else ""
     )
     v_exprs = [e.replace("kb[", "vb[") for e in v_exprs]
-    k_lines = "\n            ".join(
-        f"k_el[{i}] = {expr};" for i, expr in enumerate(k_exprs)
-    )
-    v_lines = "\n            ".join(
-        f"v_el[{i}] = {expr};" for i, expr in enumerate(v_exprs)
-    )
+
+    def lines(exprs, array, pointer, suffix=""):
+        return "\n            ".join(
+            f"{array}{suffix}[{i}] = "
+            + expr.replace(f"{pointer}[", f"{pointer}{suffix}[")
+            + ";"
+            for i, expr in enumerate(exprs)
+        )
+
+    k_lines = lines(k_exprs, "k_el", "kb")
+    v_lines = lines(v_exprs, "v_el", "vb")
+
+    block = ""
+    if unroll > 1:
+        loads = []
+        for j in range(unroll):
+            loads.append(
+                f"""
+            U kn{j} = static_cast<U>(k_nm[(long)(t + {j} * Blocks) * k_nm_ts]);
+            auto kb{j} = (const device uint8_t*)(k_pk + (long)(t + {j} * Blocks) * k_pk_ts)
+                + k_byte_base;
+            U k_el{j}[qk_per_thread];
+            {lines(k_exprs, "k_el", "kb", str(j))}
+            U vn{j} = static_cast<U>(v_nm[(long)(t + {j} * Blocks) * v_nm_ts]);
+            auto vb{j} = (const device uint8_t*)(v_pk + (long)(t + {j} * Blocks) * v_pk_ts)
+                + v_byte_base;
+            U v_el{j}[v_per_thread];
+            {lines(v_exprs, "v_el", "vb", str(j))}"""
+            )
+        score_lines = "\n".join(
+            f"""
+                U d{j} = 0;
+                for (int i = 0; i < qk_per_thread; i++)
+                    d{j} += q[r][i] * k_el{j}[i];
+                U s{j} = simd_sum(d{j}) * kn{j};"""
+            for j in range(unroll)
+        )
+        smax = "s0"
+        for j in range(1, unroll):
+            smax = f"max({smax}, s{j})"
+        p_lines = "\n".join(
+            f"                U p{j} = fast::exp(s{j} - new_max);" for j in range(unroll)
+        )
+        psum = " + ".join(f"p{j}" for j in range(unroll))
+        pv = " + ".join(f"p{j} * vn{j} * v_el{j}[i]" for j in range(unroll))
+        block = f"""
+        // Tokens up to token_count - QRows are visible to every row: no mask.
+        for (; t + {unroll - 1} * Blocks <= token_count - QRows; t += {unroll} * Blocks) {{
+            {"".join(loads)}
+            for (int r = 0; r < QRows; r++) {{
+                {score_lines}
+                U new_max = max(max_score[r], {smax});
+                U factor = fast::exp(max_score[r] - new_max);
+{p_lines}
+                max_score[r] = new_max;
+                sum_exp_score[r] = sum_exp_score[r] * factor + ({psum});
+                for (int i = 0; i < v_per_thread; i++)
+                    o[r][i] = o[r][i] * factor + ({pv});
+            }}
+        }}
+"""
 
     source = f"""
         constexpr int BD = 32;
@@ -392,7 +454,9 @@ def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
         {"int k_bit_off = k_bit_start & 7;" if k_misaligned else ""}
         {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
 
-        for (int t = pad + (int)block_idx; t < token_count; t += Blocks) {{
+        int t = pad + (int)block_idx;
+{block}
+        for (; t < token_count; t += Blocks) {{
             U kn = static_cast<U>(k_nm[(long)t * k_nm_ts]);
             auto kb = (const device uint8_t*)(k_pk + (long)t * k_pk_ts)
                 + k_byte_base;
@@ -438,7 +502,7 @@ def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
     """
 
     return mx.fast.metal_kernel(
-        name=f"omlx_tq_mse_ragged_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        name=f"omlx_tq_mse_ragged_2pass1_k{key_bits}_v{val_bits}_d{dim}_u{unroll}",
         input_names=[
             "queries",
             "key_norms",
@@ -501,7 +565,10 @@ def _ragged_batched_attention(real_cache, queries, keys_state, values_state, sca
     n_kv_heads = keys_state.norms.shape[1]
     n_repeats = n_q_heads // n_kv_heads
 
-    pass1 = _ragged_mse_2pass1_kernel(int(key_codec.bits), int(value_codec.bits), D)
+    unroll = _RAGGED_UNROLL or (2 if L <= 2 else 4)
+    pass1 = _ragged_mse_2pass1_kernel(
+        int(key_codec.bits), int(value_codec.bits), D, unroll
+    )
     pass2 = _tq._fused_mse_decode_2pass_2_kernel()
     if pass1 is None or pass2 is None:
         return None
