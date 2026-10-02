@@ -384,6 +384,152 @@ def _decode_multirow_attention(real_cache, queries, keys, values, scale):
     return out.astype(queries.dtype)
 
 
+_LOGGED_PATHS: set = set()
+
+
+def _log_path_once(key: str, message: str) -> None:
+    """Log which batched-attention path is used, once per process and key."""
+    if key in _LOGGED_PATHS:
+        return
+    _LOGGED_PATHS.add(key)
+    logger.info(message)
+
+
+def _row_dequant_attention(real_cache, q_row, ks_row, vs_row, scale):
+    """Correct fallback for one row: dequantize ONLY the row's unpadded slice.
+
+    ``q_row`` is (1, H, L, D); the row slice holds n keys whose last L
+    positions are the queries. If n < L the leading L - n queries sit inside
+    the padding and have nothing to attend to; their output is zero.
+    """
+    from ..turboquant_kv import _state_length
+
+    n = _state_length(real_cache._unwrap(ks_row))
+    L = q_row.shape[2]
+    if n <= 0:
+        return mx.zeros(q_row.shape, dtype=q_row.dtype)
+    dk, dv = real_cache.dequantize(keys_state=ks_row, values_state=vs_row)
+    keep = min(L, n)
+    out = mx.fast.scaled_dot_product_attention(
+        q_row[:, :, L - keep :, :],
+        dk.astype(q_row.dtype),
+        dv.astype(q_row.dtype),
+        scale=scale,
+        mask="causal" if keep > 1 else None,
+    )
+    if keep < L:
+        out = mx.concatenate(
+            [mx.zeros((*q_row.shape[:2], L - keep, out.shape[-1]), out.dtype), out],
+            axis=2,
+        )
+    return out
+
+
+def _is_batch_padding_mask(real_cache, mask, queries, keys) -> bool:
+    """True iff ``mask`` is exactly the left-padding + causal mask of the cache.
+
+    The per-row path hard-codes that mask, so an arbitrary caller-supplied
+    boolean mask (anything but the cache's own) must keep the masked path.
+    """
+    left_padding = getattr(real_cache, "left_padding", None)
+    if left_padding is None or int(left_padding.max().item()) <= 0:
+        return False
+    from mlx_lm.models.cache import create_causal_mask
+
+    from ..turboquant_kv import _state_length
+
+    L = queries.shape[-2]
+    total = _state_length(real_cache._unwrap(keys))
+    if mask.ndim != 4 or mask.shape[-2:] != (L, total):
+        return False
+    expected = create_causal_mask(L, offset=total - L, left_padding=left_padding)
+    return bool(mx.array_equal(mask, expected).item())
+
+
+def _per_row_batched_attention(real_cache, queries, keys, values, scale):
+    """Attention for a left-padded B>1 TurboQuant batch, one row at a time.
+
+    Rows are end-aligned; row b owns columns [pad_b, total). The batched
+    kernels cannot skip a per-row prefix, and attending the zero-filled
+    padding corrupts the softmax (each padded column adds exp(0 - m) to the
+    denominator), so every row attends ONLY its own slice. The slice feeds
+    the single-row fused machinery (decode_attention for L == 1, the fused
+    multi-row verify kernel for 1 < L <= 15) with a row-local causal tail;
+    no float32 dequantize of the context. Rows whose slice cannot take the
+    fused kernels fall back to ``_row_dequant_attention`` (still unpadded).
+
+    Returns None when the cache has no usable left padding (caller keeps its
+    own path).
+    """
+    from ..turboquant_kv import _filter_state, _slice_state_range, _state_length
+
+    left_padding = getattr(real_cache, "left_padding", None)
+    if left_padding is None:
+        return None
+    B, _, L, _ = queries.shape
+    pads = [int(p) for p in left_padding.tolist()]
+    if len(pads) != B:
+        return None
+
+    keys_state = real_cache._unwrap(keys)
+    values_state = real_cache._unwrap(values)
+    total = _state_length(keys_state)
+    fused_ok = L <= _DECODE_MULTIROW_MAX_Q_LEN
+    outputs = []
+    used_fallback = None
+    for b, pad in enumerate(pads):
+        n = total - pad
+        q_row = queries[b : b + 1]
+        if n <= 0:
+            outputs.append(mx.zeros(q_row.shape, dtype=q_row.dtype))
+            continue
+        ks_row = _filter_state(
+            _slice_state_range(keys_state, pad, total), slice(b, b + 1)
+        )
+        vs_row = _filter_state(
+            _slice_state_range(values_state, pad, total), slice(b, b + 1)
+        )
+        out = None
+        if fused_ok and n >= L:
+            try:
+                if L == 1:
+                    out = real_cache.decode_attention(
+                        q_row,
+                        keys_state=ks_row,
+                        values_state=vs_row,
+                        scale=scale,
+                        mask=None,
+                    )
+                else:
+                    out = _decode_multirow_attention(
+                        real_cache, q_row, ks_row, vs_row, scale
+                    )
+            except Exception as exc:
+                used_fallback = f"fused kernel failed ({type(exc).__name__})"
+                logger.debug("TurboQuant per-row fused attention failed",
+                             exc_info=True)
+        elif not fused_ok:
+            used_fallback = f"q_len {L} > {_DECODE_MULTIROW_MAX_Q_LEN}"
+        else:
+            used_fallback = f"row slice ({n}) shorter than q_len ({L})"
+        if out is None:
+            out = _row_dequant_attention(real_cache, q_row, ks_row, vs_row, scale)
+        outputs.append(out)
+
+    if used_fallback is None:
+        _log_path_once(
+            "fused",
+            f"TurboQuant batched attention: per-row fused path (B={B})",
+        )
+    else:
+        _log_path_once(
+            f"fallback:{used_fallback}",
+            "TurboQuant batched attention: per-row dequantize fallback "
+            f"({used_fallback}; B={B})",
+        )
+    return mx.concatenate(outputs, axis=0).astype(queries.dtype)
+
+
 def _patch_update_eval_policy() -> None:
     """Skip the per-layer eval for decode-shaped multi-row cache appends.
 
@@ -482,6 +628,21 @@ def _patch_vlm_target_verify_attention() -> None:
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
             )
+        if queries.shape[0] > 1 and not isinstance(mask, mx.array):
+            # B>1 without an explicit mask (mlx-vlm's "left_padded_decode"
+            # hands mask=None): rows are left-padded, so each must attend only
+            # its own slice. Without padding the batched kernels are exact.
+            left_padding = getattr(real_cache, "left_padding", None)
+            if left_padding is not None and int(left_padding.max().item()) > 0:
+                result = _per_row_batched_attention(
+                    real_cache, queries, keys, values, scale
+                )
+                if result is not None:
+                    return result
+            else:
+                return sdpa(
+                    queries, keys, values, cache=cache, scale=scale, mask="causal"
+                )
         # Left-padded batches / explicit array masks: dequantize once and
         # replicate the caller's per-row causal slicing on dense arrays.
         dk, dv = real_cache.dequantize(keys_state=keys, values_state=values)
@@ -575,6 +736,23 @@ def apply_turboquant_attention_patch() -> bool:
                     mask=mask,
                     sinks=sinks,
                 )
+            if (
+                queries.shape[0] > 1
+                and queries.shape[-2] <= _DECODE_MULTIROW_MAX_Q_LEN
+                and isinstance(real_cache, BatchTurboQuantKVCache)
+                and isinstance(mask, mx.array)
+                and mask.dtype == mx.bool_
+                and _is_batch_padding_mask(real_cache, mask, queries, keys)
+            ):
+                # Decode-shaped call on a left-padded batch with the cache's own
+                # padding+causal mask: equivalent to attending each row's
+                # unpadded slice with a row-local causal tail, but through the
+                # fused single-row kernels instead of the masked chunk loop.
+                result = _per_row_batched_attention(
+                    real_cache, queries, keys, values, scale
+                )
+                if result is not None:
+                    return result
             if queries.shape[-2] == 1:
                 # Decode (B=1 and B>1). Continuous-batching decode passes a
                 # per-request left-padding array mask; the masked decode_attention
