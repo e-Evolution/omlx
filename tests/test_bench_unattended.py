@@ -1107,3 +1107,42 @@ class TestNoMtpVariant:
         p = _p3lp(ref_gap_at_div=0.2, div_at=10)
         md = report.section_p3({"fork": {"P3": [p]}, "fork-nomtp": {"P3": [p]}})
         assert "MTP off" in md
+
+
+def _with_rerun(p, identical):
+    for row in p["scenario"]["rows"]:
+        rr = _recs(64)
+        if not identical:
+            rr[20] = {"t": 777, "lp": -1.0, "top": [[777, -1.0]]}
+        row["logprobs"]["alone_restored2"] = rr
+    return p
+
+
+class TestEvalP3MtpAttribution:
+    def test_batching_noise_with_irreproducible_mtp_reference_passes(self):
+        mtp_on = _with_rerun(_p3lp(ref_gap_at_div=1.0, div_at=8), identical=False)
+        off = _p3lp(ref_gap_at_div=0.0, div_at=40)
+        r = bm.eval_p3([mtp_on], [], nomtp=[off])
+        assert r["verdict"] == "PASS"
+        names = [c["name"] for c in r["checks"]]
+        assert any("MTP off" in n for n in names)
+        assert r["nomtp"]["detail"][0]["classification"] == "noise"
+
+    def test_reproducible_mtp_reference_is_judged_on_its_own(self):
+        mtp_on = _with_rerun(_p3lp(ref_gap_at_div=1.0, div_at=8), identical=True)
+        off = _p3lp(ref_gap_at_div=0.0, div_at=40)
+        assert bm.eval_p3([mtp_on], [], nomtp=[off])["verdict"] == "FAIL"
+
+    def test_batching_bug_with_mtp_off_fails(self):
+        mtp_on = _with_rerun(_p3lp(ref_gap_at_div=0.0, div_at=40), identical=False)
+        off = _p3lp(ref_gap_at_div=4.0, div_at=10)
+        assert bm.eval_p3([mtp_on], [], nomtp=[off])["verdict"] == "FAIL"
+
+    def test_mtp_off_batch_must_be_exercised(self):
+        mtp_on = _with_rerun(_p3lp(div_at=None), identical=True)
+        off = _p3lp(div_at=None, batch_b=2)
+        assert bm.eval_p3([mtp_on], [], nomtp=[off])["verdict"] == "FAIL"
+
+    def test_without_nomtp_behaviour_is_unchanged(self):
+        mtp_on = _with_rerun(_p3lp(ref_gap_at_div=1.0, div_at=8), identical=False)
+        assert bm.eval_p3([mtp_on], [])["verdict"] == "FAIL"
