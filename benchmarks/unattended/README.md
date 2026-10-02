@@ -86,15 +86,23 @@ Method notes:
   `fraction x prompt_tokens` (prefill slows with context, so this is
   conservative); the identical prompt is re-issued and the cached tokens are read
   from `Prefix cache restore ... cached=N`. Pass: cached >= 50% of progress.
-* P3: three prompts (20k/45k/135k), temperature 0, top_k 1. Arms: B=1 cold,
-  B=3 (all three at once, longest first; hits the cache populated by the B=1
-  arm so decode really overlaps), B=1 again (cache-restored; informational, to
-  separate cache-restore effects from batching). Fork runs with
-  `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0`. Text equality is the check; the
-  log must contain `per-row fused path (B=3)`.
+* P3: three prompts (20k/45k/135k), temperature 0, top_k 1, like-for-like:
+  cold B=1 (only populates the prefix cache), B=1 restored (reference), B=3
+  restored (started together so all rows decode in one batch). Fork variants run
+  with `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0`. PASS: B=3 equals the
+  B=1-restored text for the first 32 tokens' worth of chunks on every row, no
+  degeneration (distinct word-4gram ratio >= 0.5x the B=1 value and >= 0.3), and
+  the log shows a 3-row batch (`Lightning MTP batch activated for 3 sequences`
+  or `per-row fused path (B=3)`). First divergence and the metric are reported
+  per row for every variant; upstream is reported, not judged.
 * P4: serial = client sends one at a time, concurrent = all three at once, on
   distinct prompts of the same lengths (both cold), server
-  `max_concurrent_requests=3`.
+  `max_concurrent_requests=3`. PASS: 0 aborts, concurrent wall <= serial wall,
+  and the aggregate decode rate over the window where all three rows decode
+  (per-chunk timestamps) >= the median single-row serial rate. Per-row ratios
+  are informational. `--p4-max-tokens` widens the all-three window.
+* P6: `--runs 3` reports median and min-max. Variants for attribution:
+  `upstream`, `fork-off`, `fork`, plus `fork-d1only` and `fork-cachelimit-only`.
 * `fork-off` cannot disable the T5d per-row TurboQuant fix (it is a bug fix),
   only the four env features.
 
