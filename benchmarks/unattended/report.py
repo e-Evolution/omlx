@@ -290,7 +290,7 @@ def section_p3(data: dict) -> str:
                     f(s["cold_vs_restored_mismatched_rows"], 0),
                 ]
             )
-    return table(
+    main = table(
         [
             "variant",
             "row",
@@ -304,6 +304,73 @@ def section_p3(data: dict) -> str:
         ],
         rows,
     )
+    return main + _p3_margins(data)
+
+
+def _p3_margins(data: dict) -> str:
+    """Near-tie analysis and controls (only when logprob dumps were captured)."""
+    runs = data.get("fork", {}).get("P3")
+    if not runs:
+        return ""
+    detail = [d for d in bm._p3_summary(runs)["detail"] if d["classification_available"]]
+    if not detail:
+        return ""
+    rows = [
+        [
+            d["name"],
+            "identical" if d["div_token"] is None else f(d["div_token"], 0),
+            f(d["margin"], 3, " nats"),
+            f(d["test_margin"], 3, " nats"),
+            f(d["mean_abs_dlp"], 4),
+            f(d["max_abs_dlp"], 4),
+            d["classification"] or "-",
+            "yes" if d["diverged_in_prefix"] else "no",
+        ]
+        for d in detail
+    ]
+    out = "\n\n**Near-tie analysis, B=3 vs B=1-restored (token level, fork).** " + (
+        f"Noise: margin < {bm.P3_NOISE_MARGIN} nats and mean |dlp| < {bm.P3_NOISE_DLP}; "
+        f"bug: margin > {bm.P3_BUG_MARGIN} or mean |dlp| >= {bm.P3_BUG_DLP}.\n\n"
+    )
+    out += table(
+        [
+            "row",
+            "first divergent token",
+            "B=1 top1-top2 margin",
+            "B=3 top1-top2 margin",
+            "mean abs dlp (shared prefix)",
+            "max abs dlp",
+            "class",
+            "inside first 32 tok",
+        ],
+        rows,
+    )
+    crow = []
+    for d in detail:
+        for label, desc in (
+            ("rerun", "B=1 restored vs B=1 restored again"),
+            ("ragged_b1", "B=1 fused vs B=1 forced through ragged kernel"),
+            ("ragged_vs_b3", "B=1 ragged vs B=3"),
+        ):
+            c = d.get("controls", {}).get(label)
+            if c is None:
+                continue
+            crow.append(
+                [
+                    d["name"],
+                    desc,
+                    "identical" if c["div_index"] is None else f(c["div_index"], 0),
+                    f(c["margin"], 3, " nats"),
+                    f(c["mean_abs_dlp"], 4),
+                    c["classification"] or "-",
+                ]
+            )
+    if crow:
+        out += "\n\n**Controls.**\n\n" + table(
+            ["row", "comparison", "first divergent token", "margin", "mean abs dlp", "class"],
+            crow,
+        )
+    return out
 
 
 def section_p4(data: dict) -> str:

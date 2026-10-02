@@ -14,6 +14,7 @@ import json
 import os
 import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 # --------------------------------------------------------------------------
@@ -592,6 +593,87 @@ def is_degenerate(
     return candidate < floor <= baseline
 
 
+# Near-tie classification of the first token divergence (needs logprob dumps).
+P3_NOISE_MARGIN = 0.5  # nats: top1-top2 gap of the reference at the divergence
+P3_BUG_MARGIN = 2.0
+P3_NOISE_DLP = 0.05  # mean |delta logprob| of the chosen tokens before it
+P3_BUG_DLP = 0.25
+
+
+def compare_logprobs(
+    ref: list[dict], test: list[dict], limit: int | None = None
+) -> dict[str, Any]:
+    """First token divergence of two logprob dumps and its near-tie evidence.
+
+    Records are ``{"t": token, "lp": chosen logprob, "top": [[id, lp], ...]}``
+    sorted by logprob. ``margin`` is the REFERENCE top1-top2 gap at the
+    divergence position; the drift is measured on the shared prefix.
+    """
+    n = min(len(ref), len(test))
+    if limit is not None:
+        n = min(n, limit)
+    div = next((i for i in range(n) if ref[i]["t"] != test[i]["t"]), None)
+    shared = n if div is None else div
+    drifts = [abs(ref[i]["lp"] - test[i]["lp"]) for i in range(shared)]
+
+    def gap(rec: dict) -> float | None:
+        top = rec.get("top") or []
+        return top[0][1] - top[1][1] if len(top) >= 2 else None
+
+    return {
+        "n_ref": len(ref),
+        "n_test": len(test),
+        "n_shared": shared,
+        "div_index": div,
+        "margin": None if div is None else gap(ref[div]),
+        "test_margin": None if div is None else gap(test[div]),
+        "mean_abs_dlp": sum(drifts) / len(drifts) if drifts else 0.0,
+        "max_abs_dlp": max(drifts, default=0.0),
+    }
+
+
+def classify_divergence(cmp: dict[str, Any]) -> str | None:
+    """noise / bug / inconclusive for a divergence; None when there is none."""
+    if cmp.get("div_index") is None:
+        return None
+    margin, drift = cmp.get("margin"), cmp.get("mean_abs_dlp") or 0.0
+    if (margin is not None and margin > P3_BUG_MARGIN) or drift >= P3_BUG_DLP:
+        return "bug"
+    if margin is not None and margin < P3_NOISE_MARGIN and drift < P3_NOISE_DLP:
+        return "noise"
+    return "inconclusive"
+
+
+def load_logprob_dump(path) -> list[dict]:
+    """Records of one request's OMLX_DEBUG_LOGPROB_DUMP file (torn tail skipped)."""
+    out = []
+    for line in Path(path).read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            break
+    return out
+
+
+def dump_listing(directory) -> set[str]:
+    d = Path(directory)
+    return {p.name for p in d.glob("*.jsonl")} if d.exists() else set()
+
+
+def new_dumps(directory, before: set[str]) -> list[Path]:
+    d = Path(directory)
+    return sorted(p for p in d.glob("*.jsonl") if p.name not in before)
+
+
+def pick_dump(paths: list[Path], prompt_tokens: int | None) -> Path | None:
+    """The dump whose records carry this prompt-token count."""
+    for p in paths:
+        recs = load_logprob_dump(p)
+        if recs and recs[0].get("pt") == prompt_tokens:
+            return p
+    return None
+
+
 def first_divergence(a: str, b: str) -> int | None:
     """Index of the first differing char, None when the texts are identical."""
     if a == b:
@@ -629,7 +711,7 @@ def _p3_row_detail(row: dict) -> dict[str, Any]:
     d1 = distinct_ngram_ratio(ref["text"])
     d3 = distinct_ngram_ratio(b3["text"])
     cc = ref.get("chunk_chars") or []
-    return {
+    detail = {
         "name": row["name"],
         "first_divergence_chars": div,
         "first_divergence_token_est": (
@@ -642,7 +724,37 @@ def _p3_row_detail(row: dict) -> dict[str, Any]:
         "degenerate": is_degenerate(d1, d3),
         "alone_tokens": ref.get("completion_tokens"),
         "batched_tokens": b3.get("completion_tokens"),
+        "classification_available": False,
     }
+    lps = row.get("logprobs") or {}
+    if lps.get("alone_restored") and lps.get("batched"):
+        c = compare_logprobs(lps["alone_restored"], lps["batched"])
+        detail.update(
+            classification_available=True,
+            classification=classify_divergence(c),
+            div_token=c["div_index"],
+            margin=c["margin"],
+            test_margin=c["test_margin"],
+            mean_abs_dlp=c["mean_abs_dlp"],
+            max_abs_dlp=c["max_abs_dlp"],
+            n_shared=c["n_shared"],
+            diverged_in_prefix=(
+                c["div_index"] is not None and c["div_index"] < P3_PREFIX_TOKENS
+            ),
+        )
+        controls = {}
+        pairs = (
+            ("rerun", "alone_restored", "alone_restored2"),
+            ("ragged_b1", "alone_restored", "ragged_b1"),
+            ("ragged_vs_b3", "ragged_b1", "batched"),
+        )
+        for label, a, b in pairs:
+            if lps.get(a) and lps.get(b):
+                cc2 = compare_logprobs(lps[a], lps[b])
+                cc2["classification"] = classify_divergence(cc2)
+                controls[label] = cc2
+        detail["controls"] = controls
+    return detail
 
 
 def _p3_summary(runs: list[dict]) -> dict[str, Any]:
@@ -676,6 +788,31 @@ def _p3_summary(runs: list[dict]) -> dict[str, Any]:
     }
 
 
+def _noise_check(detail: list[dict], all_ok: bool) -> dict[str, Any]:
+    """Divergences inside the first 32 tokens must be near-tie numerical noise."""
+    bad = [
+        d
+        for d in detail
+        if d["diverged_in_prefix"] and d["classification"] != "noise"
+    ]
+
+    def one(d: dict) -> str:
+        if d["div_token"] is None:
+            return f"{d['name']}: identical"
+        return (
+            f"{d['name']}: token {d['div_token']} margin {_fmt(d['margin'])} nats, "
+            f"mean|dlp| {_fmt(d['mean_abs_dlp'], 3)} -> {d['classification']}"
+            + ("" if d["diverged_in_prefix"] else " (after token 32, not judged)")
+        )
+
+    return _check(
+        f"B=3 vs B=1 (restored): divergence inside the first {P3_PREFIX_TOKENS} tokens "
+        "is numerical noise (near-tie)",
+        all_ok and not bad,
+        f"{len(bad)}/{len(detail)} rows not noise; " + "; ".join(one(d) for d in detail),
+    )
+
+
 def eval_p3(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
     """Like-for-like: B=3 restored rows vs the same rows alone, restored."""
     if not fork:
@@ -688,13 +825,16 @@ def eval_p3(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
         for k in ("alone_restored", "batched")
     )
     n = len(fk["detail"])
+    judged = bool(fk["detail"]) and all(d["classification_available"] for d in fk["detail"])
     checks = [
         _check(
             "all requests completed",
             all_ok,
             "every restored B=1 and B=3 request ok" if all_ok else "a request failed",
         ),
-        _check(
+        _noise_check(fk["detail"], all_ok)
+        if judged
+        else _check(
             f"B=3 == B=1 (restored) for the first {P3_PREFIX_TOKENS} tokens, every row",
             all_ok and fk["diverged_in_prefix_rows"] == 0,
             f"{fk['diverged_in_prefix_rows']}/{n} rows diverge inside the prefix; "

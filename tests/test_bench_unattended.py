@@ -588,6 +588,134 @@ class TestEvalP3:
         assert r["fork"]["cold_vs_restored_mismatched_rows"] == 3
 
 
+def _rec(tok, lp=-0.1, gap=3.0):
+    """A token record whose top-2 margin is `gap` nats."""
+    return {"t": tok, "lp": lp, "top": [[tok, lp], [tok + 1000, lp - gap]]}
+
+
+def _recs(n, **kw):
+    return [_rec(i, **kw) for i in range(n)]
+
+
+class TestLogprobComparison:
+    def test_identical_has_no_divergence(self):
+        c = bm.compare_logprobs(_recs(40), _recs(40))
+        assert c["div_index"] is None
+        assert c["mean_abs_dlp"] == 0.0
+        assert c["n_shared"] == 40
+
+    def test_margin_taken_from_reference_top2_at_divergence(self):
+        ref, test = _recs(40), _recs(40)
+        ref[10] = _rec(10, lp=-0.2, gap=0.3)
+        test[10] = {"t": 1010, "lp": -0.5, "top": [[1010, -0.5], [10, -0.8]]}
+        c = bm.compare_logprobs(ref, test)
+        assert c["div_index"] == 10
+        assert c["margin"] == pytest.approx(0.3)
+        assert c["n_shared"] == 10
+
+    def test_mean_and_max_abs_dlp_over_shared_prefix(self):
+        ref, test = _recs(20), _recs(20)
+        test[2]["lp"] = ref[2]["lp"] - 0.4  # |dlp| 0.4 on one of 5 shared tokens
+        test[5] = {"t": 999, "lp": -9.0, "top": [[999, -9.0]]}
+        c = bm.compare_logprobs(ref, test)
+        assert c["div_index"] == 5
+        assert c["mean_abs_dlp"] == pytest.approx(0.4 / 5)
+        assert c["max_abs_dlp"] == pytest.approx(0.4)
+
+    def test_length_mismatch_without_token_difference_is_not_divergence(self):
+        c = bm.compare_logprobs(_recs(40), _recs(30))
+        assert c["div_index"] is None and c["n_shared"] == 30
+
+    def test_missing_second_candidate_gives_none_margin(self):
+        ref, test = _recs(5), _recs(5)
+        ref[3] = {"t": 3, "lp": -0.1, "top": [[3, -0.1]]}
+        test[3] = _rec(77)
+        assert bm.compare_logprobs(ref, test)["margin"] is None
+
+
+class TestClassifyDivergence:
+    def _c(self, margin, mean):
+        return {"div_index": 5, "margin": margin, "mean_abs_dlp": mean}
+
+    def test_no_divergence(self):
+        assert bm.classify_divergence({"div_index": None}) is None
+
+    def test_small_margin_small_drift_is_noise(self):
+        assert bm.classify_divergence(self._c(0.1, 0.01)) == "noise"
+
+    def test_large_margin_is_bug(self):
+        assert bm.classify_divergence(self._c(2.5, 0.01)) == "bug"
+
+    def test_large_prefix_drift_is_bug(self):
+        assert bm.classify_divergence(self._c(0.1, 0.5)) == "bug"
+
+    def test_grey_zone_is_inconclusive(self):
+        assert bm.classify_divergence(self._c(1.0, 0.01)) == "inconclusive"
+        assert bm.classify_divergence(self._c(0.1, 0.1)) == "inconclusive"
+
+    def test_unknown_margin_is_inconclusive(self):
+        assert bm.classify_divergence(self._c(None, 0.01)) == "inconclusive"
+
+
+def _p3lp(ref_gap_at_div=0.2, div_at=10, drift=0.0, batch_b=3, degenerate=False):
+    p = _p3(batch_b=batch_b, degenerate=degenerate)
+    for row in p["scenario"]["rows"]:
+        ref, b3 = _recs(64), _recs(64)
+        for r in b3:
+            r["lp"] -= drift
+        if div_at is not None:
+            ref[div_at] = _rec(div_at, gap=ref_gap_at_div)
+            b3[div_at] = {"t": 5000, "lp": -0.6, "top": [[5000, -0.6]]}
+        row["logprobs"] = {"alone_restored": ref, "batched": b3}
+    return p
+
+
+class TestEvalP3WithLogprobs:
+    def test_noise_divergence_passes_even_inside_prefix(self):
+        p = _p3lp(ref_gap_at_div=0.2, div_at=10)
+        p["scenario"]["rows"][0]["batched"]["text"] = "totally different"
+        r = bm.eval_p3([p], [])
+        assert r["verdict"] == "PASS"
+        d = r["fork"]["detail"][0]
+        assert d["classification"] == "noise"
+        assert d["margin"] == pytest.approx(0.2)
+        assert d["div_token"] == 10
+
+    def test_large_margin_divergence_fails(self):
+        r = bm.eval_p3([_p3lp(ref_gap_at_div=4.0, div_at=10)], [])
+        assert r["verdict"] == "FAIL"
+        assert any("noise" in c["name"] and not c["ok"] for c in r["checks"])
+
+    def test_inconclusive_margin_fails(self):
+        assert bm.eval_p3([_p3lp(ref_gap_at_div=1.0)], [])["verdict"] == "FAIL"
+
+    def test_divergence_after_token_32_is_reported_not_judged(self):
+        r = bm.eval_p3([_p3lp(ref_gap_at_div=4.0, div_at=40)], [])
+        assert r["verdict"] == "PASS"
+        assert r["fork"]["detail"][0]["classification"] == "bug"
+
+    def test_no_divergence_passes(self):
+        assert bm.eval_p3([_p3lp(div_at=None)], [])["verdict"] == "PASS"
+
+    def test_still_requires_batch_and_no_degeneration(self):
+        assert bm.eval_p3([_p3lp(batch_b=2)], [])["verdict"] == "FAIL"
+        assert bm.eval_p3([_p3lp(degenerate=True)], [])["verdict"] == "FAIL"
+
+    def test_controls_are_reported(self):
+        p = _p3lp(div_at=None)
+        for row in p["scenario"]["rows"]:
+            row["logprobs"]["alone_restored2"] = _recs(64)
+            rg = _recs(64)
+            rg[7] = _rec(7, gap=0.1)
+            rg[7] = {"t": 4242, "lp": -1.0, "top": [[4242, -1.0]]}
+            row["logprobs"]["ragged_b1"] = rg
+        r = bm.eval_p3([p], [])
+        ctl = r["fork"]["detail"][0]["controls"]
+        assert ctl["rerun"]["div_index"] is None
+        assert ctl["ragged_b1"]["div_index"] == 7
+        assert r["verdict"] == "PASS"  # controls are informational
+
+
 def _p4(
     serial_wall,
     conc_wall,
@@ -856,3 +984,74 @@ def test_fork_overlay_refuses_to_delete_foreign_dir(tmp_path):
     foreign.mkdir()
     with pytest.raises(RuntimeError):
         bp.build_fork_overlay(tmp_path, tmp_path, foreign)
+
+
+class TestLogprobDumpHelpers:
+    def test_load_dump_parses_jsonl_and_skips_torn_last_line(self, tmp_path):
+        import json
+
+        f = tmp_path / "r.jsonl"
+        f.write_text(
+            json.dumps({"pt": 5, "t": 1, "lp": -0.1, "top": [[1, -0.1]]})
+            + "\n"
+            + json.dumps({"pt": 5, "t": 2, "lp": -0.2, "top": [[2, -0.2]]})
+            + '\n{"pt": 5, "t"'
+        )
+        recs = bm.load_logprob_dump(f)
+        assert [r["t"] for r in recs] == [1, 2]
+
+    def test_new_dumps_returns_only_files_added_since(self, tmp_path):
+        (tmp_path / "a.jsonl").write_text("{}\n")
+        before = bm.dump_listing(tmp_path)
+        (tmp_path / "b.jsonl").write_text("{}\n")
+        assert [p.name for p in bm.new_dumps(tmp_path, before)] == ["b.jsonl"]
+
+    def test_pick_dump_by_prompt_tokens(self, tmp_path):
+        import json
+
+        for name, pt in (("x", 100), ("y", 250)):
+            (tmp_path / f"{name}.jsonl").write_text(
+                json.dumps({"pt": pt, "t": 1, "lp": 0.0, "top": []}) + "\n"
+            )
+        paths = sorted(tmp_path.iterdir())
+        assert bm.pick_dump(paths, 250).name == "y.jsonl"
+        assert bm.pick_dump(paths, 999) is None
+
+
+class TestP3DebugEnv:
+    def test_fork_p3_gets_dump_and_ragged_flag_paths(self, tmp_path):
+        import bench_premises as bp
+
+        env = bp.debug_env("fork", "P3", tmp_path)
+        assert env["OMLX_DEBUG_LOGPROB_DUMP"].startswith(str(tmp_path))
+        assert env["OMLX_DEBUG_FORCE_RAGGED_B1"].startswith(str(tmp_path))
+
+    def test_upstream_and_other_premises_get_none(self, tmp_path):
+        import bench_premises as bp
+
+        assert bp.debug_env("upstream", "P3", tmp_path) == {}
+        assert bp.debug_env("fork", "P4", tmp_path) == {}
+
+    def test_p3_control_phases(self):
+        import bench_premises as bp
+
+        assert bp.P3_CONTROL_PHASES == ("alone_restored2", "ragged_b1")
+
+
+class TestReportP3Margins:
+    def test_margins_and_controls_tables_render(self):
+        import report
+
+        p = _p3lp(ref_gap_at_div=0.2, div_at=10)
+        for row in p["scenario"]["rows"]:
+            row["logprobs"]["alone_restored2"] = _recs(64)
+        md = report.section_p3({"fork": {"P3": [p]}})
+        assert "Near-tie analysis" in md
+        assert "0.200 nats" in md
+        assert "noise" in md
+        assert "Controls" in md and "restored again" in md
+
+    def test_no_margins_without_logprobs(self):
+        import report
+
+        assert "Near-tie" not in report.section_p3({"fork": {"P3": [_p3()]}})
