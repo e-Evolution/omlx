@@ -28,10 +28,18 @@ SCALE = D**-0.5
 LENGTHS = [2000, 6000, 9000]
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _patched():
+@pytest.fixture(autouse=True)
+def _patched(monkeypatch):
     tqa.apply_turboquant_attention_patch()
     tqa._PATCHED = True
+    # Other suites wrap the same mlx-vlm seam in other orders (the MTP verify
+    # wrapper returns None for an explicit mask when it ends up outermost).
+    # Install the production order: the TurboQuant dispatcher outermost.
+    original = getattr(q35_lang, "_omlx_tq_target_verify_original", None)
+    if original is not None:
+        monkeypatch.setattr(q35_lang, "_qwen3_5_left_padded_attention", original)
+        monkeypatch.setattr(q35_lang, "_omlx_tq_target_verify_patched", False, raising=False)
+        tqa._patch_vlm_target_verify_attention()
 
 
 def _kv(b, n, seed):
@@ -369,8 +377,8 @@ def _dense_batch(pads, total, new_len, seed=0):
 def test_dense_padded_rows_attend_their_own_slice_without_copying_the_cache(
     new_len, monkeypatch
 ):
-    pads = [1500, 400, 0]  # different SDPA plans per row: no shared ragged kernel
-    cache, q, keys, values, mask = _dense_batch(pads, 2600, new_len)
+    pads = [6000, 1500, 0]  # different SDPA plans per row: no shared ragged kernel
+    cache, q, keys, values, mask = _dense_batch(pads, 9400, new_len)
     takes = {"n": 0}
     real_take = mx.take
 
@@ -390,4 +398,9 @@ def test_dense_padded_rows_attend_their_own_slice_without_copying_the_cache(
 
 def test_dense_unpadded_batch_keeps_the_upstream_path():
     cache, q, keys, values, mask = _dense_batch([0, 0], 1200, 1)
+    assert tqa._dense_padded_attention(q, keys, values, cache=cache, scale=SCALE) is None
+
+
+def test_dense_short_context_verify_stays_on_the_bounded_verify_kernel():
+    cache, q, keys, values, mask = _dense_batch([1500, 400, 0], 2600, 3)
     assert tqa._dense_padded_attention(q, keys, values, cache=cache, scale=SCALE) is None
