@@ -19,6 +19,8 @@ from typing import Optional
 
 import mlx.core as mx
 
+from .. import debug_numerics as _debug_numerics
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -1211,6 +1213,28 @@ def apply_turboquant_attention_patch() -> bool:
                 )
                 if result is not None:
                     return result
+            if (
+                queries.shape[0] == 1
+                and queries.shape[-2] <= _RAGGED_MAX_Q_ROWS
+                and isinstance(real_cache, BatchTurboQuantKVCache)
+                and _debug_numerics.force_ragged_b1()
+            ):
+                # Debug control (OMLX_DEBUG_FORCE_RAGGED_B1): single-row batch
+                # through the B>1 ragged kernel, to tell kernel numerics apart
+                # from batching/padding effects. Never on by default.
+                ragged = _ragged_batched_attention(
+                    real_cache,
+                    queries,
+                    real_cache._unwrap(keys),
+                    real_cache._unwrap(values),
+                    scale,
+                )
+                if ragged is not None:
+                    _log_path_once(
+                        "ragged",
+                        "TurboQuant batched attention: ragged single-launch path (B=1, forced)",
+                    )
+                    return ragged
             if queries.shape[-2] == 1:
                 # Decode (B=1 and B>1). Continuous-batching decode passes a
                 # per-request left-padding array mask; the masked decode_attention
