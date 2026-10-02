@@ -7,6 +7,7 @@ from statistics import median
 # Four decisions in a row with MTP below this fraction of ordinary decode
 # (expected tokens per ms) park at once instead of after 16 losing ones.
 _CLEAR_LOSS = 0.9
+_HOPELESS_MIN_MS = 20.0
 
 
 class BatchPolicy:
@@ -31,6 +32,7 @@ class BatchPolicy:
         self.acceptance = [0.6] * self.max_depth
         self.losing = 0
         self.clear_losing = 0
+        self.hopeless = 0
         self.cooldown = 128
         self.remaining = 0
         # Measured MTP decisions since activation or the last park.
@@ -104,6 +106,22 @@ class BatchPolicy:
         # CPU dispatch shape. Wait for a complete cycle at the same depth.
         if not stable:
             return
+        # A cycle emits at most depth + 1 tokens per row. When one costs more
+        # than that many ordinary steps it cannot win whatever the acceptance,
+        # so do not spend the usual 16 losing cycles (and the depth sweep)
+        # finding out: park after two such cycles in a row. The floor keeps
+        # sub-20 ms timing jitter (tiny models, test doubles) out of the rule:
+        # only a cycle expensive in absolute terms is worth short-circuiting.
+        if (
+            self.standard
+            and milliseconds >= _HOPELESS_MIN_MS
+            and milliseconds > (depth + 1) * median(self.standard)
+        ):
+            self.hopeless += 1
+            if self.hopeless >= 2:
+                self.losing = max(self.losing, 16)
+        else:
+            self.hopeless = 0
         self.costs.setdefault(depth, deque(maxlen=8)).append(max(1e-6, milliseconds))
         self.last_seen[depth] = self.elapsed_ms
         pending = [
@@ -139,6 +157,7 @@ class BatchPolicy:
         self.standard_warmup = 2
         self.losing = 0
         self.clear_losing = 0
+        self.hopeless = 0
 
     def start_parked(self, cooldown, next_cooldown=None):
         """Decode ordinarily for ``cooldown`` steps before measuring MTP again.
