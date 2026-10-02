@@ -439,3 +439,90 @@ def test_no_parkable_victim_is_logged_once_per_request_with_its_reason(
         assert any("ext: prefill runs in the external loop" in m for m in lines)
     finally:
         rig.close()
+
+
+# --- Teardown budget: our waits must fit inside the engine watchdog --------------
+
+
+def test_shutdown_commit_waits_fit_a_fraction_of_the_teardown_watchdog():
+    import omlx.scheduler as sm
+    from omlx.utils.fatal import FATAL_TEARDOWN_TIMEOUT_S
+
+    worst = (
+        sm.PREFILL_COMMIT_SHUTDOWN_WAIT_S
+        + sm.PREFILL_COMMIT_CANCEL_WAIT_S
+        + sm.PREFILL_COMMIT_STREAM_CLEANUP_WAIT_S
+    )
+    assert worst <= FATAL_TEARDOWN_TIMEOUT_S / 2
+
+
+def _stuck_final_store(rig, gated, monkeypatch):
+    """A final store queued behind a commit that never ends (gate held)."""
+    import omlx.scheduler as sm
+
+    gate = gated(rig)
+    request, state = rig.start("r1", PROMPT)
+    while not rig.scheduler._step_prefill_chunk(state):
+        pass
+    assert gate.entered.wait(20)
+    finished = _decode_to_finish(rig, request, state)
+    rig.scheduler._cleanup_finished(finished)
+    fatal = []
+    monkeypatch.setattr(sm, "fatal_exit", lambda msg: fatal.append(msg))
+    return gate, fatal
+
+
+@pytest.mark.parametrize("split", [False], ids=["inline-gdn"], indirect=True)
+def test_shutdown_cancels_a_final_store_waiting_on_a_stuck_commit(
+    tmp_path, mock_tokenizer, split, monkeypatch, gated
+):
+    import time
+
+    import omlx.scheduler as sm
+
+    # The final store would wait a full minute for the commit; the teardown
+    # watchdog allows far less. Shutdown must not inherit that wait.
+    monkeypatch.setattr(sm, "PREFILL_COMMIT_FINAL_STORE_WAIT_S", 60.0)
+    monkeypatch.setattr(sm, "PREFILL_COMMIT_SHUTDOWN_WAIT_S", 0.3)
+    monkeypatch.setattr(sm, "PREFILL_COMMIT_CANCEL_WAIT_S", 0.3)
+    monkeypatch.setattr(sm, "FATAL_TEARDOWN_TIMEOUT_S", 5.0)
+    rig = _rig(tmp_path, mock_tokenizer, split)
+    try:
+        gate, fatal = _stuck_final_store(rig, gated, monkeypatch)
+        started = time.monotonic()
+        rig.scheduler.shutdown()
+        elapsed = time.monotonic() - started
+        assert fatal == []
+        assert elapsed < 4.0
+    finally:
+        gate.release.set()
+        rig.close()
+
+
+@pytest.mark.parametrize("split", [False], ids=["inline-gdn"], indirect=True)
+def test_shutdown_reports_commit_progress_to_the_teardown_watchdog(
+    tmp_path, mock_tokenizer, split, monkeypatch, gated
+):
+    import omlx.scheduler as sm
+
+    monkeypatch.setattr(sm, "PREFILL_COMMIT_SHUTDOWN_WAIT_S", 0.3)
+    monkeypatch.setattr(sm, "PREFILL_COMMIT_CANCEL_WAIT_S", 0.3)
+    rig = _rig(tmp_path, mock_tokenizer, split)
+    try:
+        phases = []
+
+        class _Teardown:
+            def set_phase(self, phase, progress=None):
+                phases.append((phase, progress))
+
+            def remaining(self, *, mlx=False):
+                return 5.0
+
+        gate, _ = _stuck_final_store(rig, gated, monkeypatch)
+        rig.scheduler._engine_teardown = _Teardown()
+        rig.scheduler.shutdown()
+        waiting = [p for p in phases if p[0] == "prefill_commits"]
+        assert waiting and callable(waiting[0][1])
+    finally:
+        gate.release.set()
+        rig.close()
