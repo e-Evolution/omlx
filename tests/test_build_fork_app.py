@@ -439,6 +439,7 @@ def test_build_replaces_a_previous_output_bundle(bfa, donor, fork_pkg, tmp_path)
     out = tmp_path / "dist"
     stale = out / "oMLX Fork.app" / "Contents" / "stale.txt"
     _write(stale, "old")
+    _write(out / "oMLX Fork.app" / bfa.BUILD_MARKER, "m")
     bfa.build(
         bfa.Options(donor=donor, out=out, package=fork_pkg, sign=False, dmg=False),
         venv_pins=dict(PINS), runner=FakeRunner(),
@@ -461,3 +462,158 @@ def test_cli_parses_documented_flags(bfa):
     assert defaults.bundle_id == "app.omlx.fork" and defaults.name == "oMLX Fork"
     assert defaults.expect_version == "0.7.0" and defaults.expect_build == "2987"
     assert defaults.sign is True and defaults.dmg is True
+
+
+# ------------------------------------------- output / donor safety (review R3)
+
+
+def _opts(bfa, donor, fork_pkg, out, **kw):
+    kw.setdefault("sign", False)
+    kw.setdefault("dmg", False)
+    return bfa.Options(donor=donor, out=out, package=fork_pkg, **kw)
+
+
+def test_build_refuses_an_output_bundle_equal_to_the_donor(bfa, donor, fork_pkg):
+    before = (donor / "Contents" / "Info.plist").read_bytes()
+    with pytest.raises(bfa.BuildError, match="donor"):
+        bfa.build(
+            _opts(bfa, donor, fork_pkg, donor.parent, name="oMLX"),
+            venv_pins=dict(PINS), runner=FakeRunner(),
+        )
+    assert (donor / "Contents" / "Info.plist").read_bytes() == before
+
+
+def test_build_refuses_an_output_bundle_inside_the_donor(bfa, donor, fork_pkg):
+    with pytest.raises(bfa.BuildError, match="donor"):
+        bfa.build(
+            _opts(bfa, donor, fork_pkg, donor / "Contents" / "Resources"),
+            venv_pins=dict(PINS), runner=FakeRunner(),
+        )
+    assert not (donor / "Contents" / "Resources" / "oMLX Fork.app").exists()
+
+
+def test_build_refuses_an_output_bundle_that_contains_the_donor(bfa, donor, fork_pkg):
+    # out/<name>.app is an ancestor of the donor: rmtree would delete it.
+    out = donor.parent.parent
+    wrapper = out / "Wrapper.app"
+    wrapper.mkdir()
+    nested = wrapper / "inner" / "oMLX.app"
+    nested.parent.mkdir()
+    donor.rename(nested)
+    with pytest.raises(bfa.BuildError, match="donor"):
+        bfa.build(
+            _opts(bfa, nested, fork_pkg, out, name="Wrapper"),
+            venv_pins=dict(PINS), runner=FakeRunner(),
+        )
+    assert (nested / "Contents" / "Info.plist").is_file()
+
+
+def test_build_refuses_the_applications_directories(bfa, donor, fork_pkg, monkeypatch, tmp_path):
+    # Never point this at the real /Applications: with a regression it would
+    # write there. The script resolves the protected dirs through one helper.
+    fake_system = tmp_path / "Applications"
+    fake_user = tmp_path / "home" / "Applications"
+    fake_system.mkdir()
+    fake_user.mkdir(parents=True)
+    monkeypatch.setattr(bfa, "protected_output_dirs", lambda: (fake_system, fake_user))
+    for out in (fake_system, fake_user):
+        with pytest.raises(bfa.BuildError, match="Applications"):
+            bfa.build(
+                _opts(bfa, donor, fork_pkg, out),
+                venv_pins=dict(PINS), runner=FakeRunner(),
+            )
+        assert not list(out.iterdir())
+
+
+def test_protected_output_dirs_are_the_system_and_user_applications(bfa):
+    assert Path("/Applications") in bfa.protected_output_dirs()
+    assert Path.home() / "Applications" in bfa.protected_output_dirs()
+
+
+def test_build_does_not_delete_an_existing_bundle_without_the_build_marker(
+    bfa, donor, fork_pkg, tmp_path
+):
+    out = tmp_path / "dist"
+    precious = out / "oMLX Fork.app" / "Contents" / "precious.txt"
+    _write(precious, "mine")
+    with pytest.raises(bfa.BuildError, match="marker"):
+        bfa.build(
+            _opts(bfa, donor, fork_pkg, out),
+            venv_pins=dict(PINS), runner=FakeRunner(),
+        )
+    assert precious.read_text() == "mine"
+
+
+def test_build_writes_the_marker_that_allows_the_next_replacement(
+    bfa, donor, fork_pkg, tmp_path
+):
+    out = tmp_path / "dist"
+    bfa.build(_opts(bfa, donor, fork_pkg, out), venv_pins=dict(PINS), runner=FakeRunner())
+    assert (out / "oMLX Fork.app" / "Contents" / "Resources" / ".omlx-fork-build").is_file()
+
+
+class FailingVerifyRunner(FakeRunner):
+    def __call__(self, cmd, **kwargs):
+        if cmd[0] == "codesign" and "--verify" in [str(c) for c in cmd]:
+            self.calls.append([str(c) for c in cmd])
+            return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"bad seal")
+        return super().__call__(cmd, **kwargs)
+
+
+def test_failed_codesign_verify_aborts_before_any_dmg(bfa, donor, fork_pkg, tmp_path):
+    out = tmp_path / "dist"
+    runner = FailingVerifyRunner()
+    with pytest.raises(bfa.BuildError, match="bad seal"):
+        bfa.build(
+            _opts(bfa, donor, fork_pkg, out, sign=True, dmg=True),
+            venv_pins=dict(PINS), runner=runner,
+        )
+    assert not [c for c in runner.calls if c[0] == "hdiutil"]
+    assert not list(out.glob("*.dmg"))
+
+
+def test_main_exits_non_zero_when_verify_fails(bfa, monkeypatch, capsys):
+    def boom(opts):
+        raise bfa.BuildError("codesign verify failed (exit 1): bad seal")
+
+    monkeypatch.setattr(bfa, "build", boom)
+    assert bfa.main([]) != 0
+    assert "bad seal" in capsys.readouterr().err
+
+
+def test_read_venv_pins_names_a_missing_package(bfa, monkeypatch):
+    import importlib.metadata as md
+
+    def fake_version(name):
+        if name == "mlx-vlm":
+            raise md.PackageNotFoundError(name)
+        return "1"
+
+    monkeypatch.setattr(bfa.importlib.metadata, "version", fake_version)
+    with pytest.raises(bfa.BuildError, match="mlx-vlm"):
+        bfa.read_venv_pins()
+
+
+def test_overlay_does_not_follow_symlinked_dirs_out_of_the_bundle(bfa, donor, fork_pkg, tmp_path):
+    outside = tmp_path / "outside"
+    _write(outside / "leak.py", "LEAK = 1\n")
+    (fork_pkg / "linkdir").symlink_to(outside, target_is_directory=True)
+    dest = donor / "Contents" / "Resources" / "omlx"
+    bfa.overlay_package(fork_pkg, dest)
+    assert not (dest / "linkdir" / "leak.py").exists()
+    assert not (outside / "extra").exists()
+
+
+def test_overlay_removes_stale_py_modules_but_keeps_donor_build_products(
+    bfa, donor, fork_pkg
+):
+    dest = donor / "Contents" / "Resources" / "omlx"
+    _write(dest / "deleted_in_repo.py", "STALE = 1\n")
+    _write(dest / "pkg" / "gone.py", "STALE = 1\n")
+    stats = bfa.overlay_package(fork_pkg, dest)
+    assert not (dest / "deleted_in_repo.py").exists()
+    assert not (dest / "pkg" / "gone.py").exists()
+    assert (dest / "_build_info.py").is_file()
+    assert (dest / "_engine_commits.json").is_file()
+    assert (dest / "custom_kernels" / "bonsai" / "_ext.cpython-311-darwin.so").is_file()
+    assert "deleted_in_repo.py" in stats["stale_py_removed"]
