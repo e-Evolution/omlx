@@ -1146,3 +1146,20 @@ class TestEvalP3MtpAttribution:
     def test_without_nomtp_behaviour_is_unchanged(self):
         mtp_on = _with_rerun(_p3lp(ref_gap_at_div=1.0, div_at=8), identical=False)
         assert bm.eval_p3([mtp_on], [])["verdict"] == "FAIL"
+
+
+class TestReportRaggedControlEngaged:
+    def _md(self, logged):
+        import report
+
+        p = _p3lp(div_at=None)
+        p["scenario"]["ragged_b1_forced_logged"] = logged
+        for row in p["scenario"]["rows"]:
+            row["logprobs"]["ragged_b1"] = _recs(64)
+        return report.section_p3({"fork": {"P3": [p]}})
+
+    def test_engaged(self):
+        assert "engaged (server log): yes" in self._md(True)
+
+    def test_not_engaged_is_flagged_invalid(self):
+        assert "not valid" in self._md(False)

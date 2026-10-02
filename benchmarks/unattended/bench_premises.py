@@ -831,7 +831,7 @@ async def scenario_p3(ctx: Ctx) -> dict[str, Any]:
         finally:
             flag.unlink(missing_ok=True)
     forced_seen = (
-        "B=1, forced" in ctx.server.log_since(ctl_off) if dump_dir is not None else None
+        "L=1, forced)" in ctx.server.log_since(ctl_off) if dump_dir is not None else None
     )
     return {
         "rows": [rows[name] for name, _ in lens],
