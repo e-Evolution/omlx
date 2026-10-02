@@ -58,6 +58,14 @@ MODEL = "Qwen3.8-27B-oQ4e-mtp"
 UPSTREAM_APP = Path("/Applications/oMLX.app")
 UPSTREAM_CLI = UPSTREAM_APP / "Contents/MacOS/omlx-cli"
 FORK_BIN = REPO / ".venv/bin/omlx"
+# The dev checkout has no compiled Metal kernels (omlx/custom_kernels/*/ *.so,
+# *.metallib; the Qwen3.5 GDN prefill kernels among them), so `.venv/bin/omlx`
+# prefills ~20% slower than the shipped app for ANY omlx source. Fork variants
+# therefore run the app's own Python runtime with the fork's `omlx/` sources
+# overlaid on the app's `omlx/` -- exactly what packaging/build_fork_app.py
+# ships -- unless --fork-runtime venv is requested.
+APP_RESOURCES = UPSTREAM_APP / "Contents/Resources"
+OVERLAY_ROOT = BENCH_BASE_ROOT / "fork-overlay"
 UPSTREAM_TAG = "v0.7.0"
 
 FORK_ON_ENV = {
@@ -186,6 +194,37 @@ def descendants(pid: int) -> list[int]:
     return found
 
 
+def build_fork_overlay(
+    app_resources: Path = APP_RESOURCES,
+    fork_repo: Path = REPO,
+    root: Path = OVERLAY_ROOT,
+) -> Path:
+    """Copy the app's ``omlx/`` (compiled kernels included), overlay the fork's
+    sources and return the launcher path. Safe to call repeatedly."""
+    marker = root / ".bench-overlay"
+    if root.exists():
+        if not marker.exists():
+            raise RuntimeError(f"refusing to delete a non-overlay dir: {root}")
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    marker.write_text("owned by bench_premises.build_fork_overlay\n")
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    shutil.copytree(app_resources / "omlx", root / "omlx", ignore=ignore)
+    shutil.copytree(fork_repo / "omlx", root / "omlx", ignore=ignore, dirs_exist_ok=True)
+    py_root = app_resources / "Python"
+    launcher = root / "omlx-fork-cli"
+    launcher.write_text(
+        "#!/bin/sh\nset -eu\n"
+        f'PYROOT="{py_root}"\n'
+        'export PYTHONHOME="$PYROOT/cpython-3.11"\n'
+        "export PYTHONDONTWRITEBYTECODE=1\n"
+        f'export PYTHONPATH="{root}:$PYROOT/framework-mlx-base/lib/python3.11/site-packages"\n'
+        'exec "$PYTHONHOME/bin/python3" -m omlx.cli "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return launcher
+
+
 class Server:
     def __init__(
         self,
@@ -235,7 +274,12 @@ class Server:
 
     # -- lifecycle ---------------------------------------------------------
     def command(self) -> list[str]:
-        exe = str(UPSTREAM_CLI if self.variant == "upstream" else FORK_BIN)
+        if self.variant == "upstream":
+            exe = str(UPSTREAM_CLI)
+        elif os.environ.get("OMLX_BENCH_FORK_RUNTIME", "app") == "venv":
+            exe = str(FORK_BIN)
+        else:
+            exe = str(build_fork_overlay())
         return [
             exe,
             "serve",
