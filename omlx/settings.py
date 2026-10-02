@@ -354,6 +354,10 @@ class SchedulerSettings:
     max_parks_per_request: int = 3
     # Consecutive "ok" pressure polls before parked requests may resume.
     park_resume_ok_polls: int = 3
+    # Hold a request out of the decode batch while the combined context of all
+    # admitted rows plus its own would exceed this many tokens, so it later
+    # decodes as a single row on the fused TurboQuant kernels. 0 = off.
+    max_batched_decode_context_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -389,6 +393,14 @@ class SchedulerSettings:
                 return default
             return value
 
+        batched_decode_limit = data.get("max_batched_decode_context_tokens", 0)
+        if (
+            not isinstance(batched_decode_limit, int)
+            or isinstance(batched_decode_limit, bool)
+            or batched_decode_limit < 0
+        ):
+            batched_decode_limit = 0
+
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
@@ -399,6 +411,7 @@ class SchedulerSettings:
             memory_pressure_park=data.get("memory_pressure_park") is True,
             max_parks_per_request=positive_int("max_parks_per_request", 3),
             park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
+            max_batched_decode_context_tokens=batched_decode_limit,
         )
 
 
@@ -1286,6 +1299,10 @@ class GlobalSettings:
         for env_name, attr in (
             ("OMLX_MAX_PARKS_PER_REQUEST", "max_parks_per_request"),
             ("OMLX_PARK_RESUME_OK_POLLS", "park_resume_ok_polls"),
+            (
+                "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS",
+                "max_batched_decode_context_tokens",
+            ),
         ):
             if raw := os.getenv(env_name):
                 try:
@@ -1818,6 +1835,16 @@ class GlobalSettings:
                 f"Invalid park_resume_ok_polls: "
                 f"{self.scheduler.park_resume_ok_polls} (must be >= 1)"
             )
+        batched_limit = self.scheduler.max_batched_decode_context_tokens
+        if (
+            not isinstance(batched_limit, int)
+            or isinstance(batched_limit, bool)
+            or batched_limit < 0
+        ):
+            errors.append(
+                f"Invalid max_batched_decode_context_tokens: "
+                f"{batched_limit!r} (must be an integer >= 0)"
+            )
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -1989,6 +2016,9 @@ class GlobalSettings:
             memory_pressure_park=self.scheduler.memory_pressure_park,
             max_parks_per_request=self.scheduler.max_parks_per_request,
             park_resume_ok_polls=self.scheduler.park_resume_ok_polls,
+            max_batched_decode_context_tokens=(
+                self.scheduler.max_batched_decode_context_tokens
+            ),
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

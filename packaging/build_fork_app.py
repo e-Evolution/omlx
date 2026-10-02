@@ -55,10 +55,18 @@ PIN_PACKAGES = (
 # in MLX's cache (65-73 GB observed) until the memory guard aborts.
 FORK_MLX_CACHE_LIMIT_GB = "16"
 
+# Combined-context ceiling (tokens) for batched decode in the fork app. Two
+# decoding rows cannot use the fused single-row TurboQuant kernels and
+# dequantize the whole KV every step. Observed live: 45k + 130k (175k) recovered,
+# 2 x 130k (260k) hit memory pressure 12-15 s after the batch formed, so the
+# gate sits between them; a request that would pass it waits and decodes alone.
+FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS = "200000"
+
 FORK_ENV = {
     "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
     "OMLX_MEMORY_PRESSURE_PARK": "true",
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
+    "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap

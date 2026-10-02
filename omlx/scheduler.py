@@ -1794,6 +1794,12 @@ class SchedulerConfig:
     memory_pressure_park: bool = False
     max_parks_per_request: int = 3
     park_resume_ok_polls: int = 3
+    # Keep a request out of the decode batch (hold its admission) while the
+    # combined context of every admitted row plus its own would exceed this
+    # many tokens; 0 disables the gate. A 2-row batch cannot use the fused
+    # single-row TurboQuant attention kernels, so it dequantizes the whole KV
+    # every step; a held request decodes alone once the running one finishes.
+    max_batched_decode_context_tokens: int = 0
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -2143,6 +2149,8 @@ class Scheduler:
         # Chunked prefill queue: requests whose prefill spans multiple steps.
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
+        # Requests held by the batched-decode context gate (logged once each).
+        self._batched_decode_held: set[str] = set()
         self._prefill_states: dict[str, _PrefillState] = {}
         # request_id -> (future, committed token count) of the in-flight
         # incremental prefill commit (see _commit_prefill_progress).
@@ -11904,6 +11912,51 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _batched_decode_gate_holds(self, request: "Request") -> bool:
+        """Whether ``request`` must wait so decode never batches long contexts.
+
+        A 2-row batch cannot use the fused single-row TurboQuant kernels and
+        dequantizes the full KV every step. When the context of every admitted
+        row (prompt plus generated tokens) plus this request's own exceeds
+        ``max_batched_decode_context_tokens`` the request stays queued, so its
+        prefill and decode start only after the batch drains and it decodes
+        alone. Admission is the single entry point into the batch (external
+        and chunked prefill both insert only after it), so holding here also
+        covers late joins.
+
+        Never holds when nothing is admitted, so the gate cannot deadlock:
+        admitted rows finish regardless of the queue (park, abort and the
+        memory guard act on them, not on waiting requests). Waiting requests
+        keep FIFO order because the scan stops at the held head, and the head
+        is admitted as soon as the batch is empty, so none starves.
+        """
+        limit = getattr(self.config, "max_batched_decode_context_tokens", 0)
+        held = self._batched_decode_held
+        if limit <= 0:
+            held.clear()
+            return False
+        held.intersection_update(self.requests)
+        others = [*self.running.values(), *self.prefilling]
+        combined = request.num_tokens + sum(r.num_tokens for r in others)
+        if not others or combined <= limit:
+            return False
+        if request.request_id not in held:
+            held.add(request.request_id)
+            logger.info(
+                "Holding %s from batched decode: combined context %d > limit %d "
+                "(single-row decode keeps fused kernels)",
+                request.request_id,
+                combined,
+                limit,
+            )
+        return True
+
+    def _batched_decode_gate_release(self, request: "Request") -> None:
+        """Log once when a request held by the batched-decode gate is admitted."""
+        if request.request_id in self._batched_decode_held:
+            self._batched_decode_held.discard(request.request_id)
+            logger.info("Releasing %s to decode", request.request_id)
+
     def _num_admitted_requests(self) -> int:
         """Return requests already occupying scheduler capacity."""
         return len(self.running) + len(self.prefilling)
@@ -12508,7 +12561,13 @@ class Scheduler:
                 held.append(self.waiting.popleft())
                 continue
 
+            if self._batched_decode_gate_holds(request):
+                # FIFO: nothing behind the head overtakes it. The admitted
+                # rows always finish, which empties the batch and admits it.
+                break
+
             request = self.waiting.popleft()
+            self._batched_decode_gate_release(request)
             self._cache_freshness_waits.pop(request.request_id, None)
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
