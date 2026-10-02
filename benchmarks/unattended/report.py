@@ -19,7 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_metrics as bm  # noqa: E402
 
-VARIANTS = ["upstream", "fork-off", "fork", "fork-d1only", "fork-cachelimit-only"]
+VARIANTS = ["upstream", "fork-off", "fork", "fork-nomtp", "fork-d1only", "fork-cachelimit-only"]
 PREMISES = ["P1", "P2", "P3", "P4", "P6"]
 TITLES = {
     "P1": "P1 - no lost work (cancel mid-prefill, re-issue)",
@@ -304,12 +304,12 @@ def section_p3(data: dict) -> str:
         ],
         rows,
     )
-    return main + _p3_margins(data)
+    return main + _p3_margins(data, "fork") + _p3_margins(data, "fork-nomtp")
 
 
-def _p3_margins(data: dict) -> str:
+def _p3_margins(data: dict, variant: str = "fork") -> str:
     """Near-tie analysis and controls (only when logprob dumps were captured)."""
-    runs = data.get("fork", {}).get("P3")
+    runs = data.get(variant, {}).get("P3")
     if not runs:
         return ""
     detail = [d for d in bm._p3_summary(runs)["detail"] if d["classification_available"]]
@@ -328,7 +328,8 @@ def _p3_margins(data: dict) -> str:
         ]
         for d in detail
     ]
-    out = "\n\n**Near-tie analysis, B=3 vs B=1-restored (token level, fork).** " + (
+    label = "fork" if variant == "fork" else "fork with MTP off (control)"
+    out = f"\n\n**Near-tie analysis, B=3 vs B=1-restored (token level, {label}).** " + (
         f"Noise: margin < {bm.P3_NOISE_MARGIN} nats and mean |dlp| < {bm.P3_NOISE_DLP}; "
         f"bug: margin > {bm.P3_BUG_MARGIN} or mean |dlp| >= {bm.P3_BUG_DLP}.\n\n"
     )

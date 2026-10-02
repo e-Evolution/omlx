@@ -85,7 +85,9 @@ FORK_ONLY_ON = {
     "fork-d1only": {"OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4"},
     "fork-cachelimit-only": {"OMLX_MLX_CACHE_LIMIT_GB": "16"},
 }
-VARIANTS = ["upstream", "fork", "fork-off", *FORK_ONLY_ON]
+# Fork with the model's MTP speculative decode off: plain decode at B=1 and
+# B=3, so a B=1 vs B=3 comparison isolates batching from MTP verify numerics.
+VARIANTS = ["upstream", "fork", "fork-off", "fork-nomtp", *FORK_ONLY_ON]
 # P3 flow: cold B=1 (populates the prefix cache), B=1 restored, B=3 restored.
 P3_PHASES = ("cold", "alone_restored", "batched")
 # Controls run after the comparison: B=1 restored again (run-to-run
@@ -120,12 +122,22 @@ _LIVE_SERVERS: list[Server] = []
 def variant_env(variant: str, premise: str) -> dict[str, str]:
     if variant == "upstream":
         return {}
-    env = dict(FORK_ON_ENV if variant == "fork" else FORK_OFF_ENV)
+    env = dict(
+        FORK_ON_ENV if variant in ("fork", "fork-nomtp") else FORK_OFF_ENV
+    )
     env.update(FORK_ONLY_ON.get(variant, {}))
     if premise == "P3":
         # Disable the T5b gate so the three rows really batch.
         env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] = "0"
     return env
+
+
+def variant_model_settings(ms: dict[str, Any], variant: str) -> dict[str, Any]:
+    """Per-variant model_settings.json tweaks (fork-nomtp: MTP off)."""
+    out = copy.deepcopy(ms)
+    if variant == "fork-nomtp":
+        out.setdefault("models", {}).setdefault(MODEL, {})["mtp_enabled"] = False
+    return out
 
 
 def debug_env(variant: str, premise: str, base: Path) -> dict[str, str]:
@@ -287,7 +299,12 @@ class Server:
         sp.chmod(0o600)
         ms = REAL_BASE / "model_settings.json"
         if ms.exists():
-            shutil.copy2(ms, self.base / "model_settings.json")
+            (self.base / "model_settings.json").write_text(
+                json.dumps(
+                    variant_model_settings(json.loads(ms.read_text()), self.variant),
+                    indent=2,
+                )
+            )
         self.api_key = self.settings.get("auth", {}).get("api_key") or ""
 
     # -- lifecycle ---------------------------------------------------------
