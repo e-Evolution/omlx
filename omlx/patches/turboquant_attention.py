@@ -425,25 +425,41 @@ def _row_dequant_attention(real_cache, q_row, ks_row, vs_row, scale):
     return out
 
 
+def _host_pads(real_cache):
+    """Per-row left padding as host ints, without a per-call device readback."""
+    host = getattr(real_cache, "host_left_padding", None)
+    if callable(host):
+        return host()
+    left_padding = getattr(real_cache, "left_padding", None)
+    if left_padding is None:
+        return None
+    return tuple(int(p) for p in left_padding.tolist())
+
+
+def _has_batch_padding(real_cache) -> bool:
+    pads = _host_pads(real_cache)
+    return bool(pads) and max(pads) > 0
+
+
 def _is_batch_padding_mask(real_cache, mask, queries, keys) -> bool:
-    """True iff ``mask`` is exactly the left-padding + causal mask of the cache.
+    """True iff ``mask`` is the left-padding + causal mask of the cache.
 
     The per-row path hard-codes that mask, so an arbitrary caller-supplied
     boolean mask (anything but the cache's own) must keep the masked path.
+    "Its own" is decided structurally: ``make_mask`` leaves a signature
+    (query rows, columns before the append, batch size) that this checks
+    against the call. An array comparison here would be a device sync on every
+    attention layer of every step.
     """
-    left_padding = getattr(real_cache, "left_padding", None)
-    if left_padding is None or int(left_padding.max().item()) <= 0:
+    from ..turboquant_kv import _state_length, is_own_padding_mask
+
+    if not _has_batch_padding(real_cache):
         return False
-    from mlx_lm.models.cache import create_causal_mask
-
-    from ..turboquant_kv import _state_length
-
     L = queries.shape[-2]
     total = _state_length(real_cache._unwrap(keys))
     if mask.ndim != 4 or mask.shape[-2:] != (L, total):
         return False
-    expected = create_causal_mask(L, offset=total - L, left_padding=left_padding)
-    return bool(mx.array_equal(mask, expected).item())
+    return is_own_padding_mask(L, total, queries.shape[0])
 
 
 def _per_row_batched_attention(real_cache, queries, keys, values, scale):
@@ -463,12 +479,9 @@ def _per_row_batched_attention(real_cache, queries, keys, values, scale):
     """
     from ..turboquant_kv import _filter_state, _slice_state_range, _state_length
 
-    left_padding = getattr(real_cache, "left_padding", None)
-    if left_padding is None:
-        return None
     B, _, L, _ = queries.shape
-    pads = [int(p) for p in left_padding.tolist()]
-    if len(pads) != B:
+    pads = _host_pads(real_cache)
+    if pads is None or len(pads) != B:
         return None
 
     keys_state = real_cache._unwrap(keys)
@@ -628,18 +641,29 @@ def _patch_vlm_target_verify_attention() -> None:
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
             )
-        if queries.shape[0] > 1 and not isinstance(mask, mx.array):
-            # B>1 without an explicit mask (mlx-vlm's "left_padded_decode"
-            # hands mask=None): rows are left-padded, so each must attend only
-            # its own slice. Without padding the batched kernels are exact.
-            left_padding = getattr(real_cache, "left_padding", None)
-            if left_padding is not None and int(left_padding.max().item()) > 0:
+        if (
+            queries.shape[0] > 1
+            and isinstance(real_cache, BatchTurboQuantKVCache)
+            and queries.shape[-2] <= _DECODE_MULTIROW_MAX_Q_LEN
+            and (
+                not isinstance(mask, mx.array)
+                or (
+                    mask.dtype == mx.bool_
+                    and _is_batch_padding_mask(real_cache, mask, queries, keys)
+                )
+            )
+        ):
+            # B>1 decode/verify on left-padded rows: either no explicit mask
+            # (mlx-vlm's "left_padded_decode" hands mask=None) or the cache's
+            # own padding + causal mask (MTP verify). Each row must attend only
+            # its own slice; without padding the batched kernels are exact.
+            if _has_batch_padding(real_cache):
                 result = _per_row_batched_attention(
                     real_cache, queries, keys, values, scale
                 )
                 if result is not None:
                     return result
-            else:
+            elif not isinstance(mask, mx.array):
                 return sdpa(
                     queries, keys, values, cache=cache, scale=scale, mask="causal"
                 )
