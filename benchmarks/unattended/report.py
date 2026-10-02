@@ -124,9 +124,15 @@ def setup_block(data: dict) -> str:
         "- P3 flow (like-for-like): cold B=1 per prompt only populates the prefix cache; then B=1 restored "
         "(reference), then B=3 restored started together so all rows decode in one batch "
         "(`max_concurrent_requests=3`; fork variants run with `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0`). "
-        "PASS = B=3 equals B=1-restored for the first 32 tokens' worth of text on every row, no output "
-        "degenerates (distinct word-4gram ratio < 0.5x the B=1 value, or < 0.3 when B=1 is above it), "
-        "and the log shows a 3-row batch. Token ids are not exposed by the API, so text is compared. "
+        "The chat API exposes no logprobs, so fork variants run with the opt-in debug dump "
+        "(`OMLX_DEBUG_LOGPROB_DUMP`) and tokens are compared with their top-5 logprobs. PASS = 3-row "
+        "batch in the log, no degeneration (distinct word-4gram ratio < 0.5x the B=1 value, or < 0.3 "
+        "when B=1 is above it), and every B=3 vs B=1-restored divergence inside the first 32 tokens "
+        "is numerical noise: top1-top2 margin of the B=1 reference < 0.5 nats and mean |dlp| of the "
+        "shared prefix < 0.05 (bug: margin > 2 or mean |dlp| >= 0.25; between: inconclusive = FAIL). "
+        "Controls: B=1 restored twice (determinism), B=1 forced through the ragged B>1 kernel, and the "
+        "`fork-nomtp` variant (MTP off) which isolates batching from MTP verify numerics; when the "
+        "MTP-on reference is itself not reproducible, the batching-only (MTP off) judgement decides. "
         "Divergence after token 32 is reported, not judged. Upstream is reported, not judged.",
         "- P4 criterion: with B=3 the non-attention compute alone sets a ~49 ms step (~20 tok/s per row), "
         "so 'per-row >= 50% of single-row' is physically unreachable; the premise is not wasting memory and "
@@ -433,7 +439,9 @@ def verdicts(data: dict) -> dict[str, dict]:
     if any(g(v, "P2") for v in data):
         out["P2"] = bm.eval_p2(g("fork", "P2"), g("upstream", "P2"))
     if any(g(v, "P3") for v in data):
-        out["P3"] = bm.eval_p3(g("fork", "P3"), g("upstream", "P3"))
+        out["P3"] = bm.eval_p3(
+            g("fork", "P3"), g("upstream", "P3"), g("fork-nomtp", "P3") or None
+        )
     if any(g(v, "P4") for v in data):
         out["P4"] = bm.eval_p4(g("fork", "P4"), g("upstream", "P4"))
     return out

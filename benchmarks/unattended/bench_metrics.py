@@ -789,8 +789,17 @@ def _p3_summary(runs: list[dict]) -> dict[str, Any]:
     }
 
 
-def _noise_check(detail: list[dict], all_ok: bool) -> dict[str, Any]:
-    """Divergences inside the first 32 tokens must be near-tie numerical noise."""
+def _noise_check(
+    detail: list[dict],
+    all_ok: bool,
+    label: str = "B=3 vs B=1 (restored)",
+    waive: str | None = None,
+) -> dict[str, Any]:
+    """Divergences inside the first 32 tokens must be near-tie numerical noise.
+
+    `waive` (a reason) turns a failing judgement informational: it is only
+    passed when the reference itself is shown not to be reproducible.
+    """
     bad = [
         d
         for d in detail
@@ -806,15 +815,31 @@ def _noise_check(detail: list[dict], all_ok: bool) -> dict[str, Any]:
             + ("" if d["diverged_in_prefix"] else " (after token 32, not judged)")
         )
 
+    detail_txt = f"{len(bad)}/{len(detail)} rows not noise; " + "; ".join(
+        one(d) for d in detail
+    )
+    ok = all_ok and not bad
+    if bad and waive and all_ok:
+        ok, detail_txt = True, f"informational ({waive}); " + detail_txt
     return _check(
-        f"B=3 vs B=1 (restored): divergence inside the first {P3_PREFIX_TOKENS} tokens "
+        f"{label}: divergence inside the first {P3_PREFIX_TOKENS} tokens "
         "is numerical noise (near-tie)",
-        all_ok and not bad,
-        f"{len(bad)}/{len(detail)} rows not noise; " + "; ".join(one(d) for d in detail),
+        ok,
+        detail_txt,
     )
 
 
-def eval_p3(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
+def _reference_irreproducible(detail: list[dict]) -> bool:
+    """True when B=1 restored vs B=1 restored again already diverges."""
+    return any(
+        (d.get("controls", {}).get("rerun") or {}).get("div_index") is not None
+        for d in detail
+    )
+
+
+def eval_p3(
+    fork: list[dict], upstream: list[dict], nomtp: list[dict] | None = None
+) -> dict[str, Any]:
     """Like-for-like: B=3 restored rows vs the same rows alone, restored."""
     if not fork:
         return _inconclusive("no fork runs")
@@ -827,13 +852,37 @@ def eval_p3(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
     )
     n = len(fk["detail"])
     judged = bool(fk["detail"]) and all(d["classification_available"] for d in fk["detail"])
+    nm = _p3_summary(nomtp) if nomtp else None
+    nm_judged = bool(nm and nm["detail"]) and all(
+        d["classification_available"] for d in nm["detail"]
+    )
+    nm_ok = nm_judged and all(
+        row[k].get("ok")
+        for r in nomtp
+        for row in r["scenario"]["rows"]
+        for k in ("alone_restored", "batched")
+    )
+    nm_check = (
+        _noise_check(nm["detail"], nm_ok, label="B=3 vs B=1, MTP off (batching only)")
+        if nm_judged
+        else None
+    )
+    waive = (
+        "the B=1 MTP reference is not reproducible: B=1 rerun diverges; "
+        "batching-only comparison with MTP off is noise"
+        if nm_check is not None
+        and nm_check["ok"]
+        and judged
+        and _reference_irreproducible(fk["detail"])
+        else None
+    )
     checks = [
         _check(
             "all requests completed",
             all_ok,
             "every restored B=1 and B=3 request ok" if all_ok else "a request failed",
         ),
-        _noise_check(fk["detail"], all_ok)
+        _noise_check(fk["detail"], all_ok, waive=waive)
         if judged
         else _check(
             f"B=3 == B=1 (restored) for the first {P3_PREFIX_TOKENS} tokens, every row",
@@ -870,9 +919,19 @@ def eval_p3(fork: list[dict], upstream: list[dict]) -> dict[str, Any]:
             f"max B seen in log: {fk['batch_max_b']}",
         ),
     ]
+    if nm_check is not None:
+        checks += [
+            nm_check,
+            _check(
+                "3-row batch exercised with MTP off (log)",
+                nm["batch_max_b"] >= 3,
+                f"max B seen in log: {nm['batch_max_b']}",
+            ),
+        ]
     return {
         "verdict": _verdict(checks),
         "checks": checks,
+        "nomtp": nm,
         "fork": fk,
         "upstream": _p3_summary(upstream),
     }
