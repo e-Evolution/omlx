@@ -1275,51 +1275,14 @@ PARK_MAX_HOLD_S = 300.0
 _POLLS_SINCE_RESUME_SATURATION = 1 << 30
 
 
+from .prefill_commit_executor import DaemonCommitExecutor as _DaemonCommitExecutor
+
+
 class _ParkPins(NamedTuple):
     """Block refs and SSD hashes a parked request holds against eviction."""
 
     block_ids: list[int]
     hashes: list[bytes]
-
-
-class _DaemonCommitExecutor:
-    """Single daemon worker thread with the ``submit``/``shutdown`` surface.
-
-    ``ThreadPoolExecutor`` workers are non-daemon and joined at interpreter
-    exit, so a commit stuck in a store call would hang process exit. This
-    worker is a daemon: an abandoned commit cannot block exit, and shutdown
-    only waits for it through the cancel flag and the store lock.
-    """
-
-    def __init__(self, thread_name_prefix: str = "omlx-prefill-commit") -> None:
-        self._queue: queue.SimpleQueue = queue.SimpleQueue()
-        self._thread = threading.Thread(
-            target=self._run, name=f"{thread_name_prefix}_0", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            future, fn, args, kwargs = item
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                future.set_result(fn(*args, **kwargs))
-            except BaseException as e:  # noqa: BLE001 - delivered via the future
-                future.set_exception(e)
-
-    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any):
-        future: concurrent.futures.Future = concurrent.futures.Future()
-        self._queue.put((future, fn, args, kwargs))
-        return future
-
-    def shutdown(self, wait: bool = False) -> None:
-        self._queue.put(None)
-        if wait:
-            self._thread.join()
 
 
 def _prefill_commit_blocks(config: Any) -> int:
