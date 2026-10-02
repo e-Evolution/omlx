@@ -264,3 +264,69 @@ def test_batch_policy_keeps_profitable_mtp():
     for _ in range(6):
         policy.observe_mtp(4, [3, 2, 3], 150.0, stable=True)
     assert not policy.should_park()
+
+
+# ---------------------------------------------------------------------------
+# Ragged single-launch kernel (decode and short verify blocks)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("new_len", [1, 2, 3, 4, 5, 6, 8])
+def test_ragged_kernel_matches_single_rows_and_is_one_launch(new_len, monkeypatch):
+    batch, refs, q, keys, values, _ = _build([1800, 5200, 9100], new_len)
+    tqa._LOGGED_PATHS.clear()
+    launches = {"n": 0}
+    original = TurboQuantKVCache.decode_attention
+
+    def spy(self, *a, **k):
+        launches["n"] += 1
+        return original(self, *a, **k)
+
+    monkeypatch.setattr(TurboQuantKVCache, "decode_attention", spy)
+    out = tqa._per_row_batched_attention(
+        batch, q, keys, values, SCALE
+    )
+    mx.eval(out)
+    assert "ragged" in tqa._LOGGED_PATHS, tqa._LOGGED_PATHS
+    assert launches["n"] == 0, "per-row decode_attention ran next to the ragged kernel"
+    monkeypatch.undo()
+    for i, ref in enumerate(refs):
+        diff = _max_abs(out[i : i + 1], _single(ref, q[i : i + 1]))
+        assert diff < 2e-3, f"row {i} q_len {new_len} max|diff|={diff:.5f}"
+
+
+def test_ragged_kernel_row_shorter_than_query_block_is_zero_not_nan():
+    batch, refs, q, keys, values, _ = _build([1500, 2500], 4)
+    # Make row 0 own only 2 columns (< q_len 4): its first two queries sit in
+    # the padding and attend nothing.
+    total = keys._state.norms.shape[2] if hasattr(keys, "_state") else None
+    ks, vs = batch._unwrap(keys), batch._unwrap(values)
+    from omlx.turboquant_kv import _state_length
+
+    total = _state_length(ks)
+    batch.left_padding = mx.array([total - 2, int(batch.left_padding[1].item())])
+    out = tqa._ragged_batched_attention(batch, q, ks, vs, SCALE)
+    mx.eval(out)
+    assert not mx.any(mx.isnan(out)).item()
+    assert mx.max(mx.abs(out[0:1, :, :2, :].astype(mx.float32))).item() == 0.0
+    assert mx.max(mx.abs(out[0:1, :, 2:, :].astype(mx.float32))).item() > 0.0
+
+
+def test_ragged_kernel_all_padding_row_is_zero():
+    batch, refs, q, keys, values, _ = _build([1500, 2500], 1)
+    ks, vs = batch._unwrap(keys), batch._unwrap(values)
+    from omlx.turboquant_kv import _state_length
+
+    total = _state_length(ks)
+    batch.left_padding = mx.array([total, 0])
+    out = tqa._ragged_batched_attention(batch, q, ks, vs, SCALE)
+    mx.eval(out)
+    assert not mx.any(mx.isnan(out)).item()
+    assert mx.max(mx.abs(out[0].astype(mx.float32))).item() == 0.0
+    assert mx.max(mx.abs(out[1].astype(mx.float32))).item() > 0.0
+
+
+def test_ragged_kernel_declines_wider_blocks_and_non_mse(monkeypatch):
+    batch, refs, q, keys, values, _ = _build([1500, 2500], 9)
+    ks, vs = batch._unwrap(keys), batch._unwrap(values)
+    assert tqa._ragged_batched_attention(batch, q, ks, vs, SCALE) is None

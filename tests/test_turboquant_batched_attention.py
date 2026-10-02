@@ -126,7 +126,8 @@ def test_b1_cache_is_unchanged():
     assert _max_abs(out, ref) < 2e-3
 
 
-def test_logs_per_row_path_once(caplog):
+def test_logs_per_row_path_once(caplog, monkeypatch):
+    monkeypatch.setattr(tqa, "_RAGGED_MAX_Q_ROWS", 0)  # exercise the per-row path
     tqa._LOGGED_PATHS.clear()
     batch, rows, q, keys, values = _build([1500, 2500, 3500], 1)
     with caplog.at_level(logging.INFO, logger=tqa.logger.name):
@@ -150,7 +151,8 @@ def _sdpa(batch, q, keys, values, mask):
 
 
 @pytest.mark.parametrize("new_len", [1, 3])
-def test_patched_sdpa_array_mask_matches_single_row(new_len):
+def test_patched_sdpa_array_mask_matches_single_row(new_len, monkeypatch):
+    monkeypatch.setattr(tqa, "_RAGGED_MAX_Q_ROWS", 0)  # exercise the per-row path
     batch, rows, q, keys, values = _build(LENGTHS, new_len)
     mask = batch._test_mask
     assert isinstance(mask, mx.array)
