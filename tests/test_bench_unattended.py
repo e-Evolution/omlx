@@ -825,3 +825,34 @@ class TestPerFeatureVariants:
 
     def test_p3_plan_cold_then_restored_then_batched(self):
         assert bp.P3_PHASES == ("cold", "alone_restored", "batched")
+
+
+def test_fork_overlay_keeps_app_kernels_and_takes_fork_sources(tmp_path):
+    import bench_premises as bp
+
+    app = tmp_path / "Resources"
+    (app / "omlx/custom_kernels/k").mkdir(parents=True)
+    (app / "omlx/custom_kernels/k/_ext.so").write_text("compiled")
+    (app / "omlx/a.py").write_text("app")
+    (app / "Python").mkdir()
+    fork = tmp_path / "fork"
+    (fork / "omlx").mkdir(parents=True)
+    (fork / "omlx/a.py").write_text("fork")
+    (fork / "omlx/b.py").write_text("new")
+    root = tmp_path / "overlay"
+    launcher = bp.build_fork_overlay(app, fork, root)
+    launcher = bp.build_fork_overlay(app, fork, root)  # idempotent
+    assert (root / "omlx/custom_kernels/k/_ext.so").read_text() == "compiled"
+    assert (root / "omlx/a.py").read_text() == "fork"
+    assert (root / "omlx/b.py").read_text() == "new"
+    assert "omlx.cli" in launcher.read_text()
+
+
+def test_fork_overlay_refuses_to_delete_foreign_dir(tmp_path):
+    import bench_premises as bp
+    import pytest
+
+    foreign = tmp_path / "x"
+    foreign.mkdir()
+    with pytest.raises(RuntimeError):
+        bp.build_fork_overlay(tmp_path, tmp_path, foreign)
