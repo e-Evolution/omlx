@@ -1242,14 +1242,18 @@ def _is_turboquant_kv_family_cache(cache_obj: Any) -> bool:
 
 
 # Bounded wait for in-flight prefill commits at shutdown only; the hot path
-# never waits (see Scheduler._after_commit).
-PREFILL_COMMIT_SHUTDOWN_WAIT_S = 30.0
+# never waits (see Scheduler._after_commit). The three shutdown waits below add
+# up to at most 20s, a third of FATAL_TEARDOWN_TIMEOUT_S, so a stuck commit can
+# never eat the engine-teardown watchdog's budget before the SSD stores close.
+PREFILL_COMMIT_SHUTDOWN_WAIT_S = 10.0
 # A teardown deferred behind a commit that has not finished after this long
 # is logged once; it stays pending and is dropped at shutdown.
 PREFILL_COMMIT_STUCK_LOG_S = 60.0
 # Extra bounded wait at shutdown for a commit worker that is inside a store
 # call after the cancel flag is set. Past it the stores are left unclosed.
-PREFILL_COMMIT_CANCEL_WAIT_S = 10.0
+PREFILL_COMMIT_CANCEL_WAIT_S = 5.0
+# Bound on clearing the commit worker's MLX streams at shutdown.
+PREFILL_COMMIT_STREAM_CLEANUP_WAIT_S = 5.0
 # Bound on the final-store worker waiting for the request's in-flight commit.
 # Past it the final store is skipped so a stuck commit cannot hold the store
 # worker (and the gate slots queued behind it).
@@ -2799,18 +2803,31 @@ class Scheduler:
         """
         self._store_cache_thread_id = threading.get_ident()
         if after_commit is not None:
-            done, _pending = concurrent.futures.wait(
-                [after_commit], timeout=PREFILL_COMMIT_FINAL_STORE_WAIT_S
-            )
+            # Poll in short slices so a shutdown that cancels the commits
+            # frees this worker at once instead of after the full bound,
+            # which would hold the teardown (and its watchdog) behind it.
+            deadline = time.monotonic() + PREFILL_COMMIT_FINAL_STORE_WAIT_S
+            done = False
+            while not done:
+                left = deadline - time.monotonic()
+                if left <= 0 or self._commit_cancelled.is_set():
+                    break
+                done_set, _pending = concurrent.futures.wait(
+                    [after_commit], timeout=min(1.0, left)
+                )
+                done = bool(done_set)
             if not done:
                 # Skip this final store; table and snapshot teardown stays
                 # deferred behind the commit (scheduler thread), the gate slot
                 # is released when the drain sees this future done.
                 logger.warning(
                     "Skipping final store for %s: its prefill commit did not "
-                    "finish within %.0fs",
+                    "finish within %.0fs%s",
                     request_id,
                     PREFILL_COMMIT_FINAL_STORE_WAIT_S,
+                    " (cancelled at shutdown)"
+                    if self._commit_cancelled.is_set()
+                    else "",
                 )
                 self._skipped_final_stores.add(request_id)
                 return
@@ -15582,6 +15599,11 @@ class Scheduler:
         directories and the process is going away).
         """
         executor = self._prefill_commit_executor
+        teardown = getattr(self, "_engine_teardown", None)
+        if teardown is not None and self._prefill_commits:
+            # A commit that is still writing counts as persistence progress
+            # for the teardown watchdog; a stuck one does not.
+            teardown.set_phase("prefill_commits", self._store_persistence_progress)
         stragglers = self._wait_for_prefill_commits(PREFILL_COMMIT_SHUTDOWN_WAIT_S)
         store_busy = False
         if stragglers:
@@ -15601,7 +15623,9 @@ class Scheduler:
             )
         elif executor is not None:
             try:
-                executor.submit(clear_thread_streams).result(timeout=10)
+                executor.submit(clear_thread_streams).result(
+                    timeout=PREFILL_COMMIT_STREAM_CLEANUP_WAIT_S
+                )
             except Exception as e:
                 logger.warning("Prefill commit worker stream cleanup failed: %s", e)
         self._deferred_teardowns.clear()
