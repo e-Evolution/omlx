@@ -288,6 +288,284 @@ def _fused_multirow_mse_attention(
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
 
+
+# Ragged (left-padded) batch kernel envelope. Same register-array argument as
+# the multi-row kernel: q and o accumulators scale with QRows.
+_RAGGED_MAX_Q_ROWS = 8
+_RAGGED_EMPTY_BLOCK_MAX = -1.0e30
+
+
+@cache
+def _ragged_mse_2pass1_kernel(key_bits: int, val_bits: int, dim: int):
+    """Pass 1 of the ragged-batch MSE attention (decode and verify).
+
+    ``_fused_mse_multirow_2pass1_kernel`` extended for end-aligned, left-padded
+    batches:
+
+    * row ``b`` scores only tokens ``[pads[b], token_count)``, so one launch
+      covers every row and the zero-filled padding never enters the softmax;
+    * K/V are read through the caller's strides (``ensure_row_contiguous`` is
+      off), so a ``[B, H, capacity]`` buffer sliced to the written length is
+      consumed in place instead of being copied per row, per layer, per step;
+    * a block that owns no token of a short row reports ``-1e30`` instead of
+      ``-inf``, which keeps the shared pass 2 NaN free (it computes
+      ``exp(max - max)`` for the first block).
+
+    ``QRows`` query rows end at ``token_count`` (the causal tail is applied
+    inline), exactly like the multi-row kernel.
+    """
+    from mlx_vlm import turboquant as _tq
+
+    if not _tq._metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0:
+        return None
+
+    elems_per_lane = dim // 32
+    k_misaligned = (elems_per_lane * key_bits) % 8 != 0
+    v_misaligned = (elems_per_lane * val_bits) % 8 != 0
+    k_exprs = _tq._gen_unrolled_extract(
+        key_bits, elems_per_lane, "key_codebook", "k_bit_off" if k_misaligned else ""
+    )
+    v_exprs = _tq._gen_unrolled_extract(
+        val_bits, elems_per_lane, "val_codebook", "v_bit_off" if v_misaligned else ""
+    )
+    v_exprs = [e.replace("kb[", "vb[") for e in v_exprs]
+    k_lines = "\n            ".join(
+        f"k_el[{i}] = {expr};" for i, expr in enumerate(k_exprs)
+    )
+    v_lines = "\n            ".join(
+        f"v_el[{i}] = {expr};" for i, expr in enumerate(v_exprs)
+    )
+
+    source = f"""
+        constexpr int BD = 32;
+        constexpr int qk_per_thread = Dim / BD;
+        constexpr int v_per_thread = Dim / BD;
+        typedef float U;
+
+        auto kv_head_idx = threadgroup_position_in_grid.x;
+        auto batch_idx = threadgroup_position_in_grid.y;
+        auto block_idx = threadgroup_position_in_grid.z;
+        auto simd_lid = thread_index_in_simdgroup;
+        auto gqa_idx = thread_position_in_threadgroup.y;
+
+        int token_count = key_norms_shape[2];
+        int kv_heads = key_norms_shape[1];
+        int pad = pads[batch_idx];
+        auto bqh = batch_idx * kv_heads * RepeatCount
+            + kv_head_idx * RepeatCount + gqa_idx;
+
+        auto k_nm = key_norms + batch_idx * key_norms_strides[0]
+            + kv_head_idx * key_norms_strides[1];
+        auto k_pk = key_packed + batch_idx * key_packed_strides[0]
+            + kv_head_idx * key_packed_strides[1];
+        auto v_nm = val_norms + batch_idx * val_norms_strides[0]
+            + kv_head_idx * val_norms_strides[1];
+        auto v_pk = val_packed + batch_idx * val_packed_strides[0]
+            + kv_head_idx * val_packed_strides[1];
+        int k_nm_ts = key_norms_strides[2];
+        int v_nm_ts = val_norms_strides[2];
+        int k_pk_ts = key_packed_strides[2];
+        int v_pk_ts = val_packed_strides[2];
+
+        thread U q[QRows][qk_per_thread];
+        for (int r = 0; r < QRows; r++) {{
+            auto qr = queries + (bqh * QRows + r) * Dim
+                + simd_lid * qk_per_thread;
+            for (int i = 0; i < qk_per_thread; i++)
+                q[r][i] = static_cast<U>(qr[i]);
+        }}
+
+        thread U o[QRows][v_per_thread] = {{}};
+        U max_score[QRows];
+        U sum_exp_score[QRows];
+        for (int r = 0; r < QRows; r++) {{
+            max_score[r] = -INFINITY;
+            sum_exp_score[r] = 0;
+        }}
+
+        int k_bit_start = simd_lid * qk_per_thread * {key_bits};
+        int v_bit_start = simd_lid * v_per_thread * {val_bits};
+        int k_byte_base = k_bit_start >> 3;
+        int v_byte_base = v_bit_start >> 3;
+        {"int k_bit_off = k_bit_start & 7;" if k_misaligned else ""}
+        {"int v_bit_off = v_bit_start & 7;" if v_misaligned else ""}
+
+        for (int t = pad + (int)block_idx; t < token_count; t += Blocks) {{
+            U kn = static_cast<U>(k_nm[(long)t * k_nm_ts]);
+            auto kb = (const device uint8_t*)(k_pk + (long)t * k_pk_ts)
+                + k_byte_base;
+            U k_el[qk_per_thread];
+            {k_lines}
+
+            auto vb = (const device uint8_t*)(v_pk + (long)t * v_pk_ts)
+                + v_byte_base;
+            U vn = static_cast<U>(v_nm[(long)t * v_nm_ts]);
+            U v_el[v_per_thread];
+            {v_lines}
+
+            // Row r sits at global position token_count - QRows + r.
+            int first_row = t - token_count + QRows;
+            for (int r = 0; r < QRows; r++) {{
+                U dot = 0;
+                for (int i = 0; i < qk_per_thread; i++)
+                    dot += q[r][i] * k_el[i];
+                U score = simd_sum(dot) * kn;
+                if (r >= first_row) {{
+                    U new_max = max(max_score[r], score);
+                    U factor = fast::exp(max_score[r] - new_max);
+                    U exp_score = fast::exp(score - new_max);
+                    max_score[r] = new_max;
+                    sum_exp_score[r] = sum_exp_score[r] * factor + exp_score;
+                    for (int i = 0; i < v_per_thread; i++)
+                        o[r][i] = o[r][i] * factor + exp_score * v_el[i] * vn;
+                }}
+            }}
+        }}
+
+        for (int r = 0; r < QRows; r++) {{
+            auto row_out = bqh * QRows + r;
+            if (simd_lid == 0) {{
+                out_sums[row_out * Blocks + block_idx] = sum_exp_score[r];
+                out_maxs[row_out * Blocks + block_idx] =
+                    max_score[r] == -INFINITY ? (U)({_RAGGED_EMPTY_BLOCK_MAX}) : max_score[r];
+            }}
+            for (int i = 0; i < v_per_thread; i++)
+                out_acc[(row_out * Blocks + block_idx) * Dim
+                    + simd_lid * v_per_thread + i] = static_cast<U>(o[r][i]);
+        }}
+    """
+
+    return mx.fast.metal_kernel(
+        name=f"omlx_tq_mse_ragged_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+            "pads",
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+        ensure_row_contiguous=False,
+    )
+
+
+def _ragged_batched_attention(real_cache, queries, keys_state, values_state, scale):
+    """Attention for a left-padded B>1 batch in ONE launch, no per-row copies.
+
+    Covers decode (L == 1) and short verify blocks (L <= _RAGGED_MAX_Q_ROWS).
+    Returns None outside the kernel envelope (non-MSE codecs, fractional bits,
+    wider blocks); the caller then runs the per-row path.
+    """
+    from mlx_vlm import turboquant as _tq
+
+    from ..turboquant_kv import _state_length
+
+    key_codec = getattr(real_cache, "key_codec", None)
+    value_codec = getattr(real_cache, "value_codec", None)
+    if not (
+        isinstance(key_codec, _tq._TurboQuantMSECodec)
+        and isinstance(value_codec, _tq._TurboQuantMSECodec)
+    ):
+        return None
+    if not (
+        isinstance(keys_state, _tq.TurboQuantMSEState)
+        and isinstance(values_state, _tq.TurboQuantMSEState)
+    ):
+        return None
+    if key_codec.bits != int(key_codec.bits) or value_codec.bits != int(
+        value_codec.bits
+    ):
+        return None
+
+    B, n_q_heads, L, D = queries.shape
+    if L > _RAGGED_MAX_Q_ROWS or key_codec.dim != D or value_codec.dim != D:
+        return None
+    if keys_state.norms.shape[0] != B or values_state.norms.shape[0] != B:
+        return None
+    for array in (
+        keys_state.norms,
+        keys_state.indices,
+        values_state.norms,
+        values_state.indices,
+    ):
+        # The kernel indexes with strides but assumes unit stride inside a
+        # token's packed words / along nothing else.
+        if array.ndim not in (3, 4):
+            return None
+    n_kv_heads = keys_state.norms.shape[1]
+    n_repeats = n_q_heads // n_kv_heads
+
+    pass1 = _ragged_mse_2pass1_kernel(int(key_codec.bits), int(value_codec.bits), D)
+    pass2 = _tq._fused_mse_decode_2pass_2_kernel()
+    if pass1 is None or pass2 is None:
+        return None
+
+    pads_host = _host_pads(real_cache)
+    total = _state_length(keys_state)
+    longest = total - (min(pads_host) if pads_host else 0)
+    if longest <= 0:
+        return mx.zeros(queries.shape, dtype=queries.dtype)
+
+    grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+    q_rot = key_codec.prepare_queries(grouped)
+    q_rot_flat = mx.contiguous(q_rot.reshape(B * n_kv_heads * n_repeats * L, D))
+    pads = mx.contiguous(real_cache.left_padding.astype(mx.int32).reshape(-1))
+
+    if longest <= 8192:
+        num_blocks = 64
+    elif longest <= 32768:
+        num_blocks = 128
+    elif longest <= 65536:
+        num_blocks = 256
+    else:
+        num_blocks = 512
+
+    n_rows = B * n_q_heads * L
+    out_acc, out_sums, out_maxs = pass1(
+        inputs=[
+            q_rot_flat,
+            keys_state.norms,
+            keys_state.indices,
+            mx.contiguous(key_codec.codebook),
+            values_state.norms,
+            values_state.indices,
+            mx.contiguous(value_codec.codebook),
+            pads,
+        ],
+        template=[
+            ("Dim", D),
+            ("RepeatCount", n_repeats),
+            ("QRows", L),
+            ("Blocks", num_blocks),
+        ],
+        grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
+        threadgroup=(32, n_repeats, 1),
+        output_shapes=[
+            (n_rows * num_blocks, D),
+            (n_rows * num_blocks,),
+            (n_rows * num_blocks,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    out = pass2(
+        inputs=[out_acc, out_sums, out_maxs],
+        template=[("Dim", D), ("Blocks", num_blocks)],
+        grid=(n_rows * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(n_rows, D)],
+        output_dtypes=[mx.float32],
+    )[0]
+    out_rotated = out.reshape(B, n_kv_heads, n_repeats, L, D)
+    output = value_codec._rotate_inverse(out_rotated)
+    return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
+
+
 def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scale):
     """Wider verify rows: one-shot quantized_attention over the whole KV.
 
@@ -486,6 +764,21 @@ def _per_row_batched_attention(real_cache, queries, keys, values, scale):
 
     keys_state = real_cache._unwrap(keys)
     values_state = real_cache._unwrap(values)
+    if L <= _RAGGED_MAX_Q_ROWS:
+        try:
+            ragged = _ragged_batched_attention(
+                real_cache, queries, keys_state, values_state, scale
+            )
+        except Exception:
+            logger.debug("TurboQuant ragged kernel failed; using per-row path",
+                         exc_info=True)
+            ragged = None
+        if ragged is not None:
+            _log_path_once(
+                "ragged",
+                f"TurboQuant batched attention: ragged single-launch path (B={B})",
+            )
+            return ragged
     total = _state_length(keys_state)
     fused_ok = L <= _DECODE_MULTIROW_MAX_Q_LEN
     outputs = []
