@@ -536,34 +536,91 @@ def tradeoffs(data: dict, ver: dict[str, dict]) -> list[str]:
     return notes
 
 
-def p5_section(out: Path) -> str:
-    files = sorted((out / "p5").glob("*summary*.json"))
-    if not files:
-        return "_Not run (see p5_pi_unattended.sh)._"
-    rows = []
-    for fp in files:
+def load_p5(out: Path) -> dict[str, dict]:
+    res = {}
+    for fp in sorted((out / "p5").glob("p5-*-summary.json")):
         d = json.loads(fp.read_text())
+        res[f"{d.get('variant', '?')}-{d.get('mode', '?')}"] = d
+    return res
+
+
+def p5_verdict(out: Path) -> dict:
+    s = load_p5(out)
+    return bm.eval_p5(s.get("fork-with"), s.get("upstream-without"))
+
+
+def p5_section(out: Path) -> str:
+    sums = load_p5(out)
+    if not sums:
+        return "_Not run (see p5_pi_unattended.sh)._"
+    rows, detail = [], []
+    for key, d in sums.items():
         rows.append(
             [
-                d.get("mode", fp.stem),
+                key,
                 f(d.get("sessions"), 0),
                 f(d.get("completed"), 0),
                 f(d.get("manual_interventions"), 0),
-                f(d.get("memory_errors_seen"), 0),
+                f(d.get("memory_failures"), 0),
+                f(d.get("recovered"), 0),
+                f(d.get("server_aborts"), 0),
                 f(d.get("wall_s"), 0, " s"),
             ]
         )
-    return table(
-        [
-            "mode",
-            "sessions",
-            "completed",
-            "manual interventions",
-            "memory errors in output",
-            "wall",
-        ],
-        rows,
-    )
+        for r in d.get("rows", []):
+            detail.append(
+                [
+                    key,
+                    f(r.get("session"), 0),
+                    f(r.get("exit"), 0),
+                    f(r.get("out_chars"), 0),
+                    "yes" if r.get("memory_signature") else "no",
+                    "yes" if r.get("recovered") else "no",
+                    f(r.get("wall_s"), 0, " s"),
+                ]
+            )
+    v = p5_verdict(out)
+    md = [
+        table(
+            [
+                "variant-mode",
+                "sessions",
+                "completed",
+                "manual interventions",
+                "memory failures",
+                "recovered",
+                "server aborts",
+                "wall",
+            ],
+            rows,
+        ),
+        "",
+        table(
+            [
+                "variant-mode",
+                "session",
+                "exit",
+                "output chars",
+                "memory signature",
+                "recovered",
+                "wall",
+            ],
+            detail,
+        ),
+        "",
+        f"Verdict: **{v['verdict']}** - "
+        + "; ".join(
+            f"{'ok' if c['ok'] else 'FAIL'}: {c['name']} ({c['detail']})"
+            for c in v["checks"]
+        ),
+        "",
+        "Notes: a memory signature is an oMLX error string in stderr or an `Error:` stdout line "
+        "(not words in the answer). A session that saw one but exited 0 with a full answer counts as "
+        "recovered, i.e. success. The fork-without raw files were lost (overwritten by the upstream run "
+        "sharing one directory); its earlier printed summary was misclassified and is not used. "
+        "See `p5/NOTES.md`.",
+    ]
+    return "\n".join(md)
 
 
 def render(out: Path) -> str:
@@ -602,7 +659,20 @@ def render(out: Path) -> str:
                     ),
                 ]
             )
-    rows.append(["P5", "see below", "pi-driven, separate script"])
+    if (out / "p5").exists() and load_p5(out):
+        v5 = p5_verdict(out)
+        rows.append(
+            [
+                "P5",
+                v5["verdict"],
+                "; ".join(
+                    f"{'ok' if c['ok'] else 'FAIL'}: {c['name']} ({c['detail']})"
+                    for c in v5["checks"]
+                ),
+            ]
+        )
+    else:
+        rows.append(["P5", "not run", "pi-driven, separate script"])
     md += [table(["premise", "verdict", "checks"], rows), ""]
     md += ["## Results", ""]
     for p in ["P6", "P1", "P2", "P3", "P4"]:
