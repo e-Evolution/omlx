@@ -444,7 +444,7 @@ def test_force_ragged_b1_flag_routes_through_ragged_kernel(
     mask = None if new_len == 1 else "causal"
     tqa._LOGGED_PATHS.clear()
     out = _sdpa(c, q, keys, values, mask)
-    assert "ragged" in tqa._LOGGED_PATHS
+    assert "ragged-b1-forced" in tqa._LOGGED_PATHS
     if new_len == 1:
         ref = c.decode_attention(q, keys_state=keys, values_state=values, scale=SCALE)
     else:
@@ -457,4 +457,14 @@ def test_b1_without_flag_keeps_fused_single_row_path(monkeypatch):
     c, q, keys, values = _b1_case(1)
     tqa._LOGGED_PATHS.clear()
     _sdpa(c, q, keys, values, None)
-    assert "ragged" not in tqa._LOGGED_PATHS
+    assert not any(k.startswith("ragged") for k in tqa._LOGGED_PATHS)
+
+
+def test_ragged_path_logs_once_per_batch_size(caplog):
+    tqa._LOGGED_PATHS.clear()
+    with caplog.at_level(logging.INFO, logger=tqa.logger.name):
+        for lengths in ([1500, 2500], [1500, 2500, 3500], [1500, 2500, 3500]):
+            batch, rows, q, keys, values = _build(lengths, 1)
+            _batched(batch, q, keys, values)
+    msgs = [r.getMessage() for r in caplog.records if "ragged" in r.getMessage()]
+    assert [m[-5:] for m in msgs] == ["(B=2)", "(B=3)"]

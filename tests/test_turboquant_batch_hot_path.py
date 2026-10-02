@@ -292,7 +292,7 @@ def test_ragged_kernel_matches_single_rows_and_is_one_launch(new_len, monkeypatc
         batch, q, keys, values, SCALE
     )
     mx.eval(out)
-    assert "ragged" in tqa._LOGGED_PATHS, tqa._LOGGED_PATHS
+    assert "ragged:3" in tqa._LOGGED_PATHS, tqa._LOGGED_PATHS
     assert launches["n"] == 0, "per-row decode_attention ran next to the ragged kernel"
     monkeypatch.undo()
     for i, ref in enumerate(refs):

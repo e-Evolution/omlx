@@ -844,7 +844,7 @@ def _per_row_batched_attention(real_cache, queries, keys, values, scale):
             ragged = None
         if ragged is not None:
             _log_path_once(
-                "ragged",
+                f"ragged:{B}",
                 f"TurboQuant batched attention: ragged single-launch path (B={B})",
             )
             return ragged
@@ -1231,7 +1231,7 @@ def apply_turboquant_attention_patch() -> bool:
                 )
                 if ragged is not None:
                     _log_path_once(
-                        "ragged",
+                        "ragged-b1-forced",
                         "TurboQuant batched attention: ragged single-launch path (B=1, forced)",
                     )
                     return ragged
