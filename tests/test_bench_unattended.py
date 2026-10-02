@@ -1055,3 +1055,40 @@ class TestReportP3Margins:
         import report
 
         assert "Near-tie" not in report.section_p3({"fork": {"P3": [_p3()]}})
+
+
+class TestNoMtpVariant:
+    def test_variant_exists_and_uses_fork_on_env(self):
+        import bench_premises as bp
+
+        assert "fork-nomtp" in bp.VARIANTS
+        assert bp.variant_env("fork-nomtp", "P3") == bp.variant_env("fork", "P3")
+
+    def test_model_settings_turn_mtp_off_only_for_the_bench_model(self):
+        import bench_premises as bp
+
+        ms = {
+            "version": 1,
+            "models": {
+                bp.MODEL: {"mtp_enabled": True, "x": 1},
+                "other": {"mtp_enabled": True},
+            },
+        }
+        out = bp.variant_model_settings(ms, "fork-nomtp")
+        assert out["models"][bp.MODEL]["mtp_enabled"] is False
+        assert out["models"][bp.MODEL]["x"] == 1
+        assert out["models"]["other"]["mtp_enabled"] is True
+        assert ms["models"][bp.MODEL]["mtp_enabled"] is True  # input untouched
+
+    def test_other_variants_keep_model_settings(self):
+        import bench_premises as bp
+
+        ms = {"models": {bp.MODEL: {"mtp_enabled": True}}}
+        assert bp.variant_model_settings(ms, "fork") == ms
+
+    def test_report_renders_nomtp_control(self):
+        import report
+
+        p = _p3lp(ref_gap_at_div=0.2, div_at=10)
+        md = report.section_p3({"fork": {"P3": [p]}, "fork-nomtp": {"P3": [p]}})
+        assert "MTP off" in md
