@@ -903,6 +903,70 @@ def _per_row_batched_attention(real_cache, queries, keys, values, scale):
     return mx.concatenate(outputs, axis=0).astype(queries.dtype)
 
 
+
+def _dense_padded_attention(queries, keys, values, *, cache, scale):
+    """Per-row attention for a left-padded B>1 batch on a DENSE KV cache.
+
+    mlx-vlm's ``_qwen3_5_left_padded_attention`` fast path needs every row on
+    the same SDPA plan; rows of 20k/45k/90k tokens are not, and the fallback
+    then ``mx.take``s each pad group's K/V out of the batch (a full copy of
+    the dense cache, ~10 ms per step for the one dense layer Qwen keeps next
+    to the TurboQuant ones). Row slices of the cache buffer are views whose
+    last two dims stay contiguous, so MLX's SDPA reads them in place.
+
+    Same contract as upstream: the rows attend ``[pad_b, total)`` with a
+    causal tail; the mask argument is not consulted. Returns None when the
+    cache has no padding or the call is outside this shape (caller falls back).
+    """
+    left_padding = getattr(cache, "left_padding", None)
+    if not isinstance(left_padding, mx.array) or left_padding.ndim != 1:
+        return None
+    if (
+        queries.ndim != 4
+        or keys.ndim != 4
+        or values.ndim != 4
+        or queries.shape[0] != keys.shape[0]
+        or queries.shape[0] < 2
+        or queries.shape[-2] > _DECODE_MULTIROW_MAX_Q_LEN
+    ):
+        return None
+    try:
+        from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+        info = q35_lang._qwen3_5_left_padding_info(cache)
+    except Exception:
+        return None
+    if info is None:
+        return None
+    pads, max_pad = info
+    total = keys.shape[2]
+    if max_pad <= 0 or len(pads) != queries.shape[0] or any(p >= total for p in pads):
+        return None
+    L = queries.shape[-2]
+    if L == 1:
+        ragged = None
+        try:
+            ragged = q35_lang._qwen3_5_ragged_decode_attention(
+                queries, keys, values, list(pads), scale
+            )
+        except Exception:
+            ragged = None
+        if ragged is not None:
+            return ragged
+    outputs = []
+    for b, pad in enumerate(pads):
+        outputs.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[b : b + 1],
+                keys[b : b + 1, :, pad:, :],
+                values[b : b + 1, :, pad:, :],
+                scale=scale,
+                mask="causal" if L > 1 else None,
+            )
+        )
+    return mx.concatenate(outputs, axis=0)
+
+
 def _patch_update_eval_policy() -> None:
     """Skip the per-layer eval for decode-shaped multi-row cache appends.
 
@@ -994,6 +1058,12 @@ def _patch_vlm_target_verify_attention() -> None:
         ):
             real_cache = cache._cache
         if not isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            if isinstance(keys, mx.array) and queries.shape[0] > 1:
+                dense = _dense_padded_attention(
+                    queries, keys, values, cache=cache, scale=scale
+                )
+                if dense is not None:
+                    return dense
             return original(queries, keys, values, cache=cache, scale=scale, mask=mask)
 
         sdpa = q35_lang.scaled_dot_product_attention

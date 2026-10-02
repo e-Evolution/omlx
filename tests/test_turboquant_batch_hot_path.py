@@ -340,3 +340,52 @@ def test_ragged_kernel_unrolled_and_single_token_loops_agree(new_len, monkeypatc
         outs.append(out)
     assert _max_abs(outs[0], outs[1]) < 1e-3
     assert _max_abs(outs[0], outs[2]) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Dense (non-TurboQuant) layer next to the TurboQuant ones
+# ---------------------------------------------------------------------------
+
+
+def _dense_batch(pads, total, new_len, seed=0):
+    from mlx_lm.models.cache import BatchKVCache
+
+    mx.random.seed(seed)
+    cache = BatchKVCache(list(pads))
+    k = mx.random.normal((len(pads), N_KV, total - new_len, D)).astype(mx.float16)
+    v = mx.random.normal((len(pads), N_KV, total - new_len, D)).astype(mx.float16)
+    cache.update_and_fetch(k, v)
+    mask = cache.make_mask(new_len)
+    nk = mx.random.normal((len(pads), N_KV, new_len, D)).astype(mx.float16)
+    nv = mx.random.normal((len(pads), N_KV, new_len, D)).astype(mx.float16)
+    q = mx.random.normal((len(pads), N_Q, new_len, D)).astype(mx.float16)
+    keys, values = cache.update_and_fetch(nk, nv)
+    return cache, q, keys, values, mask
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+def test_dense_padded_rows_attend_their_own_slice_without_copying_the_cache(
+    new_len, monkeypatch
+):
+    pads = [1500, 400, 0]  # different SDPA plans per row: no shared ragged kernel
+    cache, q, keys, values, mask = _dense_batch(pads, 2600, new_len)
+    takes = {"n": 0}
+    real_take = mx.take
+
+    def spy_take(*a, **k):
+        takes["n"] += 1
+        return real_take(*a, **k)
+
+    monkeypatch.setattr(mx, "take", spy_take)
+    out = q35_lang._qwen3_5_left_padded_attention(
+        q, keys, values, cache=cache, scale=SCALE, mask=None
+    )
+    mx.eval(out)
+    assert takes["n"] == 0, "dense KV rows were gathered (copied) per pad group"
+    ref = mx.fast.scaled_dot_product_attention(q, keys, values, scale=SCALE, mask=mask)
+    assert _max_abs(out, ref) < 2e-3
+
+
+def test_dense_unpadded_batch_keeps_the_upstream_path():
+    cache, q, keys, values, mask = _dense_batch([0, 0], 1200, 1)
+    assert tqa._dense_padded_attention(q, keys, values, cache=cache, scale=SCALE) is None
