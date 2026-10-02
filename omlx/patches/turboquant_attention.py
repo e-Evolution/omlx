@@ -943,6 +943,10 @@ def _dense_padded_attention(queries, keys, values, *, cache, scale):
     if max_pad <= 0 or len(pads) != queries.shape[0] or any(p >= total for p in pads):
         return None
     L = queries.shape[-2]
+    if L > 1 and total <= 8192:
+        # Short-context verify rows belong to the bounded verify-attention
+        # kernel (qwen35_verify_attention), which sits behind this seam.
+        return None
     if L == 1:
         ragged = None
         try:
