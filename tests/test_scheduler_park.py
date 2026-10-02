@@ -10,6 +10,7 @@ cache, and resumes from the blocks an incremental commit stored.
 import time
 from types import SimpleNamespace
 
+import pytest
 import test_scheduler_prefill_progress_commit as commit_rig
 from test_scheduler_prefill_progress_commit import BLOCK, _returns_promptly, _Rig
 
@@ -745,6 +746,61 @@ def test_a_hot_cache_shrink_reclaims_parked_blocks_that_stay_restorable(
         rig.close()
 
 
+@pytest.mark.parametrize("failure", ["dropped", "raises"])
+def test_resume_degrades_safely_when_the_hot_cache_writeback_is_lost(
+    tmp_path, mock_tokenizer, caplog, failure
+):
+    """A parked request's dirty hot-cache blocks are reclaimed and the SSD
+    write-back does not happen (queue unavailable) or fails: resume must fall
+    back to whatever is restorable, finish the request and leave a log line."""
+    import logging
+
+    expected = uninterrupted_output(tmp_path, mock_tokenizer)
+    rig = make_rig(tmp_path / "park", mock_tokenizer, ok_polls=1)
+    try:
+        rig.ssd._hot_cache_max_bytes = 64 * 1024**2
+        rig.ssd._hot_cache_enabled = True
+        old, young = prefill_two(rig)
+        scheduler = rig.scheduler
+        scheduler.request_park_prefill()
+        step(rig)
+        rig.drain()
+        pins = scheduler._park_pins["young"]
+        assert set(pins.hashes) & set(rig.ssd._hot_cache)
+
+        def lost_write(block_hash, entry, **kwargs):
+            if failure == "raises":
+                raise OSError("ssd write queue unavailable")
+            return False
+
+        rig.ssd._enqueue_ssd_write = lost_write
+        protected = scheduler.get_active_hot_cache_block_hashes()
+        try:
+            rig.ssd.shrink_hot_cache_to(0, protected_hashes=protected)
+        except OSError:
+            pass  # the cache layer may surface the failure; the scheduler must not care
+        finally:
+            del rig.ssd._enqueue_ssd_write  # back to the real queue for teardown
+        # Whatever the SSD index still knows is gone too: nothing is restorable.
+        rig.ssd._evict_tracked_until_size(0)
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            finish_ok_polls(rig, 1)
+            step_until(rig, lambda: "young" in prefilling_ids(rig))
+            assert any(
+                "Resumed parked request young" in r.getMessage() for r in caplog.records
+            )
+        assert young.parked is False
+        outputs = run_to_completion(rig, [old, young])
+        assert not [o for o in outputs if o.error]
+        assert list(young.output_token_ids) == expected
+        stats = scheduler.get_park_stats()
+        assert stats["resumes"] == 1
+        assert not scheduler._park_pins
+    finally:
+        rig.close()
+
+
 def test_the_settle_window_counts_enforcer_polls_not_queries(tmp_path, mock_tokenizer):
     rig = make_rig(tmp_path, mock_tokenizer, max_parks=1)
     try:
@@ -777,3 +833,14 @@ def test_is_request_parked_reads_the_request_flag():
     assert Scheduler.is_request_parked(scheduler, "p") is True
     assert Scheduler.is_request_parked(scheduler, "l") is False
     assert Scheduler.is_request_parked(scheduler, "missing") is False
+
+
+def test_polls_since_resume_saturates_at_a_named_constant(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        cap = scheduler_module._POLLS_SINCE_RESUME_SATURATION
+        assert rig.scheduler._polls_since_resume == cap
+        rig.scheduler.note_pressure_poll("ok")
+        assert rig.scheduler._polls_since_resume == cap  # saturated, no growth
+    finally:
+        rig.close()

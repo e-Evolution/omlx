@@ -1359,6 +1359,11 @@ PARK_SETTLE_POLLS = 3
 PARK_SIGNAL_STALE_S = 60.0
 # Longest a parked head holds admission on a non-hard pressure level.
 PARK_MAX_HOLD_S = 300.0
+# Saturation value of ``_polls_since_resume``: "long enough since the last
+# resume that the hysteresis gate is open". It is the initial value (no resume
+# has happened yet) and the cap that keeps the counter from growing without
+# bound; any value above every realistic ``park_resume_ok_polls`` works.
+_POLLS_SINCE_RESUME_SATURATION = 1 << 30
 
 
 class _ParkPins(NamedTuple):
@@ -2290,7 +2295,7 @@ class Scheduler:
         # scheduling pass, and the next one needs a fresh ok streak (or, for
         # the max-hold escape, as many polls since the last resume).
         self._park_resumed_this_pass: bool = False
-        self._polls_since_resume: int = 1 << 30
+        self._polls_since_resume: int = _POLLS_SINCE_RESUME_SATURATION
         self._last_pressure_poll_at: float | None = None
         self._last_pressure_level: str = "ok"
         self._park_pins: dict[str, _ParkPins] = {}
@@ -11867,7 +11872,9 @@ class Scheduler:
         """
         self._last_pressure_poll_at = time.monotonic()
         self._last_pressure_level = level
-        self._polls_since_resume = min(self._polls_since_resume + 1, 1 << 30)
+        self._polls_since_resume = min(
+            self._polls_since_resume + 1, _POLLS_SINCE_RESUME_SATURATION
+        )
         if self._polls_since_park is not None:
             self._polls_since_park += 1
         if level == "ok":
