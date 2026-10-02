@@ -33,6 +33,21 @@ LOG = """\
 """
 
 
+class TestParseServerLogRagged:
+    def test_ragged_path_counts_as_batch_but_forced_b1_does_not(self):
+        text = (
+            "x - omlx.patches.turboquant_attention - INFO - [-] - "
+            "TurboQuant batched attention: ragged single-launch path (B=2)\n"
+            "x - omlx.patches.turboquant_attention - INFO - [-] - "
+            "TurboQuant batched attention: ragged single-launch path (B=3)\n"
+            "x - omlx.patches.turboquant_attention - INFO - [-] - "
+            "TurboQuant batched attention: ragged single-launch path (B=1, forced)\n"
+        )
+        m = bm.parse_server_log(text)
+        assert m["tq_batched_fused_rows"] == [2, 3]
+        assert m["batch_max_b"] == 3
+
+
 class TestParseServerLog:
     def test_aborts_split_memory_from_other(self):
         m = bm.parse_server_log(LOG)

@@ -33,7 +33,8 @@ _RE_RELEASE = re.compile(r"Releasing \S+ to decode")
 _RE_RESTORE = re.compile(r"Prefix cache restore for \S+: source=\S+ cached=(\d+)")
 _RE_CACHE_LIMIT = re.compile(r"MLX buffer cache limit set to ([\d.]+) GB")
 _RE_TQ_FUSED = re.compile(
-    r"TurboQuant batched attention: per-row fused path \(B=(\d+)\)"
+    r"TurboQuant batched attention: (?:per-row fused|ragged single-launch) path "
+    r"\(B=(\d+)\)"
 )
 _RE_MTP_BATCH = re.compile(r"Lightning MTP batch activated for (\d+) sequences")
 _RE_TQ_FALLBACK = re.compile(
