@@ -372,8 +372,13 @@ def _p3_margins(data: dict, variant: str = "fork") -> str:
                     c["classification"] or "-",
                 ]
             )
+    engaged = [r["scenario"].get("ragged_b1_forced_logged") for r in runs]
     if crow:
-        out += "\n\n**Controls.**\n\n" + table(
+        out += (
+            "\n\n**Controls.** Forced ragged B=1 decode path engaged (server log): "
+            + ("yes" if all(engaged) else "NO - the ragged control is not valid")
+            + ".\n\n"
+        ) + table(
             ["row", "comparison", "first divergent token", "margin", "mean abs dlp", "class"],
             crow,
         )

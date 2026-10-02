@@ -444,7 +444,7 @@ def test_force_ragged_b1_flag_routes_through_ragged_kernel(
     mask = None if new_len == 1 else "causal"
     tqa._LOGGED_PATHS.clear()
     out = _sdpa(c, q, keys, values, mask)
-    assert "ragged-b1-forced" in tqa._LOGGED_PATHS
+    assert f"ragged-b1-forced:{new_len}" in tqa._LOGGED_PATHS
     if new_len == 1:
         ref = c.decode_attention(q, keys_state=keys, values_state=values, scale=SCALE)
     else:
@@ -468,3 +468,31 @@ def test_ragged_path_logs_once_per_batch_size(caplog):
             _batched(batch, q, keys, values)
     msgs = [r.getMessage() for r in caplog.records if "ragged" in r.getMessage()]
     assert [m[-5:] for m in msgs] == ["(B=2)", "(B=3)"]
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+def test_force_ragged_b1_also_covers_plain_single_sequence_cache(
+    new_len, monkeypatch, tmp_path
+):
+    flag = tmp_path / "ragged.flag"
+    flag.write_text("1")
+    monkeypatch.setenv("OMLX_DEBUG_FORCE_RAGGED_B1", str(flag))
+    from omlx import debug_numerics
+
+    debug_numerics._flag_cache.clear()
+    k, v = _kv(1, 3000, 31)
+    c = TurboQuantKVCache(bits=BITS)
+    c.update_and_fetch(k, v)
+    mx.random.seed(32)
+    q = mx.random.normal((1, N_Q, new_len, D)).astype(mx.float16)
+    nk, nv = _kv(1, new_len, 33)
+    keys, values = c.update_and_fetch(nk, nv)
+    mask = None if new_len == 1 else "causal"
+    tqa._LOGGED_PATHS.clear()
+    out = _sdpa(c, q, keys, values, mask)
+    assert f"ragged-b1-forced:{new_len}" in tqa._LOGGED_PATHS
+    if new_len == 1:
+        ref = c.decode_attention(q, keys_state=keys, values_state=values, scale=SCALE)
+    else:
+        ref = tqa._decode_multirow_attention(c, q, keys, values, SCALE)
+    assert _max_abs(out, ref) < 3e-3

@@ -584,7 +584,11 @@ def _ragged_batched_attention(real_cache, queries, keys_state, values_state, sca
     grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
     q_rot = key_codec.prepare_queries(grouped)
     q_rot_flat = mx.contiguous(q_rot.reshape(B * n_kv_heads * n_repeats * L, D))
-    pads = mx.contiguous(real_cache.left_padding.astype(mx.int32).reshape(-1))
+    left_padding = getattr(real_cache, "left_padding", None)
+    if left_padding is None:  # plain single-sequence cache (debug B=1 control)
+        pads = mx.zeros((B,), dtype=mx.int32)
+    else:
+        pads = mx.contiguous(left_padding.astype(mx.int32).reshape(-1))
 
     if longest <= 8192:
         num_blocks = 64
@@ -1213,12 +1217,14 @@ def apply_turboquant_attention_patch() -> bool:
                 )
                 if result is not None:
                     return result
-            if (
-                queries.shape[0] == 1
-                and queries.shape[-2] <= _RAGGED_MAX_Q_ROWS
-                and isinstance(real_cache, BatchTurboQuantKVCache)
-                and _debug_numerics.force_ragged_b1()
-            ):
+            force_b1 = queries.shape[0] == 1 and _debug_numerics.force_ragged_b1()
+            if force_b1:
+                _log_path_once(
+                    f"ragged-b1-probe:{queries.shape[-2]}",
+                    "force_ragged_b1: patched sdpa reached "
+                    f"(cache={type(real_cache).__name__}, L={queries.shape[-2]})",
+                )
+            if force_b1 and queries.shape[-2] <= _RAGGED_MAX_Q_ROWS:
                 # Debug control (OMLX_DEBUG_FORCE_RAGGED_B1): single-row batch
                 # through the B>1 ragged kernel, to tell kernel numerics apart
                 # from batching/padding effects. Never on by default.
@@ -1231,8 +1237,9 @@ def apply_turboquant_attention_patch() -> bool:
                 )
                 if ragged is not None:
                     _log_path_once(
-                        "ragged-b1-forced",
-                        "TurboQuant batched attention: ragged single-launch path (B=1, forced)",
+                        f"ragged-b1-forced:{queries.shape[-2]}",
+                        "TurboQuant batched attention: ragged single-launch path "
+                        f"(B=1, L={queries.shape[-2]}, forced)",
                     )
                     return ragged
             if queries.shape[-2] == 1:
