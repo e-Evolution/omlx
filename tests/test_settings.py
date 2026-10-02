@@ -398,6 +398,7 @@ class TestSchedulerSettings:
             "memory_pressure_park": False,
             "max_parks_per_request": 3,
             "park_resume_ok_polls": 3,
+            "max_batched_decode_context_tokens": 0,
         }
 
     def test_prefill_progress_commit_blocks_from_dict(self):
@@ -455,6 +456,51 @@ class TestSchedulerSettings:
             )
             assert junk.max_parks_per_request == 3
             assert junk.park_resume_ok_polls == 3
+
+    def test_batched_decode_context_limit_defaults_and_round_trip(self):
+        """Off (0) by default; a non-negative int round-trips; junk falls back."""
+        assert SchedulerSettings.from_dict({}).max_batched_decode_context_tokens == 0
+        custom = SchedulerSettings.from_dict(
+            {"max_batched_decode_context_tokens": 150000}
+        )
+        assert custom.max_batched_decode_context_tokens == 150000
+        assert custom.to_dict()["max_batched_decode_context_tokens"] == 150000
+        for bad in ("many", None, -1, True, 1.5):
+            junk = SchedulerSettings.from_dict(
+                {"max_batched_decode_context_tokens": bad}
+            )
+            assert junk.max_batched_decode_context_tokens == 0
+
+    def test_batched_decode_context_limit_validation(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert not any(
+            "max_batched_decode_context_tokens" in e for e in settings.validate()
+        )
+        for bad in (-1, True):
+            settings.scheduler.max_batched_decode_context_tokens = bad
+            assert any(
+                "max_batched_decode_context_tokens" in e for e in settings.validate()
+            )
+
+    def test_batched_decode_context_limit_env_and_scheduler_config(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert settings.to_scheduler_config().max_batched_decode_context_tokens == 0
+        with patch.dict(
+            os.environ,
+            {"OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000"},
+            clear=False,
+        ):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.scheduler.max_batched_decode_context_tokens == 200000
+        config = settings.to_scheduler_config()
+        assert config.max_batched_decode_context_tokens == 200000
+        with patch.dict(
+            os.environ,
+            {"OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "junk"},
+            clear=False,
+        ):
+            junk = GlobalSettings.load(base_path=tmp_path)
+        assert junk.scheduler.max_batched_decode_context_tokens == 0
 
     def test_park_settings_reach_scheduler_config(self, tmp_path):
         settings = GlobalSettings(base_path=tmp_path)
