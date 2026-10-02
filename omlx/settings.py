@@ -598,6 +598,10 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Upper bound (GB) for MLX's free-buffer cache (mx.set_cache_limit), which
+    # the enforcer reports as the "pool". 0 = unset: leave MLX's own limit
+    # (the CLI sets it to total RAM, i.e. effectively unbounded).
+    mlx_cache_limit_gb: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -609,6 +613,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "mlx_cache_limit_gb": self.mlx_cache_limit_gb,
         }
 
     @classmethod
@@ -617,7 +622,12 @@ class MemorySettings:
         tier = str(data.get("memory_guard_tier", "balanced")).lower()
         if tier not in VALID_MEMORY_GUARD_TIERS:
             tier = "balanced"
+        # bool is an int subclass: True must not silently become 1 GB.
+        cache_limit = data.get("mlx_cache_limit_gb", 0.0)
+        if isinstance(cache_limit, bool) or not isinstance(cache_limit, (int, float)):
+            cache_limit = 0.0
         return cls(
+            mlx_cache_limit_gb=float(cache_limit),
             prefill_memory_guard=data.get("prefill_memory_guard", True),
             memory_guard_tier=tier,  # type: ignore[arg-type]
             memory_guard_custom_ceiling_gb=float(
@@ -1266,6 +1276,11 @@ class GlobalSettings:
                     f"Invalid OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS value: "
                     f"{commit_blocks}"
                 )
+        if cache_gb := os.getenv("OMLX_MLX_CACHE_LIMIT_GB"):
+            try:
+                self.memory.mlx_cache_limit_gb = float(cache_gb)
+            except ValueError:
+                logger.warning(f"Invalid OMLX_MLX_CACHE_LIMIT_GB value: {cache_gb}")
         if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
             self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
         for env_name, attr in (
@@ -1769,6 +1784,12 @@ class GlobalSettings:
             errors.append(
                 f"prefill_min_chunk_tokens must be in [1, 1024], "
                 f"got {self.memory.prefill_min_chunk_tokens}"
+            )
+
+        cache_gb = self.memory.mlx_cache_limit_gb
+        if isinstance(cache_gb, bool) or cache_gb < 0:
+            errors.append(
+                f"mlx_cache_limit_gb must be a non-negative number, got {cache_gb!r}"
             )
 
         # Scheduler validation

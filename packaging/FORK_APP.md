@@ -31,8 +31,11 @@ What it changes in the copy:
 - `Info.plist`: bundle id `app.omlx.fork`, name `oMLX Fork`, version
   `0.7.0-fork.N` (the Swift version parser reads only the numeric prefix and
   the suffix has no dev/alpha/beta/rc marker), and `LSEnvironment`.
-- **D1 and park ON** through `LSEnvironment`:
-  `OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS=4`, `OMLX_MEMORY_PRESSURE_PARK=true`.
+- **D1, park and a bounded MLX buffer cache ON** through `LSEnvironment`:
+  `OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS=4`, `OMLX_MEMORY_PRESSURE_PARK=true`,
+  `OMLX_MLX_CACHE_LIMIT_GB=16` (`mx.set_cache_limit`, applied at server startup;
+  keeps the enforcer's pool from growing to 65-73 GB during MTP batch decode.
+  Upstream default is 0 = unbounded).
   The Swift app passes its own process environment to the server
   (`PythonRuntime.makeEnvironment`) and `omlx/settings.py` applies these
   variables after `settings.json`. Upstream defaults in the repo stay off.

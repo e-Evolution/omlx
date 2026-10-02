@@ -568,6 +568,13 @@ async def lifespan(app: FastAPI):
             logger.warning("Cluster discovery service failed to start: %s", exc)
             discovery_service = None
 
+    # Bound MLX's free-buffer cache. Runs after cli.py raised it to total RAM,
+    # so an explicit setting wins; 0 leaves that default untouched.
+    if _server_state.global_settings is not None:
+        from .process_memory_enforcer import apply_mlx_cache_limit
+
+        apply_mlx_cache_limit(_server_state.global_settings.memory.mlx_cache_limit_gb)
+
     # Start process memory enforcer if configured
     if (
         _server_state.global_settings is not None

@@ -326,6 +326,31 @@ def _apply_metal_wired_limit(desired_bytes: int) -> tuple[int, int | None]:
         return 0, None
 
 
+def apply_mlx_cache_limit(limit_gb: float) -> int:
+    """Bound MLX's free-buffer cache to ``limit_gb`` GB.
+
+    ``mx.set_cache_limit`` configures the process-global Metal allocator (any
+    thread may call it) and returns the previous limit. Freed buffers beyond
+    the limit are released on the next allocation, so the enforcer's "pool"
+    (``mx.get_cache_memory()``) stays at or below it. Returns the applied
+    limit in bytes, or 0 when unset (<= 0 or bool) or the call failed.
+    """
+    if isinstance(limit_gb, bool) or limit_gb <= 0:
+        return 0
+    limit_bytes = int(limit_gb * 1024**3)
+    try:
+        previous = mx.set_cache_limit(limit_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mx.set_cache_limit(%s) failed: %s", _format_gb(limit_bytes), exc)
+        return 0
+    logger.info(
+        "MLX buffer cache limit set to %.1f GB (was %.1f GB)",
+        limit_bytes / 1024**3,
+        int(previous) / 1024**3,
+    )
+    return limit_bytes
+
+
 def preview_tier_ceilings() -> dict[str, dict[str, Any]]:
     """Ceiling each tier would set right now, for the settings previews.
 

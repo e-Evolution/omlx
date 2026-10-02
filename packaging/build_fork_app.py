@@ -50,9 +50,15 @@ PIN_PACKAGES = (
 # Swift app builds the server environment from its own process environment
 # (PythonRuntime.makeEnvironment) and omlx/settings.py applies these variables
 # after settings.json, so the upstream defaults in the repo stay off.
+# MLX buffer-cache bound (GB) for the fork app. Lightning MTP batch decode with
+# TurboQuant KV dequantizes the full KV every step; the freed buffers pile up
+# in MLX's cache (65-73 GB observed) until the memory guard aborts.
+FORK_MLX_CACHE_LIMIT_GB = "16"
+
 FORK_ENV = {
     "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
     "OMLX_MEMORY_PRESSURE_PARK": "true",
+    "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap
