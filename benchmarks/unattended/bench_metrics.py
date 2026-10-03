@@ -30,6 +30,8 @@ _RE_PARK_SKIP = re.compile(r"Park skipped for ")
 _RE_RESUMED = re.compile(r"Resumed parked request ")
 _RE_HOLD = re.compile(r"Holding \S+ from batched decode")
 _RE_RELEASE = re.compile(r"Releasing \S+ to decode")
+_RE_BACKFILL = re.compile(r"Backfilling \S+ past held ")
+_RE_AGING = re.compile(r"Aging: \S+ held \d+ s")
 _RE_RESTORE = re.compile(r"Prefix cache restore for \S+: source=\S+ cached=(\d+)")
 _RE_CACHE_LIMIT = re.compile(r"MLX buffer cache limit set to ([\d.]+) GB")
 _RE_TQ_FUSED = re.compile(
@@ -51,6 +53,7 @@ def parse_server_log(text: str) -> dict[str, Any]:
     levels: list[str] = []
     parked_tokens: list[int] = []
     park_skips = park_resumes = holds = releases = 0
+    backfills = agings = 0
     restores: list[int] = []
     cache_limit: float | None = None
     tq_rows: list[int] = []
@@ -88,6 +91,10 @@ def parse_server_log(text: str) -> dict[str, Any]:
             holds += 1
         if _RE_RELEASE.search(line):
             releases += 1
+        if _RE_BACKFILL.search(line):
+            backfills += 1
+        if _RE_AGING.search(line):
+            agings += 1
         m = _RE_RESTORE.search(line)
         if m:
             restores.append(int(m.group(1)))
@@ -120,6 +127,8 @@ def parse_server_log(text: str) -> dict[str, Any]:
         "park_resumes": park_resumes,
         "holds": holds,
         "releases": releases,
+        "backfills": backfills,
+        "agings": agings,
         "restores": restores,
         "restore_cached_last": restores[-1] if restores else None,
         "restore_cached_max": max(restores) if restores else None,
@@ -960,6 +969,31 @@ def aggregate_decode_rate(rows: list[dict]) -> dict[str, Any]:
         tpc = (r.get("completion_tokens") or len(ts)) / len(ts)
         total += sum(1 for t in ts if start < t <= end) * tpc
     return {"rate": total / (end - start), "window_s": end - start}
+
+
+def pl_row(run: dict[str, Any]) -> dict[str, Any]:
+    """One PL (batched-decode limit probe) run reduced to the table columns."""
+    reqs = run["scenario"]["requests"]
+    log = run.get("log", {})
+    ok = bool(run.get("ok")) and all(r.get("ok") for r in reqs)
+    good = [r for r in reqs if r.get("ok")]
+    ratios = [distinct_ngram_ratio(r.get("text") or "") for r in good]
+    degenerate = any(x is not None and x < P3_DEGEN_FLOOR for x in ratios)
+    return {
+        "ok": ok,
+        "wall_s": run.get("wall_s"),
+        "req_end_s": [r.get("end_s") for r in reqs],
+        "req_decode_tps": [r.get("decode_tps") for r in reqs],
+        "aggregate_tps": aggregate_decode_rate(good)["rate"] if len(good) == len(reqs) else None,
+        "holds": log.get("holds", 0),
+        "backfills": log.get("backfills", 0),
+        "agings": log.get("agings", 0),
+        "max_b": log.get("batch_max_b", 0),
+        "peak_gb": run.get("samples", {}).get("footprint_peak_gb"),
+        "aborts": log.get("aborts_total", 0),
+        "distinct4": ratios,
+        "degenerate": degenerate,
+    }
 
 
 def _p4_summary(runs: list[dict]) -> dict[str, Any]:

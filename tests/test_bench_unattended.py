@@ -1249,3 +1249,119 @@ class TestEvalP5:
 
     def test_missing_summary_is_inconclusive(self):
         assert bm.eval_p5(None, None)["verdict"] == "INCONCLUSIVE"
+
+
+# --- PL (batched-decode limit probe, T13) -----------------------------------
+
+PL_LOG = """\
+2026-10-03 10:00:00,000 - omlx.scheduler - INFO - [-] - Holding r2 from batched decode: combined context 260000 > limit 200000 (single-row decode keeps fused kernels)
+2026-10-03 10:00:01,000 - omlx.scheduler - INFO - [-] - Backfilling r3 past held r2
+2026-10-03 10:00:02,000 - omlx.scheduler - INFO - [-] - Aging: r2 held 120 s, backfill paused
+2026-10-03 10:00:03,000 - omlx.scheduler - INFO - [-] - Releasing r2 to decode
+"""
+
+
+class TestPlLog:
+    def test_backfill_and_aging_counts(self):
+        m = bm.parse_server_log(PL_LOG)
+        assert m["holds"] == 1
+        assert m["backfills"] == 1
+        assert m["agings"] == 1
+
+    def test_empty_log_zero(self):
+        m = bm.parse_server_log("")
+        assert m["backfills"] == 0 and m["agings"] == 0
+
+
+class TestPlEnv:
+    def test_pl_env_override(self):
+        env = bp.variant_env("fork", "PL", batched_limit=300000)
+        assert env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] == "300000"
+
+    def test_zero_override_is_kept(self):
+        env = bp.variant_env("fork", "PL", batched_limit=0)
+        assert env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] == "0"
+
+    def test_no_override_keeps_default(self):
+        env = bp.variant_env("fork", "PL")
+        assert env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] == "200000"
+
+    def test_pl_registered_with_two_slots(self):
+        assert bp.PREMISE_CONCURRENCY["PL"] == 2
+        assert "PL" in bp.SCENARIOS
+        assert "PL" not in bp.ALL_PREMISES
+
+    def test_override_reaches_settings(self):
+        env = bp.variant_env("fork", "PL", batched_limit=300000)
+        s = bp.build_settings(REAL, "fork", 8002, "/c", 2, env)
+        assert s["scheduler"]["max_batched_decode_context_tokens"] == 300000
+
+
+def _pl_req(name, start, first, end, n, ctoks, text="a b c d e f g h i j k l"):
+    times = [first + (end - first) * i / (n - 1) for i in range(n)]
+    return {
+        "name": name,
+        "ok": True,
+        "start_s": start,
+        "end_s": end,
+        "prompt_tokens": 100,
+        "completion_tokens": ctoks,
+        "decode_tps": (ctoks - 1) / (end - first),
+        "chunk_times": times,
+        "text": text,
+    }
+
+
+def _pl_run(requests, wall=100.0, peak=70.0, aborts=0, log=None):
+    return {
+        "ok": True,
+        "wall_s": wall,
+        "scenario": {"requests": requests},
+        "log": {
+            "aborts_total": aborts,
+            "holds": 0,
+            "backfills": 0,
+            "agings": 0,
+            "batch_max_b": 2,
+            **(log or {}),
+        },
+        "samples": {"footprint_peak_gb": peak},
+    }
+
+
+class TestPlSummary:
+    def test_row_fields(self):
+        reqs = [
+            _pl_req("165k", 0, 10, 60, 101, 1000),
+            _pl_req("95k", 0, 20, 70, 101, 1000),
+        ]
+        row = bm.pl_row(_pl_run(reqs, wall=72.0, peak=71.5, log={"holds": 3}))
+        assert row["wall_s"] == 72.0
+        assert row["peak_gb"] == 71.5
+        assert row["holds"] == 3
+        assert row["max_b"] == 2
+        assert row["aborts"] == 0
+        assert row["req_end_s"] == [60, 70]
+        assert [round(t, 1) for t in row["req_decode_tps"]] == [20.0, 20.0]
+        # window = [20, 60]; each row decodes 1000 tok / 50 s = 20 tok/s
+        assert row["aggregate_tps"] == pytest.approx(40.0, rel=0.1)
+        assert row["degenerate"] is False
+
+    def test_degenerate_flag_on_repetition(self):
+        loop = "x y z w " * 50
+        reqs = [
+            _pl_req("165k", 0, 10, 60, 101, 1000, text=loop),
+            _pl_req("95k", 0, 20, 70, 101, 1000),
+        ]
+        assert bm.pl_row(_pl_run(reqs))["degenerate"] is True
+
+    def test_no_overlap_gives_none_aggregate(self):
+        reqs = [
+            _pl_req("165k", 0, 10, 30, 21, 100),
+            _pl_req("95k", 0, 40, 60, 21, 100),
+        ]
+        assert bm.pl_row(_pl_run(reqs))["aggregate_tps"] is None
+
+    def test_failed_request_is_not_ok(self):
+        reqs = [_pl_req("165k", 0, 10, 60, 101, 1000), {"name": "95k", "ok": False}]
+        assert bm.pl_row(_pl_run(reqs))["ok"] is False

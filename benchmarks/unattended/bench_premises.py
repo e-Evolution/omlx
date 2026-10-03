@@ -108,7 +108,7 @@ FORK_ONLY_SETTINGS = {
 SAMPLING_DEFAULT = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 SAMPLING_GREEDY = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
 
-PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3}
+PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3, "PL": 2}
 ALL_PREMISES = ["P6", "P1", "P2", "P3", "P4"]
 
 _LIVE_SERVERS: list[Server] = []
@@ -119,7 +119,9 @@ _LIVE_SERVERS: list[Server] = []
 # --------------------------------------------------------------------------
 
 
-def variant_env(variant: str, premise: str) -> dict[str, str]:
+def variant_env(
+    variant: str, premise: str, batched_limit: int | None = None
+) -> dict[str, str]:
     if variant == "upstream":
         return {}
     env = dict(
@@ -129,6 +131,8 @@ def variant_env(variant: str, premise: str) -> dict[str, str]:
     if premise == "P3":
         # Disable the T5b gate so the three rows really batch.
         env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] = "0"
+    if batched_limit is not None:
+        env["OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS"] = str(batched_limit)
     return env
 
 
@@ -259,6 +263,7 @@ class Server:
         max_concurrent: int,
         out: Path,
         keep_cache: bool,
+        batched_limit: int | None = None,
     ):
         self.variant, self.premise, self.port = variant, premise, port
         self.max_concurrent = max_concurrent
@@ -267,7 +272,7 @@ class Server:
         tag = f"{variant}-{premise}"
         self.base = BENCH_BASE_ROOT / tag
         self.cache_dir = f"{CACHE_ROOT}/{tag}"
-        self.env = variant_env(variant, premise)
+        self.env = variant_env(variant, premise, batched_limit)
         self.env.update(debug_env(variant, premise, self.base))
         dump = self.env.get("OMLX_DEBUG_LOGPROB_DUMP")
         self.dump_dir = Path(dump) if dump else None
@@ -889,7 +894,22 @@ async def scenario_p4(ctx: Ctx) -> dict[str, Any]:
     }
 
 
+async def scenario_pl(ctx: Ctx) -> dict[str, Any]:
+    """Limit probe: ~165k + ~95k distinct prompts at once, default sampling."""
+    lens = [("165k", 165_000), ("95k", 95_000)]
+    mt = ctx.mt(ctx.args.pl_max_tokens)
+    prompts = [ctx.corpus.prompt(ctx.seed("PL", nm), ctx.n(nom)) for nm, nom in lens]
+    res = await asyncio.gather(
+        *[
+            ctx.chat(p, mt, name=nm, keep_text=True, keep_chunks=True)
+            for (nm, _), p in zip(lens, prompts)
+        ]
+    )
+    return {"requests": list(res)}
+
+
 SCENARIOS = {
+    "PL": scenario_pl,
     "P6": scenario_p6,
     "P1": scenario_p1,
     "P2": scenario_p2,
@@ -906,7 +926,7 @@ def scenario_ok(premise: str, sc: dict[str, Any]) -> bool:
         return okreq(sc["request"])
     if premise == "P1":
         return okreq(sc.get("reissue"))
-    if premise == "P2":
+    if premise in ("P2", "PL"):
         return all(okreq(r) for r in sc["requests"])
     if premise == "P3":
         return all(
@@ -1015,6 +1035,7 @@ async def run_premise_async(
         args.max_concurrent or PREMISE_CONCURRENCY[premise],
         out,
         args.keep_cache,
+        args.batched_decode_limit,
     )
     srv.prepare()
     srv.start()
@@ -1135,7 +1156,9 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--variant", choices=VARIANTS, required=True)
-    ap.add_argument("--premise", choices=[*ALL_PREMISES, "all"], default="all")
+    ap.add_argument(
+        "--premise", choices=[*ALL_PREMISES, "PL", "all"], default="all"
+    )
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--port", type=int, default=8002)
@@ -1166,6 +1189,15 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=512,
         help="tokens per P4 request (raise it to widen the all-three-decoding window)",
+    )
+    ap.add_argument(
+        "--pl-max-tokens", type=int, default=1500, help="tokens per PL request"
+    )
+    ap.add_argument(
+        "--batched-decode-limit",
+        type=int,
+        default=None,
+        help="override scheduler.max_batched_decode_context_tokens (0 = no limit)",
     )
     ap.add_argument("--settle-s", type=float, default=5.0)
     ap.add_argument(
