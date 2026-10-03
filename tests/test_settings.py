@@ -399,6 +399,7 @@ class TestSchedulerSettings:
             "max_parks_per_request": 3,
             "park_resume_ok_polls": 3,
             "max_batched_decode_context_tokens": 0,
+            "batched_decode_hold_max_s": 120.0,
         }
 
     def test_prefill_progress_commit_blocks_from_dict(self):
@@ -501,6 +502,60 @@ class TestSchedulerSettings:
         ):
             junk = GlobalSettings.load(base_path=tmp_path)
         assert junk.scheduler.max_batched_decode_context_tokens == 0
+
+    def test_batched_decode_hold_max_defaults_and_round_trip(self):
+        """120 s by default; a non-negative finite number round-trips (0 = off)."""
+        assert SchedulerSettings.from_dict({}).batched_decode_hold_max_s == 120.0
+        for good, expected in ((30, 30.0), (0.5, 0.5), (0, 0.0)):
+            parsed = SchedulerSettings.from_dict({"batched_decode_hold_max_s": good})
+            assert parsed.batched_decode_hold_max_s == expected
+        assert (
+            SchedulerSettings.from_dict(
+                {"batched_decode_hold_max_s": 45}
+            ).to_dict()["batched_decode_hold_max_s"]
+            == 45.0
+        )
+        for bad in ("soon", None, -1, -0.1, True, False, float("nan"), float("inf")):
+            junk = SchedulerSettings.from_dict({"batched_decode_hold_max_s": bad})
+            assert junk.batched_decode_hold_max_s == 120.0, bad
+
+    def test_batched_decode_hold_max_validation(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert not any("batched_decode_hold_max_s" in e for e in settings.validate())
+        for good in (0, 0.0, 120, 3.5):
+            settings.scheduler.batched_decode_hold_max_s = good
+            assert not any(
+                "batched_decode_hold_max_s" in e for e in settings.validate()
+            )
+        for bad in (-1, -0.5, True, False, float("nan"), float("inf"), "5", None):
+            settings.scheduler.batched_decode_hold_max_s = bad
+            assert any(
+                "batched_decode_hold_max_s" in e for e in settings.validate()
+            ), bad
+
+    def test_batched_decode_hold_max_env_and_scheduler_config(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert settings.to_scheduler_config().batched_decode_hold_max_s == 120.0
+        with patch.dict(
+            os.environ, {"OMLX_BATCHED_DECODE_HOLD_MAX_S": "30"}, clear=False
+        ):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.scheduler.batched_decode_hold_max_s == 30.0
+        assert settings.to_scheduler_config().batched_decode_hold_max_s == 30.0
+        with patch.dict(
+            os.environ, {"OMLX_BATCHED_DECODE_HOLD_MAX_S": "0"}, clear=False
+        ):
+            off = GlobalSettings.load(base_path=tmp_path)
+        assert off.scheduler.batched_decode_hold_max_s == 0.0
+        for bad in ("junk", "nan", "inf", "-5"):
+            with patch.dict(
+                os.environ, {"OMLX_BATCHED_DECODE_HOLD_MAX_S": bad}, clear=False
+            ):
+                junk = GlobalSettings.load(base_path=tmp_path)
+            assert junk.scheduler.batched_decode_hold_max_s == 120.0, bad
+            assert not any(
+                "batched_decode_hold_max_s" in e for e in junk.validate()
+            )
 
     def test_park_settings_reach_scheduler_config(self, tmp_path):
         settings = GlobalSettings(base_path=tmp_path)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -321,6 +322,16 @@ class ModelSettings:
         )
 
 
+def _is_valid_hold_max_s(value: Any) -> bool:
+    """A non-negative finite number; bool is an int subclass and is rejected."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
@@ -358,6 +369,11 @@ class SchedulerSettings:
     # admitted rows plus its own would exceed this many tokens, so it later
     # decodes as a single row on the fused TurboQuant kernels. 0 = off.
     max_batched_decode_context_tokens: int = 0
+    # While that gate holds the queue head, shorter requests behind it whose
+    # combined context fits are admitted past it (backfill). Once the head has
+    # waited longer than this many seconds backfill stops so it cannot starve.
+    # 0 = never backfill (strict head-of-line).
+    batched_decode_hold_max_s: float = 120.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -400,6 +416,9 @@ class SchedulerSettings:
             or batched_decode_limit < 0
         ):
             batched_decode_limit = 0
+        hold_max_s = data.get("batched_decode_hold_max_s", 120.0)
+        if not _is_valid_hold_max_s(hold_max_s):
+            hold_max_s = 120.0
 
         return cls(
             max_concurrent_requests=value,
@@ -412,6 +431,7 @@ class SchedulerSettings:
             max_parks_per_request=positive_int("max_parks_per_request", 3),
             park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
             max_batched_decode_context_tokens=batched_decode_limit,
+            batched_decode_hold_max_s=float(hold_max_s),
         )
 
 
@@ -1309,6 +1329,18 @@ class GlobalSettings:
                     setattr(self.scheduler, attr, int(raw))
                 except ValueError:
                     logger.warning(f"Invalid {env_name} value: {raw}")
+        if raw := os.getenv("OMLX_BATCHED_DECODE_HOLD_MAX_S"):
+            try:
+                hold_max_s = float(raw)
+            except ValueError:
+                hold_max_s = None
+            if hold_max_s is not None and _is_valid_hold_max_s(hold_max_s):
+                self.scheduler.batched_decode_hold_max_s = hold_max_s
+            else:
+                logger.warning(
+                    f"Invalid OMLX_BATCHED_DECODE_HOLD_MAX_S value: {raw} "
+                    "(must be a finite number >= 0)"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1845,6 +1877,12 @@ class GlobalSettings:
                 f"Invalid max_batched_decode_context_tokens: "
                 f"{batched_limit!r} (must be an integer >= 0)"
             )
+        if not _is_valid_hold_max_s(self.scheduler.batched_decode_hold_max_s):
+            errors.append(
+                f"Invalid batched_decode_hold_max_s: "
+                f"{self.scheduler.batched_decode_hold_max_s!r} "
+                "(must be a finite number >= 0)"
+            )
 
         # Cache validation
         if self.cache.gdn_ssd_split_enabled is True and self.cache.hot_cache_only:
@@ -2019,6 +2057,7 @@ class GlobalSettings:
             max_batched_decode_context_tokens=(
                 self.scheduler.max_batched_decode_context_tokens
             ),
+            batched_decode_hold_max_s=self.scheduler.batched_decode_hold_max_s,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

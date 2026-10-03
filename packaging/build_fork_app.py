@@ -62,11 +62,17 @@ FORK_MLX_CACHE_LIMIT_GB = "16"
 # gate sits between them; a request that would pass it waits and decodes alone.
 FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS = "200000"
 
+# Aging bound (seconds) for the batched-decode gate's backfill. While the gate
+# holds a long request, shorter ones that fit are admitted past it; once the
+# held request has waited this long, backfill stops so it cannot starve.
+FORK_BATCHED_DECODE_HOLD_MAX_S = "120"
+
 FORK_ENV = {
     "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
     "OMLX_MEMORY_PRESSURE_PARK": "true",
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
     "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
+    "OMLX_BATCHED_DECODE_HOLD_MAX_S": FORK_BATCHED_DECODE_HOLD_MAX_S,
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap

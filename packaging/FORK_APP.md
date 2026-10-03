@@ -39,7 +39,11 @@ What it changes in the copy:
   `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=200000` (a request whose context plus
   the running rows' would exceed this waits and decodes alone on the fused
   single-row kernels; 45k + 130k recovered live, 2 x 130k did not. Upstream
-  default is 0 = off).
+  default is 0 = off),
+  `OMLX_BATCHED_DECODE_HOLD_MAX_S=120` (while that gate holds a long request,
+  shorter requests behind it whose combined context still fits are admitted
+  past it; once the held request has waited 120 s backfill stops so it cannot
+  starve. 0 = never backfill, strict head-of-line).
   The Swift app passes its own process environment to the server
   (`PythonRuntime.makeEnvironment`) and `omlx/settings.py` applies these
   variables after `settings.json`. Upstream defaults in the repo stay off.
