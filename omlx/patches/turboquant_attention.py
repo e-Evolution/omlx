@@ -810,7 +810,7 @@ def _is_batch_padding_mask(real_cache, mask, queries, keys) -> bool:
     total = _state_length(real_cache._unwrap(keys))
     if mask.ndim != 4 or mask.shape[-2:] != (L, total):
         return False
-    return is_own_padding_mask(L, total, queries.shape[0])
+    return is_own_padding_mask(mask, L, total, queries.shape[0])
 
 
 def _per_row_batched_attention(real_cache, queries, keys, values, scale):
@@ -1057,6 +1057,8 @@ def _patch_vlm_target_verify_attention() -> None:
     if original is None:
         return
 
+    sdpa_masked = q35_lang.scaled_dot_product_attention
+
     def patched(queries, keys, values, *, cache, scale, mask):
         from mlx_vlm.turboquant import TurboQuantKVCache as _TQCache
 
@@ -1069,6 +1071,13 @@ def _patch_vlm_target_verify_attention() -> None:
             real_cache = cache._cache
         if not isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
             if isinstance(keys, mx.array) and queries.shape[0] > 1:
+                if isinstance(mask, mx.array):
+                    # The dense per-row-slice path (and upstream) never read
+                    # the mask; an explicit array mask is the caller's
+                    # contract, so honor it with plain masked SDPA.
+                    return sdpa_masked(
+                        queries, keys, values, cache=cache, scale=scale, mask=mask
+                    )
                 dense = _dense_padded_attention(
                     queries, keys, values, cache=cache, scale=scale
                 )
@@ -1084,7 +1093,6 @@ def _patch_vlm_target_verify_attention() -> None:
         if (
             queries.shape[0] > 1
             and isinstance(real_cache, BatchTurboQuantKVCache)
-            and queries.shape[-2] <= _DECODE_MULTIROW_MAX_Q_LEN
             and (
                 not isinstance(mask, mx.array)
                 or (
@@ -1093,17 +1101,23 @@ def _patch_vlm_target_verify_attention() -> None:
                 )
             )
         ):
-            # B>1 decode/verify on left-padded rows: either no explicit mask
-            # (mlx-vlm's "left_padded_decode" hands mask=None) or the cache's
-            # own padding + causal mask (MTP verify). Each row must attend only
-            # its own slice; without padding the batched kernels are exact.
+            # B>1 on left-padded rows: either no explicit mask (mlx-vlm's
+            # "left_padded_decode" hands mask=None) or the cache's own padding
+            # + causal mask (MTP verify). Each row must attend only its own
+            # slice, at ANY query length: the ragged kernel (L <= 8), else the
+            # per-row fused/multirow path (L <= 15), else the per-row
+            # dequantize of the unpadded slice. Never the dequantize-once path
+            # below, whose softmax would include the zero padding columns.
             if _has_batch_padding(real_cache):
                 result = _per_row_batched_attention(
                     real_cache, queries, keys, values, scale
                 )
                 if result is not None:
                     return result
-            elif not isinstance(mask, mx.array):
+            elif (
+                not isinstance(mask, mx.array)
+                and queries.shape[-2] <= _DECODE_MULTIROW_MAX_Q_LEN
+            ):
                 return sdpa(
                     queries, keys, values, cache=cache, scale=scale, mask="causal"
                 )
