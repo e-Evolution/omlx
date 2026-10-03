@@ -610,3 +610,90 @@ def test_dense_path_without_mask_still_takes_per_row_slices():
         q[0:1], keys[0:1, :, 5:], values[0:1, :, 5:], scale=SCALE
     )
     assert _max_abs(out[0:1], ref0) < 2e-3
+
+
+# ---------------------------------------------------------------------------
+# T12c: the real model call shape (MTP verify, L>1) keeps the per-row path
+# ---------------------------------------------------------------------------
+# mlx-vlm's attention layer slices the mask (``mask[..., :kv_seq_len]``) before
+# the attention call, so the TurboQuant layer never sees the object that
+# ``make_mask`` tagged. The own mask must survive that derivation, otherwise
+# every batched verify forward falls to the dequantize-once path (slow, and its
+# softmax includes the padding columns).
+
+
+@pytest.mark.parametrize("verify_len", [2, 5])
+def test_real_model_verify_forward_takes_per_row_path(verify_len, monkeypatch):
+    model = _tiny_vlm_language_model()
+    mx.random.seed(33)
+    prompts = [mx.random.randint(0, 64, (n,)).tolist() for n in (300, 900, 1500)]
+    draft = mx.random.randint(0, 64, (3, verify_len))
+
+    def prefill(prompt):
+        caches = [
+            TurboQuantKVCache(bits=BITS) if type(c).__name__ == "KVCache" else c
+            for c in model.make_cache()
+        ]
+        model(mx.array(prompt)[None], cache=caches)
+        return caches
+
+    rows = [prefill(p) for p in prompts]
+    refs = [
+        _logits(model(draft[i : i + 1], cache=prefill(prompts[i])))[0]
+        for i in range(3)
+    ]
+    batch = []
+    for layer in range(len(rows[0])):
+        group = [r[layer] for r in rows]
+        cls = (
+            BatchTurboQuantKVCache
+            if isinstance(group[0], TurboQuantKVCache)
+            else type(group[0])
+        )
+        batch.append(cls.merge(group))
+
+    calls = []
+    real = tqa._per_row_batched_attention
+
+    def spy(*args, **kwargs):
+        calls.append(args[1].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tqa, "_per_row_batched_attention", spy)
+    out = _logits(model(draft, cache=batch, speculative_verify=True))
+    mx.eval(out)
+
+    n_tq_layers = sum(isinstance(c, BatchTurboQuantKVCache) for c in batch)
+    assert n_tq_layers > 0
+    assert len(calls) == n_tq_layers, (
+        "verify forward left the per-row path: "
+        f"{len(calls)} per-row calls for {n_tq_layers} TurboQuant layers"
+    )
+    for i in range(3):
+        assert _max_abs(out[i], refs[i]) < 5e-2
+
+
+def test_carried_own_mask_tag_is_scoped_to_prefix_slices_of_own_masks():
+    from omlx.turboquant_kv import carry_own_padding_mask, is_own_padding_mask
+
+    batch, rows, q, keys, values = _build([1200, 2400], 2)
+    own = batch._test_mask
+    total = own.shape[-1]
+
+    derived = own[..., :total]
+    assert derived is not own
+    assert not is_own_padding_mask(derived, 2, total, 2)
+    carry_own_padding_mask(own, derived)
+    assert is_own_padding_mask(derived, 2, total, 2)
+
+    # A truncated slice is a different mask: never tagged.
+    short = own[..., : total - 1]
+    carry_own_padding_mask(own, short)
+    assert not is_own_padding_mask(short, 2, total - 1, 2)
+    assert not is_own_padding_mask(short, 2, total, 2)
+
+    # A foreign source never lends its (absent) tag.
+    foreign = mx.array(own)
+    foreign_derived = foreign[..., :total]
+    carry_own_padding_mask(foreign, foreign_derived)
+    assert not is_own_padding_mask(foreign_derived, 2, total, 2)

@@ -1036,6 +1036,32 @@ def _patch_update_eval_policy() -> None:
     cls._omlx_multirow_eval_patched = True
 
 
+def _wrap_prepare_projected_qkv(q35_lang) -> None:
+    """Keep the cache's own-mask tag across mlx-vlm's per-layer mask slice.
+
+    ``Qwen3_5Attention._prepare_projected_qkv`` returns ``mask[..., :kv]``: a
+    new array object on every layer, so the identity tag ``make_mask`` left on
+    the model's mask would never match at the attention call and every batched
+    MTP verify would fall to the dequantize-once path.
+    """
+    from ..turboquant_kv import carry_own_padding_mask
+
+    cls = getattr(q35_lang, "Qwen3_5Attention", None)
+    original = getattr(cls, "_prepare_projected_qkv", None)
+    if original is None or getattr(original, "_omlx_carries_own_mask", False):
+        return
+
+    def prepare(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        src = kwargs["mask"] if "mask" in kwargs else (args[-1] if args else None)
+        if isinstance(src, mx.array) and isinstance(result[4], mx.array):
+            carry_own_padding_mask(src, result[4])
+        return result
+
+    prepare._omlx_carries_own_mask = True
+    cls._prepare_projected_qkv = prepare
+
+
 def _patch_vlm_target_verify_attention() -> None:
     """Make mlx-vlm's qwen3_5 MTP verify attention TurboQuant-safe.
 
@@ -1147,6 +1173,7 @@ def _patch_vlm_target_verify_attention() -> None:
             axis=2,
         )
 
+    _wrap_prepare_projected_qkv(q35_lang)
     q35_lang._qwen3_5_left_padded_attention = patched
     q35_lang._omlx_tq_target_verify_original = original
     q35_lang._omlx_tq_target_verify_patched = True

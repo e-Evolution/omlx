@@ -336,6 +336,27 @@ def mark_own_padding_mask(mask, n: int, phys: int, batch: int, window_size=None)
     _OWN_PADDING_MASKS[key] = (weakref.ref(mask, _forget), (n, phys, batch))
 
 
+def carry_own_padding_mask(src, dst) -> None:
+    """Tag ``dst`` as own when it is a full-width re-slice of the own mask ``src``.
+
+    mlx-vlm's attention layer hands the model's mask on as ``mask[..., :kv]``,
+    a new object per layer whose values are unchanged while ``kv`` covers every
+    column. A truncated slice (fewer columns) is a different mask and is never
+    tagged.
+    """
+    if dst is src or not isinstance(dst, mx.array) or not isinstance(src, mx.array):
+        return
+    entry = _OWN_PADDING_MASKS.get(id(src))
+    if entry is None or entry[0]() is not src:
+        return
+    if dst.ndim != src.ndim or dst.shape[:-1] != src.shape[:-1]:
+        return
+    if dst.shape[-1] != src.shape[-1]:
+        return
+    n, phys, batch = entry[1]
+    mark_own_padding_mask(dst, n, phys, batch)
+
+
 def is_own_padding_mask(mask, n: int, total: int, batch: int) -> bool:
     """True iff ``mask`` is a padding mask built for ``n`` rows ending at ``total``."""
     entry = _OWN_PADDING_MASKS.get(id(mask))
