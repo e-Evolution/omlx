@@ -285,9 +285,11 @@ def test_default_env_enables_d1_and_park(bfa):
         "OMLX_MEMORY_PRESSURE_PARK": "true",
         "OMLX_MLX_CACHE_LIMIT_GB": "16",
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000",
+        "OMLX_BATCHED_DECODE_HOLD_MAX_S": "120",
     }
     assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
     assert bfa.FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS == "200000"
+    assert bfa.FORK_BATCHED_DECODE_HOLD_MAX_S == "120"
 
 
 # ------------------------------------------------------------ updater patch

@@ -1771,6 +1771,11 @@ class SchedulerConfig:
     # single-row TurboQuant attention kernels, so it dequantizes the whole KV
     # every step; a held request decodes alone once the running one finishes.
     max_batched_decode_context_tokens: int = 0
+    # When that gate holds the queue head, later requests whose combined
+    # context still fits are admitted past it (backfill). Once the head has
+    # been held longer than this many seconds backfill stops so it cannot
+    # starve; 0 never backfills (strict head-of-line).
+    batched_decode_hold_max_s: float = 120.0
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -2124,6 +2129,12 @@ class Scheduler:
         self.prefilling: deque[Request] = deque()
         # Requests held by the batched-decode context gate (logged once each).
         self._batched_decode_held: set[str] = set()
+        # First monotonic time each gate-held request was held (aging clock).
+        self._batched_decode_held_since: dict[str, float] = {}
+        # Requests whose aging message was already logged.
+        self._batched_decode_aged: set[str] = set()
+        # Requests whose "Backfilling" message was already logged.
+        self._batched_decode_backfill_logged: set[str] = set()
         self._prefill_states: dict[str, _PrefillState] = {}
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
@@ -12478,22 +12489,38 @@ class Scheduler:
 
         Never holds when nothing is admitted, so the gate cannot deadlock:
         admitted rows finish regardless of the queue (park, abort and the
-        memory guard act on them, not on waiting requests). Waiting requests
-        keep FIFO order because the scan stops at the held head, and the head
-        is admitted as soon as the batch is empty, so none starves.
+        memory guard act on them, not on waiting requests), and the held
+        request is admitted as soon as the batch is empty. The scan may keep
+        going past a held request to backfill shorter ones that fit
+        (``_batched_decode_backfill_allowed``); aging bounds that so the held
+        request cannot starve.
         """
         limit = getattr(self.config, "max_batched_decode_context_tokens", 0)
         held = self._batched_decode_held
         if limit <= 0:
             held.clear()
+            self._batched_decode_held_since.clear()
+            self._batched_decode_aged.clear()
+            self._batched_decode_backfill_logged.clear()
             return False
         held.intersection_update(self.requests)
+        for tracked in (
+            self._batched_decode_held_since,
+            self._batched_decode_aged,
+            self._batched_decode_backfill_logged,
+        ):
+            for rid in [r for r in tracked if r not in self.requests]:
+                if isinstance(tracked, dict):
+                    del tracked[rid]
+                else:
+                    tracked.discard(rid)
         others = [*self.running.values(), *self.prefilling]
         combined = request.num_tokens + sum(r.num_tokens for r in others)
         if not others or combined <= limit:
             return False
         if request.request_id not in held:
             held.add(request.request_id)
+            self._batched_decode_held_since[request.request_id] = time.monotonic()
             logger.info(
                 "Holding %s from batched decode: combined context %d > limit %d "
                 "(single-row decode keeps fused kernels)",
@@ -12503,11 +12530,41 @@ class Scheduler:
             )
         return True
 
+    def _batched_decode_backfill_allowed(self, request: "Request") -> bool:
+        """Whether the scan may admit requests behind a gate-held ``request``.
+
+        EASY backfill: later requests whose combined context fits are admitted
+        past the held one, which keeps its place at the front. Backfill stops
+        once the held request has waited longer than
+        ``batched_decode_hold_max_s`` (it logs that once), so the rows already
+        running drain and the held request is admitted next instead of being
+        starved by a stream of shorter ones. 0 never backfills.
+        """
+        hold_max = getattr(self.config, "batched_decode_hold_max_s", 0.0)
+        if not hold_max or hold_max <= 0:
+            return False
+        since = self._batched_decode_held_since.get(request.request_id)
+        waited = 0.0 if since is None else time.monotonic() - since
+        if waited > hold_max:
+            if request.request_id not in self._batched_decode_aged:
+                self._batched_decode_aged.add(request.request_id)
+                logger.info(
+                    "Aging: %s held %d s, backfill paused",
+                    request.request_id,
+                    int(waited),
+                )
+            return False
+        return True
+
     def _batched_decode_gate_release(self, request: "Request") -> None:
         """Log once when a request held by the batched-decode gate is admitted."""
-        if request.request_id in self._batched_decode_held:
-            self._batched_decode_held.discard(request.request_id)
-            logger.info("Releasing %s to decode", request.request_id)
+        rid = request.request_id
+        self._batched_decode_held_since.pop(rid, None)
+        self._batched_decode_aged.discard(rid)
+        self._batched_decode_backfill_logged.discard(rid)
+        if rid in self._batched_decode_held:
+            self._batched_decode_held.discard(rid)
+            logger.info("Releasing %s to decode", rid)
 
     def _num_admitted_requests(self) -> int:
         """Return requests already occupying scheduler capacity."""
@@ -13008,6 +13065,8 @@ class Scheduler:
         batch_specprefill_status: bool | None = None
 
         self._park_resumed_this_pass = False
+        # Requests set aside by the batched-decode gate this pass (in ``held``).
+        gate_held_ids: list[str] = []
         while (
             self.waiting
             and self._num_admitted_requests() < self._effective_max_num_seqs()
@@ -13131,9 +13190,26 @@ class Scheduler:
                 continue
 
             if self._batched_decode_gate_holds(request):
-                # FIFO: nothing behind the head overtakes it. The admitted
-                # rows always finish, which empties the batch and admits it.
-                break
+                # The held request keeps its place at the front. While it is
+                # younger than batched_decode_hold_max_s the scan continues
+                # past it so shorter requests that still fit are admitted;
+                # after that (or with backfill off) nothing behind it
+                # overtakes it, the admitted rows finish and it is admitted.
+                if not self._batched_decode_backfill_allowed(request):
+                    break
+                held.append(self.waiting.popleft())
+                gate_held_ids.append(request.request_id)
+                continue
+            if (
+                gate_held_ids
+                and request.request_id not in self._batched_decode_backfill_logged
+            ):
+                self._batched_decode_backfill_logged.add(request.request_id)
+                logger.info(
+                    "Backfilling %s past held %s",
+                    request.request_id,
+                    gate_held_ids[0],
+                )
 
             request = self.waiting.popleft()
             self._batched_decode_gate_release(request)
