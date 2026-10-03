@@ -170,13 +170,11 @@ def test_patched_sdpa_array_mask_matches_single_row(new_len, monkeypatch):
 
 
 def test_foreign_array_mask_is_honored_not_replaced():
-    from omlx.turboquant_kv import mark_own_padding_mask
-
     batch, rows, q, keys, values = _build([1200, 2400], 1)
-    # The padding mask is recognised structurally (cache.make_mask leaves a
-    # signature for the step); a mask the cache did not build for this call
-    # carries none and must keep the masked path.
-    mark_own_padding_mask(0, 0, 0)
+    # The own padding mask is recognised by object identity (cache.make_mask
+    # tags the mask it builds); a mask the cache did not build carries no tag
+    # and must keep the masked path. (Adapted: the old test poisoned the
+    # process-global shape signature, which no longer exists.)
     mask = mx.ones((2, 1, 1, 2401), dtype=mx.bool_)  # attends the padding too
     out = _sdpa(batch, q, keys, values, mask)
     dk, dv = batch.dequantize(keys, values)
@@ -496,3 +494,119 @@ def test_force_ragged_b1_also_covers_plain_single_sequence_cache(
     else:
         ref = tqa._decode_multirow_attention(c, q, keys, values, SCALE)
     assert _max_abs(out, ref) < 3e-3
+
+
+# ---------------------------------------------------------------------------
+# T12a: routing gate — padded B>1 never reaches an unpadded-softmax path
+# ---------------------------------------------------------------------------
+
+
+def _masked_dense_ref(batch, q, keys, values, mask):
+    dk, dv = batch.dequantize(keys, values)
+    return mx.fast.scaled_dot_product_attention(
+        q, dk.astype(q.dtype), dv.astype(q.dtype), scale=SCALE, mask=mask
+    )
+
+
+def _row_causal_ref(row_state, q_row):
+    c, rk, rv = row_state
+    dk, dv = c.dequantize(keys_state=rk, values_state=rv)
+    return mx.fast.scaled_dot_product_attention(
+        q_row,
+        dk.astype(q_row.dtype),
+        dv.astype(q_row.dtype),
+        scale=SCALE,
+        mask="causal",
+    )
+
+
+@pytest.mark.parametrize("new_len", [16, 32])
+@pytest.mark.parametrize("own_mask", [False, True])
+def test_wide_l_padded_batch_matches_single_row_reference(new_len, own_mask):
+    # L above both the ragged (8) and the multirow (15) maxima: the padded
+    # rows must still attend only their own slice (T12a).
+    batch, rows, q, keys, values = _build([600, 1200, 1800], new_len)
+    mask = batch._test_mask if own_mask else None
+    out = _batched(batch, q, keys, values, mask=mask)
+    mx.eval(out)
+    assert out.shape == q.shape
+    for i, rs in enumerate(rows):
+        ref = _row_causal_ref(rs, q[i : i + 1])
+        diff = _max_abs(out[i : i + 1], ref)
+        assert diff < 2e-3, f"row {i} (len {[600, 1200, 1800][i]}) max|diff|={diff:.5f}"
+
+
+def test_wide_l_padded_short_row_norm_matches_reference():
+    batch, rows, q, keys, values = _build([300, 1800], 16)
+    out = _batched(batch, q, keys, values)
+    ref = _row_causal_ref(rows[0], q[0:1])
+    ratio = mx.linalg.norm(out[0:1].astype(mx.float32)) / mx.linalg.norm(
+        ref.astype(mx.float32)
+    )
+    assert ratio.item() == pytest.approx(1.0, abs=1e-2)
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+@pytest.mark.parametrize("entry", ["vlm", "sdpa"])
+def test_foreign_mask_with_own_mask_shape_is_honored(new_len, entry):
+    # A foreign boolean mask with exactly the shape of the cache's own mask
+    # (same rows, same columns, same batch) must not be mistaken for it.
+    batch, rows, q, keys, values = _build([1200, 2400], new_len)
+    own = batch._test_mask
+    total = own.shape[-1]
+    causal = mx.arange(total)[None, :] <= (total - new_len + mx.arange(new_len))[:, None]
+    # Causal only: unlike the own mask it attends the padding columns.
+    foreign = mx.broadcast_to(causal, own.shape)
+    assert not mx.array_equal(foreign, own).item()
+    if entry == "vlm":
+        out = _batched(batch, q, keys, values, mask=foreign)
+    else:
+        out = _sdpa(batch, q, keys, values, foreign)
+    ref = _masked_dense_ref(batch, q, keys, values, foreign)
+    assert _max_abs(out, ref) < 2e-3
+
+
+def test_own_mask_object_is_still_recognised():
+    from omlx.turboquant_kv import is_own_padding_mask
+
+    batch, rows, q, keys, values = _build([1200, 2400], 2)
+    total = 2400 + 2
+    assert is_own_padding_mask(batch._test_mask, 2, total, 2)
+    assert not is_own_padding_mask(mx.array(batch._test_mask), 2, total, 2)
+
+
+def test_dense_path_honors_explicit_array_mask():
+    from mlx_lm.models.cache import BatchKVCache
+
+    cache = BatchKVCache([5, 0])
+    mx.random.seed(21)
+    k = mx.random.normal((2, N_KV, 40, D)).astype(mx.float16)
+    v = mx.random.normal((2, N_KV, 40, D)).astype(mx.float16)
+    keys, values = cache.update_and_fetch(k, v)
+    q = mx.random.normal((2, N_Q, 1, D)).astype(mx.float16)
+    mask = mx.ones((2, 1, 1, 40), dtype=mx.bool_)  # attends the padding too
+    out = q35_lang._qwen3_5_left_padded_attention(
+        q, keys, values, cache=cache, scale=SCALE, mask=mask
+    )
+    ref = mx.fast.scaled_dot_product_attention(
+        q, keys, values, scale=SCALE, mask=mask
+    )
+    assert _max_abs(out, ref) < 2e-3
+
+
+def test_dense_path_without_mask_still_takes_per_row_slices():
+    from mlx_lm.models.cache import BatchKVCache
+
+    cache = BatchKVCache([5, 0])
+    mx.random.seed(22)
+    k = mx.random.normal((2, N_KV, 40, D)).astype(mx.float16)
+    v = mx.random.normal((2, N_KV, 40, D)).astype(mx.float16)
+    keys, values = cache.update_and_fetch(k, v)
+    q = mx.random.normal((2, N_Q, 1, D)).astype(mx.float16)
+    out = q35_lang._qwen3_5_left_padded_attention(
+        q, keys, values, cache=cache, scale=SCALE, mask=None
+    )
+    ref0 = mx.fast.scaled_dot_product_attention(
+        q[0:1], keys[0:1, :, 5:], values[0:1, :, 5:], scale=SCALE
+    )
+    assert _max_abs(out[0:1], ref0) < 2e-3
