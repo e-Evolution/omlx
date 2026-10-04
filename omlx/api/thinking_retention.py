@@ -32,8 +32,15 @@ its bare stripped form while ``preserve_thinking`` is on).
 The module is inert (``took_control`` False, messages returned unchanged) when
 it is disabled, when no non-query message and no guard strip is involved, and
 when no assistant turn carries reasoning.  That makes disabled and unaffected
-conversations render byte-for-byte as before.  ``took_control`` is monotone in
-the history prefix, so a conversation switches rendering mode at most once.
+conversations render byte-for-byte as before.
+
+Invariant: ``took_control`` is a monotone function of the history prefix, so a
+conversation switches rendering mode at most once.  Exact tokenization only
+runs on the live tail (after the last real user message); older loops are
+judged by a cheap deterministic proxy, ``ceil(chars / 2)``, which never
+underestimates tokens, replayed with the same boundary rules.  If any earlier
+loop could have exceeded the guard, takeover stays on even after a new real
+user message moves that loop out of the tail.
 """
 
 from __future__ import annotations
@@ -131,6 +138,11 @@ def _reasoning_text(msg: dict) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _proxy_tokens(text: str) -> int:
+    """Cheap token upper bound: never below the word count or ``chars / 2``."""
+    return math.ceil(len(text) / 2.0)
+
+
 def _replay(
     messages: list[dict],
     count_tokens: Callable[[str], int],
@@ -142,7 +154,9 @@ def _replay(
     Assistant turns before ``count_from`` are not tokenized: the caller passes
     the index of the last real user message, which strips everything before it
     regardless of size.  Only the final boundary is consumed by
-    ``apply_thinking_retention``, so skipping them cannot change the outcome.
+    ``apply_thinking_retention``, so skipping them cannot change the boundary.
+    They are still sized with ``_proxy_tokens`` so that ``guard_stripped``
+    (which feeds ``took_control``) stays monotone in the history prefix.
 
     Returns ``(boundaries, has_reasoning, has_non_query, guard_stripped)``,
     where ``boundaries[i]`` is the strip boundary after processing message
@@ -169,9 +183,9 @@ def _replay(
             if text.strip():
                 has_reasoning = True
                 if i < count_from:
-                    boundaries.append(boundary)
-                    continue
-                tokens = int(count_tokens(text))
+                    tokens = _proxy_tokens(text)
+                else:
+                    tokens = int(count_tokens(text))
                 retained += tokens
                 if retained > guard_tokens:
                     if live_reasoning_turns:
