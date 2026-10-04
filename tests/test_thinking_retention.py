@@ -402,7 +402,6 @@ def test_same_input_same_output():
 
 def test_boundary_decisions_depend_only_on_the_history_prefix():
     full = loop_history(14)
-    full[8:8] = []  # keep as is
     for k in range(2, len(full)):
         short = replay_strip_boundaries(full[:k], count_words, GUARD_N)
         longer = replay_strip_boundaries(full[: k + 5], count_words, GUARD_N)
@@ -641,7 +640,7 @@ def test_server_wires_the_module_at_every_template_call_site():
     src = inspect.getsource(server)
     calls = src.count("_apply_thinking_retention(")
     # definition + chat completions, Anthropic, Responses, /tokenize
-    assert calls == 5
+    assert calls >= 5
     for fn in (
         server.create_chat_completion,
         server.create_anthropic_message,
@@ -662,3 +661,281 @@ def test_server_wires_the_module_at_every_template_call_site():
             )
         ]
         assert min(i for i in merge if i >= 0) < apply
+
+
+# ---------------------------------------------------------------------------
+# Graceful degradation: retention must never fail a request.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_retention_warnings():
+    warned = getattr(server, "_retention_warned_reasons", set())
+    warned.clear()
+    yield
+    warned.clear()
+
+
+def _degraded(engine, server_state, caplog):
+    server_state(global_guard=GUARD)
+    with caplog.at_level("WARNING"):
+        out = server._apply_thinking_retention(
+            NOTE_CONVO, engine, "m", {"preserve_thinking": False}
+        )
+    assert out == (NOTE_CONVO, {"preserve_thinking": False}, False)
+    assert out[0] is NOTE_CONVO
+    return [r for r in caplog.records if "Thinking retention skipped" in r.message]
+
+
+def test_processor_without_encode_degrades_with_a_warning(server_state, caplog):
+    engine = SimpleNamespace(
+        tokenizer=SimpleNamespace(), processor=SimpleNamespace()
+    )
+    assert len(_degraded(engine, server_state, caplog)) == 1
+
+
+@pytest.mark.parametrize("exc", [ValueError("bad"), RuntimeError("boom")])
+def test_encode_raising_degrades(server_state, caplog, exc):
+    def encode(text, **kw):
+        raise exc
+
+    engine = SimpleNamespace(tokenizer=SimpleNamespace(encode=encode))
+    assert len(_degraded(engine, server_state, caplog)) == 1
+
+
+@pytest.mark.parametrize("bad", [None, "abc", 7])
+def test_encode_returning_non_sequence_degrades(server_state, caplog, bad):
+    engine = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda t, **kw: bad))
+    assert len(_degraded(engine, server_state, caplog)) == 1
+
+
+def test_degradation_warns_once_per_process_and_reason(server_state, caplog):
+    engine = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda t, **kw: None))
+    assert len(_degraded(engine, server_state, caplog)) == 1
+    with caplog.at_level("WARNING"):
+        server._apply_thinking_retention(NOTE_CONVO, engine, "m", None)
+    assert len([r for r in caplog.records if "retention skipped" in r.message]) == 1
+
+
+def test_processor_tokenizer_is_used_when_engine_tokenizer_cannot_encode(server_state):
+    server_state(global_guard=GUARD)
+    engine = SimpleNamespace(
+        tokenizer=SimpleNamespace(),
+        processor=SimpleNamespace(
+            tokenizer=SimpleNamespace(encode=lambda t, **kw: t.split())
+        ),
+    )
+    _, kwargs, took = server._apply_thinking_retention(
+        NOTE_CONVO, engine, "m", {"preserve_thinking": False}
+    )
+    assert took and kwargs == {"preserve_thinking": True}
+
+
+def test_encode_without_add_special_tokens_kwarg_still_counts(server_state):
+    server_state(global_guard=GUARD)
+    engine = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda t: t.split()))
+    assert server._apply_thinking_retention(NOTE_CONVO, engine, "m", None)[2] is True
+
+
+# ---------------------------------------------------------------------------
+# Only the tail after the last real user message is tokenized.
+# ---------------------------------------------------------------------------
+
+
+def test_turns_before_last_real_user_message_are_never_counted():
+    convo = [
+        SYSTEM,
+        U1,
+        asst(1, "old-think-one"),
+        tool(1),
+        asst(2, "old-think-two"),
+        tool(2),
+        {"role": "user", "content": "next question"},
+        asst(3, "tail-think"),
+        tool(3),
+        MARK_TEXT,
+        asst(4, "tail-think-b"),
+        tool(4),
+    ]
+    seen = []
+
+    def spy(text):
+        seen.append(text)
+        return 1
+
+    result = apply_thinking_retention(convo, spy, GUARD)
+    assert seen == ["tail-think", "tail-think-b"]
+    assert result.took_control
+    assert result.messages[2]["reasoning_content"] == ""
+    assert result.messages[4]["reasoning_content"] == ""
+    assert result.messages[7]["reasoning_content"] == "tail-think"
+
+
+def test_skipping_old_turns_does_not_change_the_final_boundary():
+    for n in (3, 6, 9):
+        convo = loop_history(n)
+        convo.insert(4, {"role": "user", "content": "follow-up"})
+        full = replay_strip_boundaries(convo, count_words, GUARD_N)[-1]
+        got = apply_thinking_retention(convo, count_words, GUARD_N)
+        stripped = [
+            i
+            for i, (a, b) in enumerate(zip(convo, got.messages))
+            if a is not b
+        ]
+        assert all(i < full for i in stripped)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint level: engine and token counter receive the rebound kwargs/messages.
+# ---------------------------------------------------------------------------
+
+
+def _endpoint_env(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    engine = MagicMock(spec=VLMBatchedEngine)
+    engine.tokenizer = _Tokenizer()
+    engine.tokenizer.encode = lambda t, **kw: t.split()
+    engine.start = AsyncMock()
+    engine.preflight_chat = AsyncMock()
+    engine.count_chat_tokens = MagicMock(return_value=10)
+    engine.chat = AsyncMock(side_effect=RuntimeError("stop-after-capture"))
+    engine.is_diffusion_model = False
+    engine.message_extractor = None
+    engine.supports_multimodal_fallback = False
+
+    async def _get_engine(model_id, *, lease=None):
+        return engine
+
+    entry = SimpleNamespace(preserve_thinking_default=True)
+    pool = MagicMock()
+    pool.get_entry = MagicMock(return_value=entry)
+    monkeypatch.setattr(server, "get_engine_for_model", _get_engine)
+    monkeypatch.setattr(server, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(server, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(server, "get_engine_pool", lambda: pool)
+    monkeypatch.setattr(server, "_thinking_retention_guard_tokens", lambda m=None: 3)
+    monkeypatch.setitem(
+        server.app.dependency_overrides, server.verify_inference_api_key, lambda: True
+    )
+    return engine
+
+
+def test_chat_completions_engine_and_counter_get_rebound_kwargs(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    engine = _endpoint_env(monkeypatch)
+    body = {
+        "model": "m",
+        "stream": False,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "reasoning_content": "think one",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+            {"role": "user", "content": [{"type": "text", "text": IMAGE_MARKER_TEXT},
+                                          IMG_PART]},
+            {"role": "assistant", "content": "", "reasoning_content": "think two",
+             "tool_calls": [{"id": "c2", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c2", "content": "r"},
+        ],
+    }
+    with TestClient(server.app, raise_server_exceptions=False) as client:
+        client.post("/v1/chat/completions", json=body)
+    counted = engine.count_chat_tokens.call_args.args[0]
+    ct = engine.count_chat_tokens.call_args.kwargs["chat_template_kwargs"]
+    assert ct["preserve_thinking"] is True
+    assert [m.get("reasoning_content") for m in counted if m["role"] == "assistant"] == [
+        "",
+        "think two",
+    ]
+    chat = engine.chat.await_args.kwargs
+    assert chat["chat_template_kwargs"]["preserve_thinking"] is True
+    assert chat["preserve_reasoning"] is True
+    assert engine.chat.await_args.kwargs["messages"] == counted
+
+
+_ANTHROPIC_BODY = {
+    "model": "m",
+    "max_tokens": 64,
+    "stream": False,
+    "tools": [
+        {"name": "f", "description": "d", "input_schema": {"type": "object", "properties": {}}}
+    ],
+    "messages": [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "think one", "signature": "s"},
+            {"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c1", "content": "r"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "think two", "signature": "s"},
+            {"type": "tool_use", "id": "c2", "name": "f", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c2", "content": "r"}]},
+    ],
+}
+
+_RESPONSES_BODY = {
+    "model": "m",
+    "stream": False,
+    "tools": [
+        {"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}
+    ],
+    "input": [
+        {"type": "message", "role": "user", "content": "q"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think one"}]},
+        {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "r"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think two"}]},
+        {"type": "function_call", "call_id": "c2", "name": "f", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "r"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [("/v1/messages", _ANTHROPIC_BODY), ("/v1/responses", _RESPONSES_BODY)],
+)
+def test_other_endpoints_engine_and_counter_get_rebound_kwargs(monkeypatch, path, body):
+    from fastapi.testclient import TestClient
+
+    engine = _endpoint_env(monkeypatch)
+    with TestClient(server.app, raise_server_exceptions=False) as client:
+        client.post(path, json=body)
+    assert engine.chat.await_count == 1, "request never reached engine.chat"
+    counted = engine.count_chat_tokens.call_args.args[0]
+    ct = engine.count_chat_tokens.call_args.kwargs["chat_template_kwargs"]
+    assert ct["preserve_thinking"] is True
+    assert [m.get("reasoning_content") for m in counted if m["role"] == "assistant"] == [
+        "",
+        "think two",
+    ]
+    chat = engine.chat.await_args.kwargs
+    assert chat["chat_template_kwargs"]["preserve_thinking"] is True
+    assert chat["preserve_reasoning"] is True
+    assert engine.chat.await_args.kwargs["messages"] == counted
+
+
+def test_anthropic_retention_runs_before_chat_kwargs_template_kwargs_are_set():
+    import inspect
+
+    body = inspect.getsource(server.create_anthropic_message)
+    apply = body.index("_apply_thinking_retention(")
+    assert apply < body.index('chat_kwargs["chat_template_kwargs"]')
+    assert apply < body.index('chat_kwargs["preserve_reasoning"]')

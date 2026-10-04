@@ -135,8 +135,14 @@ def _replay(
     messages: list[dict],
     count_tokens: Callable[[str], int],
     guard_tokens: int,
+    count_from: int = 0,
 ) -> tuple[list[int], bool, bool, bool]:
     """Replay the history in order.
+
+    Assistant turns before ``count_from`` are not tokenized: the caller passes
+    the index of the last real user message, which strips everything before it
+    regardless of size.  Only the final boundary is consumed by
+    ``apply_thinking_retention``, so skipping them cannot change the outcome.
 
     Returns ``(boundaries, has_reasoning, has_non_query, guard_stripped)``,
     where ``boundaries[i]`` is the strip boundary after processing message
@@ -162,6 +168,9 @@ def _replay(
             text = _reasoning_text(msg)
             if text.strip():
                 has_reasoning = True
+                if i < count_from:
+                    boundaries.append(boundary)
+                    continue
                 tokens = int(count_tokens(text))
                 retained += tokens
                 if retained > guard_tokens:
@@ -198,8 +207,18 @@ def apply_thinking_retention(
     guard = normalize_guard_tokens(guard_tokens)
     if guard is None or not messages:
         return ThinkingRetentionResult(messages)
+    last_real_user = 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "user"
+            and not is_non_query_user_message(messages, i)
+        ):
+            last_real_user = i
+            break
     boundaries, has_reasoning, has_non_query, guard_stripped = _replay(
-        messages, count_tokens, guard
+        messages, count_tokens, guard, count_from=last_real_user
     )
     if not has_reasoning or not (has_non_query or guard_stripped):
         return ThinkingRetentionResult(messages)
