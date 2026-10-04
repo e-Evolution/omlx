@@ -1968,13 +1968,19 @@ def _thinking_retention_guard_tokens(model_id: str | None = None) -> int | None:
 _retention_warned_reasons: set[str] = set()
 
 
-def _warn_retention_degraded(reason: str) -> None:
-    """Log a retention degradation once per process per reason."""
-    if reason in _retention_warned_reasons:
+def _warn_retention_degraded(category: str, detail: str = "") -> None:
+    """Log a retention degradation once per process per stable category.
+
+    ``category`` (e.g. ``encode-raised:ValueError``) is the dedup key; the free
+    text ``detail`` is only logged so the set stays bounded.
+    """
+    if category in _retention_warned_reasons:
         return
-    _retention_warned_reasons.add(reason)
+    _retention_warned_reasons.add(category)
     logger.warning(
-        "Thinking retention skipped, request continues unchanged: %s", reason
+        "Thinking retention skipped, request continues unchanged: %s%s",
+        category,
+        f" ({detail})" if detail else "",
     )
 
 
@@ -2047,11 +2053,11 @@ def _apply_thinking_retention(
     try:
         counter = _engine_token_counter(engine)
         if counter is None:
-            _warn_retention_degraded("engine exposes no tokenizer with encode()")
+            _warn_retention_degraded("no-encoder", "engine exposes no tokenizer with encode()")
             return messages, chat_template_kwargs, False
         result = apply_thinking_retention(messages, counter, guard)
     except Exception as e:  # noqa: BLE001 - retention must never fail a request
-        _warn_retention_degraded(f"{type(e).__name__}: {e}")
+        _warn_retention_degraded(f"encode-raised:{type(e).__name__}", str(e))
         return messages, chat_template_kwargs, False
     if not result.took_control:
         return messages, chat_template_kwargs, False

@@ -929,3 +929,108 @@ def test_anthropic_retention_runs_before_chat_kwargs_template_kwargs_are_set():
     apply = body.index("_apply_thinking_retention(")
     assert apply < body.index('chat_kwargs["chat_template_kwargs"]')
     assert apply < body.index('chat_kwargs["preserve_reasoning"]')
+
+
+# ---------------------------------------------------------------------------
+# took_control is monotone in the history prefix (one rendering-mode switch).
+# ---------------------------------------------------------------------------
+
+
+def _took(convo, counter=count_words, guard=GUARD_N):
+    return apply_thinking_retention(convo, counter, guard).took_control
+
+
+def _assert_monotone(convo, counter=count_words, guard=GUARD_N):
+    seen = False
+    for k in range(1, len(convo) + 1):
+        took = _took(convo[:k], counter, guard)
+        assert took or not seen, f"took_control flipped back at prefix {k}"
+        seen = seen or took
+
+
+def test_text_only_takeover_survives_a_later_small_loop():
+    big = [asst(i, words(f"a{i}_", 10)) for i in range(1, 9)]
+    convo = [SYSTEM, U1]
+    for a in big:
+        convo += [a, tool(int(a["tool_calls"][0]["id"][1:]))]
+    convo += [U2, asst(20, "tiny"), tool(20), {"role": "user", "content": "more"},
+              asst(21, "small"), tool(21)]
+    first = next(
+        k for k in range(1, len(convo) + 1) if _took(convo[:k])
+    )
+    assert first <= 2 + 2 * 8  # took control inside loop 1
+    for k in range(first, len(convo) + 1):
+        assert _took(convo[:k]), f"flipped back at prefix {k}"
+
+
+def _convo_mixed():
+    c = [SYSTEM, U1]
+    for i in range(1, 8):
+        c += [asst(i, words(f"x{i}_", 10)), tool(i)]
+    c += [MARK_TEXT, U2, asst(8, "s"), tool(8), UPDATE,
+          {"role": "user", "content": "q3"}, asst(9, words("y_", 40)), tool(9),
+          MARK_VLM, asst(10, "z"), tool(10), final("done")]
+    return c
+
+
+def _convo_notes_only():
+    c = [SYSTEM, U1, asst(1, "a b"), tool(1), U2]
+    for i in range(2, 9):
+        c += [asst(i, words(f"n{i}_", 9)), tool(i)]
+    c += [{"role": "user", "content": "q"}, asst(9, "t"), tool(9)]
+    return c
+
+
+def _convo_text_only():
+    c = [SYSTEM, U1]
+    for i in range(1, 8):
+        c += [asst(i, words(f"p{i}_", 10)), tool(i)]
+    c += [U2, asst(8, "x"), tool(8), {"role": "user", "content": "q"},
+          asst(9, "y"), tool(9), final("end")]
+    return c
+
+
+def _convo_markers_then_big():
+    c = [SYSTEM, U1, asst(1, "a"), tool(1), MARK_TEXT, U2]
+    for i in range(2, 6):
+        c += [asst(i, words(f"m{i}_", 30)), tool(i), MARK_VLM]
+    c += [{"role": "user", "content": "q"}, asst(9, "t"), tool(9)]
+    return c
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_convo_mixed, _convo_notes_only, _convo_text_only, _convo_markers_then_big],
+)
+def test_took_control_is_monotone_over_all_prefixes(build):
+    _assert_monotone(build())
+
+
+def test_exact_tokenization_still_only_on_the_tail_with_head_proxy():
+    convo = [SYSTEM, U1]
+    for i in range(1, 9):
+        convo += [asst(i, words(f"h{i}_", 10)), tool(i)]
+    convo += [U2, asst(20, "tail-a"), tool(20), asst(21, "tail-b"), tool(21)]
+    seen = []
+
+    def spy(text):
+        seen.append(text)
+        return 1
+
+    result = apply_thinking_retention(convo, spy, GUARD_N)
+    assert seen == ["tail-a", "tail-b"]
+    assert result.took_control  # head loop was oversized by the char proxy
+
+
+def test_warned_reasons_are_bounded_by_category(server_state, caplog):
+    server_state(global_guard=GUARD)
+    for n in range(50):
+        def encode(text, _n=n, **kw):
+            raise ValueError(f"distinct message {_n}")
+
+        engine = SimpleNamespace(tokenizer=SimpleNamespace(encode=encode))
+        with caplog.at_level("WARNING"):
+            server._apply_thinking_retention(NOTE_CONVO, engine, "m", None)
+    assert len(server._retention_warned_reasons) == 1
+    assert "encode-raised:ValueError" in server._retention_warned_reasons
+    assert any("distinct message 0" in r.message for r in caplog.records)
