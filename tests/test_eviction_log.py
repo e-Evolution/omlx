@@ -125,3 +125,53 @@ def test_manager_close_flushes_pending_summary(tmp_path, caplog):
     ]
     assert len(finals) == 1
     assert "total_blocks=3" in finals[0]
+
+
+def _mgr_with_dirty_entry(tmp_path):
+    from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+    mgr = PagedSSDCacheManager(cache_dir=tmp_path, max_size_bytes=10**9)
+    mgr._hot_cache_enabled = True
+    mgr._hot_cache = {b"h1": {"dirty": True, "block_metadata": None}}
+    return mgr
+
+
+def test_close_survives_failing_summary_flush(tmp_path, caplog):
+    mgr = _mgr_with_dirty_entry(tmp_path)
+
+    class _Boom:
+        def flush(self):
+            raise RuntimeError("flush boom")
+
+    mgr._eviction_summary = _Boom()
+    calls = []
+    mgr._enqueue_ssd_write = lambda h, e, blocking=False: calls.append(h) or True
+    with caplog.at_level(logging.WARNING, logger="omlx.cache.paged_ssd_cache"):
+        mgr.close()  # must not raise
+    assert calls == [b"h1"]
+    assert any(r.levelno == logging.WARNING and "flush boom" in r.getMessage()
+               for r in caplog.records)
+    assert mgr._hot_cache == {}
+
+
+def test_evictions_during_shutdown_flush_are_summarized(tmp_path, caplog):
+    mgr = _mgr_with_dirty_entry(tmp_path)
+    mgr._eviction_summary = EvictionSummary(interval_s=3600.0, clock=_Clock())
+    f0 = tmp_path / "first.safetensors"
+    f0.write_bytes(b"x" * 10)
+    mgr._unlink_evicted(_Meta(f0, 10))  # emits immediately
+
+    def _enqueue(h, e, blocking=False):
+        f = tmp_path / "during.safetensors"
+        f.write_bytes(b"x" * 10)
+        mgr._unlink_evicted(_Meta(f, 10))  # batched, pending
+        return True
+
+    mgr._enqueue_ssd_write = _enqueue
+    with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+        mgr.close()
+    assert any(
+        r.getMessage().startswith("SSD cache evicted: blocks=1 bytes=10")
+        and "total_blocks=2" in r.getMessage()
+        for r in caplog.records
+    )
