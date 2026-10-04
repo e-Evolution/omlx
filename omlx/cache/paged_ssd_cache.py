@@ -40,6 +40,7 @@ import numpy as np
 from omlx.utils.formatting import format_bytes
 
 from ..utils.fatal import fatal_exit
+from .eviction_log import EvictionSummary
 from .interface import CacheManager
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
@@ -1806,6 +1807,7 @@ class PagedSSDCacheManager(CacheManager):
         self._last_disk_pressure_warn: float = 0.0
         self._last_promotion_failure_warn: float = 0.0
 
+        self._eviction_summary = EvictionSummary()
         # Statistics
         self._stats = {
             "saves": 0,
@@ -4965,6 +4967,24 @@ class PagedSSDCacheManager(CacheManager):
         )
         return freed
 
+    def _log_eviction(self, metadata: Any) -> None:
+        """DEBUG per event, plus a rate-limited INFO summary (<= 1 line/60 s)."""
+        is_sidecar = isinstance(metadata, GDNCheckpointMetadata)
+        size = int(getattr(metadata, "file_size", 0) or 0)
+        logger.debug(
+            "Evicted SSD %s %s (%d bytes)",
+            "sidecar" if is_sidecar else "block",
+            getattr(metadata, "file_path", "?"),
+            size,
+        )
+        line = self._eviction_summary.record(
+            blocks=0 if is_sidecar else 1,
+            nbytes=size,
+            sidecars=1 if is_sidecar else 0,
+        )
+        if line:
+            logger.info(line)
+
     def _unlink_evicted(
         self,
         metadata: Any,
@@ -4988,6 +5008,7 @@ class PagedSSDCacheManager(CacheManager):
             else:
                 metadata.file_path.unlink(missing_ok=True)
             self._stats["evictions"] += 1
+            self._log_eviction(metadata)
         except OSError as e:
             restore_index = source_index or self._index
             # Restore the index entry so total_size matches disk reality.

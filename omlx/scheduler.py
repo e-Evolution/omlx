@@ -55,6 +55,7 @@ from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_s
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
+from .cache.restore_outcome import RestoreOutcomeCounter, classify_restore_outcome
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
 from .exceptions import (
@@ -81,6 +82,7 @@ from .prefill_boundaries import (
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .ttft_breakdown import TtftTracker
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     MTPProcessorContractError,
@@ -2127,6 +2129,9 @@ class Scheduler:
         # Chunked prefill queue: requests whose prefill spans multiple steps.
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
+        # Prefix-cache restore outcome counters and per-request TTFT stages.
+        self._restore_outcomes = RestoreOutcomeCounter()
+        self._ttft_tracker = TtftTracker()
         # Requests held by the batched-decode context gate (logged once each).
         self._batched_decode_held: set[str] = set()
         # First monotonic time each gate-held request was held (aging clock).
@@ -10243,6 +10248,52 @@ class Scheduler:
     # prompt (i.e. the cache was relevant but could not cover the request).
     _REPREFILL_INFO_MIN_TOKENS = 4096
 
+    def _get_ttft_tracker(self) -> TtftTracker:
+        tracker = getattr(self, "_ttft_tracker", None)
+        if tracker is None:
+            tracker = self._ttft_tracker = TtftTracker()
+        return tracker
+
+    def _log_ttft_breakdown(self, request: Request, now: float) -> None:
+        """One INFO line at the request's first response (see TtftTracker)."""
+        started = request.generation_started_at
+        if started is None:
+            return
+        line = self._get_ttft_tracker().first_token_line(
+            request.request_id,
+            generation_started_at=started,
+            now=now,
+            prompt_tokens=request.num_prompt_tokens,
+            cached_tokens=request.cached_tokens or 0,
+        )
+        if line:
+            logger.info(line)
+
+    def _record_restore_outcome(
+        self,
+        request: Request,
+        cached: int,
+        common_prefix: int | None,
+        stored_len: int | None,
+        block: int,
+        has_media_keys: bool,
+    ) -> str:
+        """Classify this request's restore outcome and bump the running counter.
+
+        Constructor-bypassing callers (tests) get the counter lazily.
+        """
+        outcome = classify_restore_outcome(
+            cached=cached,
+            common_prefix=common_prefix,
+            stored_len=stored_len,
+            block=block,
+            has_media_keys=has_media_keys,
+        )
+        if not hasattr(self, "_restore_outcomes"):
+            self._restore_outcomes = RestoreOutcomeCounter()
+        self._restore_outcomes.record(outcome)
+        return outcome
+
     def _log_prefix_divergence(self, request: Request) -> None:
         """Prefix-cache miss diagnostics (issues #1003, #2333, #2349).
 
@@ -10267,9 +10318,14 @@ class Scheduler:
             "block_size": block,
             "matched_blocks": cached // block,
         }
+        has_media_keys = bool(getattr(request, "vlm_extra_keys_for_cache", None))
         if not prompt:
+            outcome = self._record_restore_outcome(
+                request, cached, None, None, block, has_media_keys
+            )
             self._last_prefix_cache_lookup = {
                 **base_observation,
+                "outcome": outcome,
                 "reason": "empty_prompt",
                 "closest_request_id": None,
                 "common_prefix_tokens": 0,
@@ -10278,8 +10334,12 @@ class Scheduler:
             }
             return
         if not self._cache_probe_seqs:
+            outcome = self._record_restore_outcome(
+                request, cached, None, None, block, has_media_keys
+            )
             self._last_prefix_cache_lookup = {
                 **base_observation,
+                "outcome": outcome,
                 "reason": "no_recent_store_probe",
                 "closest_request_id": None,
                 "common_prefix_tokens": 0,
@@ -10296,8 +10356,12 @@ class Scheduler:
             return
         reusable = min(len(prompt), len(best_seq))
         reprefill = len(prompt) - cached
+        outcome = self._record_restore_outcome(
+            request, cached, best_p, len(best_seq), block, has_media_keys
+        )
         self._last_prefix_cache_lookup = {
             **base_observation,
+            "outcome": outcome,
             "reason": "closest_recent_store",
             "closest_request_id": best_id,
             "common_prefix_tokens": best_p,
@@ -10308,7 +10372,7 @@ class Scheduler:
             logger.info(
                 "prefix cache: request %s re-prefills %d of %d tokens "
                 "(reused %d); closest stored sequence %s shares the first "
-                "%d of %d comparable tokens before diverging",
+                "%d of %d comparable tokens before diverging; outcome=%s",
                 request.request_id,
                 reprefill,
                 len(prompt),
@@ -10316,6 +10380,7 @@ class Scheduler:
                 best_id,
                 best_p,
                 reusable,
+                outcome,
             )
         if not logger.isEnabledFor(logging.DEBUG):
             return
@@ -10580,6 +10645,7 @@ class Scheduler:
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
+        restore_started_at = time.monotonic()
 
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
         minimum_prefix = (
@@ -10814,6 +10880,18 @@ class Scheduler:
         # sequences: one INFO line for large re-prefills (#2333/#2349
         # triage), decoded token context at DEBUG (issue #1003).
         self._log_prefix_divergence(request)
+        lookup = getattr(self, "_last_prefix_cache_lookup", None) or {}
+        self._get_ttft_tracker().mark_restore(
+            request.request_id,
+            arrival=request.arrival_time,
+            restore_start=restore_started_at,
+            restore_end=time.monotonic(),
+            outcome=(
+                lookup.get("outcome", "unknown")
+                if lookup.get("request_id") == request.request_id
+                else "unknown"
+            ),
+        )
 
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
@@ -13923,6 +14001,8 @@ class Scheduler:
 
             request.last_activity_at = step_now
             completion_tokens_before = request.num_output_tokens
+            if completion_tokens_before == 0:
+                self._log_ttft_breakdown(request, step_now)
 
             # Release VLM embeddings after first decode token (prefill is done)
             if request.vlm_inputs_embeds is not None:
@@ -15532,6 +15612,9 @@ class Scheduler:
             stats["ssd_cache"] = self.block_aware_cache.get_stats()
         if getattr(self.config, "memory_pressure_park", False) is True:
             stats["park"] = self.get_park_stats()
+        counter = getattr(self, "_restore_outcomes", None)
+        if counter is not None:
+            stats["cache_outcomes"] = counter.snapshot()
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

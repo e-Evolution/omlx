@@ -3276,6 +3276,7 @@ class TestSchedulerBoundarySnapshots:
             "reprefill_tokens": 4,
             "block_size": 4,
             "matched_blocks": 1,
+            "outcome": "block_aligned_divergence",
             "reason": "closest_recent_store",
             "closest_request_id": "stored-a",
             "common_prefix_tokens": 7,

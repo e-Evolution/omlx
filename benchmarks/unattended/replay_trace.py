@@ -47,11 +47,17 @@ LOG_UNAVAILABLE_WARNING = (
 LOG_FIELDS = (
     "divergence_position", "comparable_tokens", "log_reprefill_tokens", "restore_source",
     "holds", "agings", "aborts", "tool_parser_failures", "pool_gb_max",
+    "cache_outcome", "ttft_hold_s", "ttft_restore_s", "ttft_prefill_s",
+    "ttft_first_decode_s",
 )
 
 _RE_DIVERGE = re.compile(
     r"prefix cache: request \S+ re-prefills (\d+) of (\d+) tokens \(reused (\d+)\); "
     r"closest stored sequence \S+ shares the first (\d+) of (\d+) comparable tokens"
+)
+_RE_TTFT = re.compile(
+    r"TTFT breakdown: request=\S+ prompt_tokens=\d+ cached_tokens=\d+ cache=(\S+) "
+    r"hold_s=([\d.]+) restore_s=([\d.]+) prefill_s=([\d.]+) first_decode_s=([\d.]+)"
 )
 _RE_RESTORE_SRC = re.compile(r"Prefix cache restore for \S+: source=(\S+) cached=(\d+)")
 _RE_TOOL_FAIL = re.compile(r"tool parser failed|Tool call (?:start )?markers? found but parsing failed", re.I)
@@ -128,7 +134,13 @@ def parse_request_log(text: str) -> dict[str, Any]:
     parsed = bm.parse_server_log(text)
     div = _RE_DIVERGE.search(text)
     src = _RE_RESTORE_SRC.search(text)
+    ttft = _RE_TTFT.search(text)
     return {
+        "cache_outcome": ttft.group(1) if ttft else None,
+        "ttft_hold_s": float(ttft.group(2)) if ttft else None,
+        "ttft_restore_s": float(ttft.group(3)) if ttft else None,
+        "ttft_prefill_s": float(ttft.group(4)) if ttft else None,
+        "ttft_first_decode_s": float(ttft.group(5)) if ttft else None,
         "divergence_position": int(div.group(4)) if div else None,
         "comparable_tokens": int(div.group(5)) if div else None,
         "log_reprefill_tokens": int(div.group(1)) if div else None,
@@ -260,6 +272,17 @@ def reduce_results(
         "agings": logsum("agings"),
         "quality": quality,
     }
+    if log_available:
+        outcomes: dict[str, int] = {}
+        for r in rows:
+            if r.get("cache_outcome"):
+                outcomes[r["cache_outcome"]] = outcomes.get(r["cache_outcome"], 0) + 1
+        out["cache_outcomes"] = outcomes
+        for stage in ("hold", "restore", "prefill", "first_decode"):
+            vals = [r[f"ttft_{stage}_s"] for r in rows if r.get(f"ttft_{stage}_s") is not None]
+            out[f"ttft_{stage}_p50_s"] = percentile(vals, 50)
+    else:
+        out["cache_outcomes"] = None
     if mode == "full":  # reuse mode is non-streaming: its latency is wall time, not TTFT
         ttfts = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None]
         out["ttft_p50_s"] = percentile(ttfts, 50)
@@ -480,6 +503,16 @@ def render_markdown(summary: dict[str, Any], meta: dict[str, Any]) -> str:
         f"- peak memory {f(meta.get('peak_memory_gb'))} GB, holds {f(summary['holds'])}, agings {f(summary['agings'])}",
         f"- quality: {json.dumps(summary['quality'], sort_keys=True)}",
     ]
+    if summary.get("cache_outcomes"):
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(summary["cache_outcomes"].items()))
+        lines.append(f"- cache outcomes: {counts}")
+    stages = [
+        f"{st} {f(summary.get(f'ttft_{st}_p50_s'))} s"
+        for st in ("hold", "restore", "prefill", "first_decode")
+        if summary.get(f"ttft_{st}_p50_s") is not None
+    ]
+    if stages:
+        lines.append(f"- TTFT stage p50: {', '.join(stages)}")
     if not summary.get("log_available", True):
         lines.append("- log_available: false (log-derived fields are n/a)")
     lines += [
