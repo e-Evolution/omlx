@@ -607,3 +607,33 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     assert pool._engine_runtime_signature(
         "m", depth_3_off
     ) == pool._engine_runtime_signature("m", depth_8_off)
+
+
+@pytest.mark.asyncio
+async def test_mid_system_policy_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mid_system_policy="inline_note"),
+    )
+    assert settings.mid_system_policy == "inline_note"
+    assert result["settings"]["mid_system_policy"] == "inline_note"
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mid_system_policy=None)
+    )
+    assert settings.mid_system_policy is None
+
+
+@pytest.mark.asyncio
+async def test_mid_system_policy_rejects_unknown_value():
+    pool, _ = _failed_pool()
+    with pytest.raises(admin_routes.HTTPException, match="mid_system_policy"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(mid_system_policy="bogus"),
+        )

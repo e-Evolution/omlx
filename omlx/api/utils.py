@@ -287,6 +287,22 @@ def _extract_multimodal_content_list(content: list) -> list:
 _MERGEABLE_ROLES = {"user", "assistant"}
 _PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
 
+# Policies for non-leading system messages the chat template cannot render.
+MID_SYSTEM_POLICIES = ("strict", "user_note_safe", "inline_note")
+# Marker set on user-role messages synthesized from a mid-transcript system
+# update by the ``inline_note`` policy. It is a plain dict key, so it never
+# reaches the rendered prompt, and later passes (thinking retention) can use
+# it to tell these notes apart from real user queries.
+MID_SYSTEM_NOTE_KEY = "_omlx_mid_system_note"
+
+
+def normalize_mid_system_policy(value: Any) -> str | None:
+    """Return a valid mid-system policy name, or None when unrecognised."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return value if value in MID_SYSTEM_POLICIES else None
+
 # Match `role == "tool"` / `role == 'tool'` in a chat template.
 _TOOL_ROLE_CHECK_RE = re.compile(r"==\s*['\"]tool['\"]")
 
@@ -738,6 +754,49 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
     return rewritten
 
 
+def _format_inline_system_update(text: str) -> str:
+    return f"<system-update>\n{text}\n</system-update>"
+
+
+def _inline_mid_system_to_notes(messages: list[dict]) -> list[dict]:
+    """Render every non-leading system message in place as a user note.
+
+    Append-only by construction: each update becomes its own user-role message
+    at its transcript position, wrapped in a fixed ``<system-update>`` tag.
+    Nothing before it is rewritten, and it is never merged into the leading
+    system message, a tool/multimodal message or neighbouring user text, so a
+    later update can never mutate an earlier message.
+
+    Known remaining effect: templates that anchor thinking retention to the
+    last user message (Qwen3.x ``last_query_index``) treat such a note as a
+    query, so reasoning before it can still be stripped when
+    ``preserve_thinking`` is off. The note is tagged with
+    ``MID_SYSTEM_NOTE_KEY`` so a thinking-retention pass can exclude it.
+    """
+    rewritten: list[dict] = []
+    seen_non_system = False
+    for msg in messages:
+        if not _is_system_role(msg.get("role")):
+            rewritten.append(msg)
+            seen_non_system = True
+            continue
+        if not seen_non_system:
+            rewritten.append(msg)
+            continue
+        text = _system_content_as_text(msg.get("content", ""))
+        if not text:
+            continue
+        rewritten.append(
+            {
+                "role": "user",
+                "content": _format_inline_system_update(text),
+                _PRESERVE_BOUNDARY_KEY: True,
+                MID_SYSTEM_NOTE_KEY: True,
+            }
+        )
+    return rewritten
+
+
 def prepare_system_messages_for_template(
     messages: list[dict],
     tokenizer: Any | None,
@@ -755,7 +814,7 @@ def prepare_system_messages_for_template(
     configured strict or user-note fallback.
     """
     messages = [dict(msg) for msg in messages]
-    if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
+    if unsupported_mid_system_policy not in MID_SYSTEM_POLICIES:
         unsupported_mid_system_policy = "strict"
 
     def strict_fallback() -> list[dict]:
@@ -765,6 +824,12 @@ def prepare_system_messages_for_template(
         return prepared
 
     def unsupported_fallback() -> list[dict]:
+        if unsupported_mid_system_policy == "inline_note":
+            prepared = _inline_mid_system_to_notes(messages)
+            prepared = _merge_consecutive_system_messages(prepared)
+            if merge_consecutive_roles:
+                prepared = _merge_consecutive_roles(prepared)
+            return prepared
         if unsupported_mid_system_policy == "user_note_safe":
             prepared = _downgrade_mid_system_to_user_notes(messages)
             if prepared is not None:

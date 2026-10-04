@@ -581,6 +581,21 @@ class TestSchedulerSettings:
         assert settings.scheduler.max_parks_per_request == 7
         assert settings.scheduler.park_resume_ok_polls == 2
 
+    def test_mid_system_policy_env_override(self, tmp_path):
+        with patch.dict(os.environ, {"OMLX_MID_SYSTEM_POLICY": " Inline_Note "}):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.server.mid_system_policy == "inline_note"
+
+    def test_mid_system_policy_env_rejects_unknown_value(self, tmp_path):
+        with patch.dict(os.environ, {"OMLX_MID_SYSTEM_POLICY": "bogus"}):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.server.mid_system_policy is None
+
+    def test_mid_system_policy_unset_by_default_and_not_persisted(self, tmp_path):
+        settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.server.mid_system_policy is None
+        assert "mid_system_policy" not in settings.server.to_dict()
+
     def test_park_settings_validation(self, tmp_path):
         settings = GlobalSettings(base_path=tmp_path)
         assert not any("park" in e for e in settings.validate())

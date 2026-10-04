@@ -73,6 +73,10 @@ FORK_ENV = {
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
     "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
     "OMLX_BATCHED_DECODE_HOLD_MAX_S": FORK_BATCHED_DECODE_HOLD_MAX_S,
+    # Append-only mid-transcript system updates: pi sends prompt changes as
+    # mid-transcript system messages; folding them into the system head breaks
+    # the prefix cache for the whole conversation.
+    "OMLX_MID_SYSTEM_POLICY": "inline_note",
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap

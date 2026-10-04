@@ -345,6 +345,9 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # How non-leading system messages the template cannot render are handled:
+    # "strict" | "user_note_safe" | "inline_note" (None = server default).
+    mid_system_policy: Optional[str] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
