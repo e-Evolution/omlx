@@ -26,6 +26,7 @@ import copy
 import json
 import re
 import sys
+import traceback
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -382,23 +383,37 @@ def run_replay(
     resume: bool = False,
     log_available: bool = True,
     progress: Callable[[int, int], None] | None = None,
+    error_out: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Replay with incremental ``<out>/rows.jsonl``. Returns (rows, partial).
 
     A KeyboardInterrupt or any exception stops the loop but keeps the rows
     gathered so far (``partial=True``) so the caller still writes a report.
+    ``error_out`` (if given) is filled with ``{"status": "interrupted"}`` or
+    ``{"status": "error", "type", "message", "traceback"}``.
+
+    On resume, a torn last line (no trailing newline) is truncated away before
+    appending, and only successful rows are skipped: failed rows are re-sent.
     """
     out.mkdir(parents=True, exist_ok=True)
     path = out / "rows.jsonl"
     done: dict[int, dict[str, Any]] = {}
     if resume and path.exists():
-        for ln in path.read_text().splitlines():
+        raw = path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            with open(path, "r+b") as tf:
+                tf.truncate(raw.rfind(b"\n") + 1)
+            raw = raw[: raw.rfind(b"\n") + 1]
+        for ln in raw.decode("utf-8", "replace").splitlines():
             try:
                 r = json.loads(ln)
             except json.JSONDecodeError:
                 continue  # torn last line from a hard kill: that request is re-sent
             if isinstance(r, dict) and isinstance(r.get("index"), int):
-                done[r["index"]] = r
+                if r.get("ok"):
+                    done[r["index"]] = r
+                else:
+                    done.pop(r["index"], None)  # failed: re-send
     gathered: list[dict[str, Any]] = [done[k] for k in sorted(done) if k < len(records)]
     partial = False
     with open(path, "w" if not resume else "a") as fh:
@@ -412,9 +427,20 @@ def run_replay(
 
         try:
             replay(records, client, mode, log_window, progress, log_available, on_row, done)
-        except (KeyboardInterrupt, Exception) as exc:
+        except KeyboardInterrupt:
             partial = True
-            print(f"[replay] interrupted ({type(exc).__name__}); writing partial report", file=sys.stderr)
+            if error_out is not None:
+                error_out.update({"status": "interrupted"})
+            print("[replay] interrupted; writing partial report", file=sys.stderr)
+        except Exception as exc:
+            partial = True
+            tb = traceback.format_exc()
+            if error_out is not None:
+                error_out.update({"status": "error", "type": type(exc).__name__,
+                                  "message": str(exc), "traceback": tb})
+            print(f"[replay] failed ({type(exc).__name__}: {exc}); writing partial report",
+                  file=sys.stderr)
+            print(tb, file=sys.stderr)
     gathered.sort(key=lambda r: r["index"])
     return gathered, partial
 
@@ -483,6 +509,10 @@ def render_markdown(summary: dict[str, Any], meta: dict[str, Any]) -> str:
     lines = [f"# Trace replay: {meta.get('variant')} / {summary['mode']}", ""]
     if summary.get("partial"):
         lines += ["**PARTIAL RESULT: the run was interrupted; these rows are incomplete.**", ""]
+        err = meta.get("error") or {}
+        if err.get("status") == "error":
+            lines += [f"**Error: {err.get('type')}: {err.get('message')}**", "",
+                      "```", str(err.get("traceback", "")).rstrip(), "```", ""]
     if summary.get("usage_missing"):
         lines += [
             f"**WARNING: {summary['usage_missing']} request(s) returned no usage block "
@@ -620,9 +650,10 @@ def main(argv: list[str] | None = None) -> int:
             return data.decode("utf-8", "replace")
 
         log_available = log_path is not None
+        error_info: dict[str, Any] = {}
         rows, partial = run_replay(
             records, HttpClient(base_url, headers), args.mode, window, out,
-            resume=args.resume, log_available=log_available,
+            resume=args.resume, log_available=log_available, error_out=error_info,
             progress=lambda i, n: print(f"[replay] {i}/{n}", flush=True),
         )
     finally:
@@ -637,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         "peak_memory_gb": max(peaks) if peaks else None,
         "port": args.port, "attached": args.attach,
         "partial": partial, "log_available": log_available,
+        "error": error_info or None,
     }
     stem = f"replay-{args.variant}-{args.mode}-{int(time.time())}"
     (out / f"{stem}.json").write_text(json.dumps({"meta": meta, "summary": summary, "rows": rows}, indent=2))

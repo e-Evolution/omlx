@@ -105,3 +105,23 @@ def test_manager_unlink_logs_info_summary_and_debug_event(tmp_path, caplog):
         assert not Path(f).exists()
     finally:
         mgr.close()
+
+
+def test_manager_close_flushes_pending_summary(tmp_path, caplog):
+    from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+
+    mgr = PagedSSDCacheManager(cache_dir=tmp_path, max_size_bytes=10**9)
+    mgr._eviction_summary = EvictionSummary(interval_s=3600.0, clock=_Clock())
+    for i in range(3):
+        f = tmp_path / f"b{i}.safetensors"
+        f.write_bytes(b"x" * 10)
+        mgr._unlink_evicted(_Meta(f, 10))  # 1st emits, 2nd/3rd stay pending
+    with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+        mgr.close()
+    finals = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("SSD cache evicted: blocks=2 bytes=20")
+    ]
+    assert len(finals) == 1
+    assert "total_blocks=3" in finals[0]

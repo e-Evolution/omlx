@@ -502,3 +502,64 @@ class TestCacheOutcomeSummary:
         s = rt.reduce_results(self._rows(), "full")
         md = rt.render_markdown(s, {"variant": "v"})
         assert "cache outcomes: cold 1, hit_tail 2" in md
+
+
+class TestResumeIntegrity:
+    def test_torn_tail_is_truncated_before_append(self, tmp_path):
+        import json
+
+        good = {"index": 0, "ok": True, "prompt_tokens": 10, "cached_tokens": 0,
+                "class": "cold", "wall_s": 0.1}
+        (tmp_path / "rows.jsonl").write_text(json.dumps(good) + '\n{"index": 1, "ok": tr')
+        rows, partial = rt.run_replay(RECS, OkClient(), "reuse", lambda: "", tmp_path,
+                                      resume=True)
+        assert partial is False and [r["index"] for r in rows] == [0, 1, 2, 3]
+        lines = (tmp_path / "rows.jsonl").read_text().splitlines()
+        assert [json.loads(ln)["index"] for ln in lines] == [0, 1, 2, 3]
+
+    def test_resume_resends_failed_rows_only(self, tmp_path):
+        import json
+
+        def mk(i, ok):
+            return {"index": i, "ok": ok, "prompt_tokens": 10, "cached_tokens": 0,
+                    "class": "cold" if ok else "failed", "wall_s": 0.1}
+
+        (tmp_path / "rows.jsonl").write_text(
+            "".join(json.dumps(mk(i, i != 1)) + "\n" for i in range(3)))
+        client = OkClient()
+        rows, _ = rt.run_replay(RECS, client, "reuse", lambda: "", tmp_path, resume=True)
+        assert client.calls == 2  # failed index 1 + untouched index 3
+        assert all(r["ok"] for r in rows) and len(rows) == 4
+        by_index = [json.loads(ln)["index"] for ln in
+                    (tmp_path / "rows.jsonl").read_text().splitlines()]
+        assert by_index.count(1) == 2  # old failure kept in log, success appended
+
+    def test_exception_records_message_and_traceback(self, tmp_path, capsys):
+        class Boom(OkClient):
+            def send(self, body, mode):
+                raise RuntimeError("server on fire")
+
+        info: dict = {}
+        rows, partial = rt.run_replay(RECS, Boom(), "reuse", lambda: "", tmp_path,
+                                      error_out=info)
+        assert partial is True
+        assert info["status"] == "error" and info["type"] == "RuntimeError"
+        assert info["message"] == "server on fire"
+        assert "Traceback" in info["traceback"] and "server on fire" in info["traceback"]
+        err = capsys.readouterr().err
+        assert "server on fire" in err and "Traceback" in err
+
+    def test_keyboard_interrupt_is_clean_interrupted(self, tmp_path, capsys):
+        info: dict = {}
+        _, partial = rt.run_replay(RECS, OkClient(fail_at=1), "reuse", lambda: "", tmp_path,
+                                   error_out=info)
+        assert partial is True and info == {"status": "interrupted"}
+        err = capsys.readouterr().err
+        assert "interrupted" in err and "Traceback" not in err
+
+    def test_markdown_shows_error_details(self):
+        md = rt.render_markdown(
+            {**rt.reduce_results([], "reuse", partial=True)},
+            {"variant": "v", "error": {"status": "error", "type": "RuntimeError",
+                                       "message": "server on fire", "traceback": "tb"}})
+        assert "server on fire" in md

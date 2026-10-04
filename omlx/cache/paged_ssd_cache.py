@@ -5315,6 +5315,9 @@ class PagedSSDCacheManager(CacheManager):
     def close(self, *, teardown=None) -> None:
         """Close the SSD cache manager, flushing hot cache and pending writes."""
         logger.info("Shutting down PagedSSDCacheManager...")
+        final_eviction_line = self._eviction_summary.flush()
+        if final_eviction_line:
+            logger.info(final_eviction_line)
 
         # Flush hot cache entries to SSD before shutdown.
         # Dirty blocks wait for queue space first; sustained saturation falls
