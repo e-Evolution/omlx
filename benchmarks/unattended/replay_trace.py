@@ -39,6 +39,16 @@ SECRET_KEYS = {"apikey", "api_key", "authorization", "headers"}
 IMAGE_PART_TYPES = {"image_url", "image", "input_image"}
 CLASSES = ("cold_start", "compaction", "system_update", "image", "unknown", "hit")
 
+LOG_UNAVAILABLE_WARNING = (
+    "--attach without --server-log: log-derived fields (divergence position, restore "
+    "source, holds, agings, aborts, tool-parser failures, pool memory) are unavailable "
+    "and reported as null/n/a. Pass --server-log to get them."
+)
+LOG_FIELDS = (
+    "divergence_position", "comparable_tokens", "log_reprefill_tokens", "restore_source",
+    "holds", "agings", "aborts", "tool_parser_failures", "pool_gb_max",
+)
+
 _RE_DIVERGE = re.compile(
     r"prefix cache: request \S+ re-prefills (\d+) of (\d+) tokens \(reused (\d+)\); "
     r"closest stored sequence \S+ shares the first (\d+) of (\d+) comparable tokens"
@@ -135,15 +145,6 @@ def _messages(record: dict[str, Any] | None) -> list[Any]:
     return list(((record or {}).get("payload") or {}).get("messages") or [])
 
 
-def _text(msg: Any) -> str:
-    c = msg.get("content") if isinstance(msg, dict) else None
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return "".join(p.get("text", "") for p in c if isinstance(p, dict))
-    return ""
-
-
 def _has_image(msg: Any) -> bool:
     c = msg.get("content") if isinstance(msg, dict) else None
     return isinstance(c, list) and any(
@@ -215,36 +216,55 @@ def percentile(values: list[float], pct: float) -> float | None:
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
-def reduce_results(rows: list[dict[str, Any]], mode: str) -> dict[str, Any]:
+def reduce_results(
+    rows: list[dict[str, Any]],
+    mode: str,
+    partial: bool = False,
+    log_available: bool = True,
+) -> dict[str, Any]:
     ok = [r for r in rows if r.get("ok")]
-    prompt = sum(r["prompt_tokens"] or 0 for r in ok)
-    cached = sum(r["cached_tokens"] or 0 for r in ok)
+    missing = [r for r in ok if r.get("usage_missing")]
+    measured = [r for r in ok if not r.get("usage_missing")]
+    prompt = sum(r["prompt_tokens"] or 0 for r in measured)
+    cached = sum(r["cached_tokens"] or 0 for r in measured)
     by_class: dict[str, dict[str, int]] = {}
-    for r in ok:
+    for r in measured:
         slot = by_class.setdefault(r["class"], {"requests": 0, "reprefilled_tokens": 0})
         slot["requests"] += 1
         slot["reprefilled_tokens"] += max(0, (r["prompt_tokens"] or 0) - (r["cached_tokens"] or 0))
-    ttfts = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None] if mode == "full" else []
-    quality: dict[str, int] = {"tool_parser_failures": sum(r.get("tool_parser_failures", 0) for r in rows)}
+    walls = [r["wall_s"] for r in ok if r.get("wall_s") is not None]
+
+    def logsum(key: str) -> int | None:
+        return sum(r.get(key) or 0 for r in rows) if log_available else None
+
+    quality: dict[str, int | None] = {"tool_parser_failures": logsum("tool_parser_failures")}
     for r in rows:
         for flag in r.get("quality_flags", []):
-            quality[flag] = quality.get(flag, 0) + 1
-    return {
+            quality[flag] = (quality.get(flag) or 0) + 1
+    out: dict[str, Any] = {
         "mode": mode,
+        "partial": partial,
+        "log_available": log_available,
         "requests": len(rows),
         "failed_requests": len(rows) - len(ok),
+        "usage_missing": len(missing),
         "prompt_tokens": prompt,
         "cached_tokens": cached,
         "hit_ratio": (cached / prompt) if prompt else None,
         "reprefilled_tokens": prompt - cached,
         "by_class": by_class,
-        "ttft_p50_s": percentile(ttfts, 50),
-        "ttft_p90_s": percentile(ttfts, 90),
-        "aborts": sum(r.get("aborts", 0) for r in rows),
-        "holds": sum(r.get("holds", 0) for r in rows),
-        "agings": sum(r.get("agings", 0) for r in rows),
+        "wall_p50_s": percentile(walls, 50),
+        "wall_p90_s": percentile(walls, 90),
+        "aborts": logsum("aborts"),
+        "holds": logsum("holds"),
+        "agings": logsum("agings"),
         "quality": quality,
     }
+    if mode == "full":  # reuse mode is non-streaming: its latency is wall time, not TTFT
+        ttfts = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None]
+        out["ttft_p50_s"] = percentile(ttfts, 50)
+        out["ttft_p90_s"] = percentile(ttfts, 90)
+    return out
 
 
 _DETERMINISTIC_KEYS = ("prompt_tokens", "cached_tokens", "class")
@@ -270,38 +290,110 @@ def replay(
     mode: str,
     log_window: Callable[[], str],
     progress: Callable[[int, int], None] | None = None,
+    log_available: bool = True,
+    on_row: Callable[[dict[str, Any]], None] | None = None,
+    done: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Replay sequentially. ``done`` maps trace index -> row already measured
+    (resume): those requests are not re-sent. Each new row goes to ``on_row``
+    as soon as it completes so an interruption loses nothing."""
     rows: list[dict[str, Any]] = []
     last: dict[Any, tuple[dict[str, Any], int | None]] = {}
+    done = done or {}
     log_window()  # discard anything logged before the first request
     for i, record in enumerate(records):
+        session = record.get("session")
+        if i in done:
+            prior = done[i]
+            rows.append(prior)
+            if prior.get("ok"):
+                last[session] = (record, prior.get("prompt_tokens"))
+            continue
         body = build_request(record, mode)
         res = client.send(body, mode)
         logtxt = log_window()
-        info = parse_request_log(logtxt)
-        session = record.get("session")
+        info = (
+            parse_request_log(logtxt) if log_available else {k: None for k in LOG_FIELDS}
+        )
         prev, prev_pt = last.get(session, (None, None))
+        ok = bool(res.get("ok"))
+        missing = ok and bool(res.get("usage_missing"))
         pt, ct = res.get("prompt_tokens") or 0, res.get("cached_tokens") or 0
+        if not ok:
+            cls = "failed"
+        elif missing:
+            cls = "usage_missing"
+        else:
+            cls = classify_reprefill(prev, record, pt, ct, prev_pt)
         row = {
             "index": i,
             "ts": record.get("ts"),
             "session": session,
-            "ok": bool(res.get("ok")),
+            "ok": ok,
             "error": res.get("error"),
-            "prompt_tokens": res.get("prompt_tokens"),
-            "cached_tokens": res.get("cached_tokens"),
-            "ttft_s": res.get("ttft_s"),
+            "usage_missing": missing,
+            "prompt_tokens": None if missing else res.get("prompt_tokens"),
+            "cached_tokens": None if missing else res.get("cached_tokens"),
+            "ttft_s": res.get("ttft_s") if mode == "full" else None,
             "wall_s": res.get("wall_s"),
-            "class": classify_reprefill(prev, record, pt, ct, prev_pt) if res.get("ok") else "failed",
+            "class": cls,
             "quality_flags": quality_flags(res.get("text") or "") if mode == "full" else [],
             **info,
         }
         rows.append(row)
-        if res.get("ok"):
-            last[session] = (record, res.get("prompt_tokens"))
+        if on_row:
+            on_row(row)
+        if ok:
+            last[session] = (record, None if missing else res.get("prompt_tokens"))
         if progress:
             progress(i + 1, len(records))
     return rows
+
+
+def run_replay(
+    records: list[dict[str, Any]],
+    client: Any,
+    mode: str,
+    log_window: Callable[[], str],
+    out: Path,
+    resume: bool = False,
+    log_available: bool = True,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Replay with incremental ``<out>/rows.jsonl``. Returns (rows, partial).
+
+    A KeyboardInterrupt or any exception stops the loop but keeps the rows
+    gathered so far (``partial=True``) so the caller still writes a report.
+    """
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "rows.jsonl"
+    done: dict[int, dict[str, Any]] = {}
+    if resume and path.exists():
+        for ln in path.read_text().splitlines():
+            try:
+                r = json.loads(ln)
+            except json.JSONDecodeError:
+                continue  # torn last line from a hard kill: that request is re-sent
+            if isinstance(r, dict) and isinstance(r.get("index"), int):
+                done[r["index"]] = r
+    gathered: list[dict[str, Any]] = [done[k] for k in sorted(done) if k < len(records)]
+    partial = False
+    with open(path, "w" if not resume else "a") as fh:
+        if resume:
+            fh.seek(0, 2)
+
+        def on_row(row: dict[str, Any]) -> None:
+            gathered.append(row)
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+
+        try:
+            replay(records, client, mode, log_window, progress, log_available, on_row, done)
+        except (KeyboardInterrupt, Exception) as exc:
+            partial = True
+            print(f"[replay] interrupted ({type(exc).__name__}); writing partial report", file=sys.stderr)
+    gathered.sort(key=lambda r: r["index"])
+    return gathered, partial
 
 
 class HttpClient:
@@ -325,10 +417,12 @@ class HttpClient:
                     return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}", "wall_s": wall}
                 usage = r.json().get("usage") or {}
                 details = usage.get("prompt_tokens_details") or {}
+                pt, ct = usage.get("prompt_tokens"), details.get("cached_tokens")
+                # non-streaming: only wall time is measured, never TTFT
                 return {
-                    "ok": True, "error": None, "text": "", "wall_s": wall, "ttft_s": wall,
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "cached_tokens": details.get("cached_tokens"),
+                    "ok": True, "error": None, "text": "", "wall_s": wall,
+                    "usage_missing": pt is None or ct is None,
+                    "prompt_tokens": pt, "cached_tokens": ct,
                 }
             acc = bm.StreamAccumulator()
             with self._httpx.stream("POST", self.url, json=body, headers=self.headers, timeout=self.timeout) as r:
@@ -338,11 +432,17 @@ class HttpClient:
                 for line in r.iter_lines():
                     acc.feed(line, time.time())
             fin = acc.finalize()
+            pt, ct = fin["prompt_tokens"], fin["cached_tokens"]
+            usage_missing = acc.usage is None or pt is None or ct is None
+            ok, error = fin["ok"], fin["error"]
+            if not ok and usage_missing and not acc.errors and acc.done and fin["text"]:
+                ok, error = True, None  # only the usage chunk is absent: flagged, not a hit
             return {
-                "ok": fin["ok"], "error": fin["error"], "text": fin["text"],
+                "ok": ok, "error": error, "text": fin["text"],
+                "usage_missing": ok and usage_missing,
                 "wall_s": time.time() - t0,
                 "ttft_s": None if fin["first_token_at"] is None else fin["first_token_at"] - t0,
-                "prompt_tokens": fin["prompt_tokens"], "cached_tokens": fin["cached_tokens"],
+                "prompt_tokens": pt, "cached_tokens": ct,
             }
         except Exception as exc:  # network failure is a failed request, not a crash
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "wall_s": time.time() - t0}
@@ -357,16 +457,32 @@ def render_markdown(summary: dict[str, Any], meta: dict[str, Any]) -> str:
     def f(v: Any, nd: int = 3) -> str:
         return "n/a" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
 
-    lines = [
-        f"# Trace replay: {meta.get('variant')} / {summary['mode']}",
-        "",
-        f"- requests: {summary['requests']} (failed {summary['failed_requests']}), aborts {summary['aborts']}",
+    lines = [f"# Trace replay: {meta.get('variant')} / {summary['mode']}", ""]
+    if summary.get("partial"):
+        lines += ["**PARTIAL RESULT: the run was interrupted; these rows are incomplete.**", ""]
+    if summary.get("usage_missing"):
+        lines += [
+            f"**WARNING: {summary['usage_missing']} request(s) returned no usage block "
+            "(usage_missing). They are excluded from hit ratio and re-prefill totals.**",
+            "",
+        ]
+    lines += [
+        f"- requests: {summary['requests']} (failed {summary['failed_requests']}, "
+        f"usage_missing {summary.get('usage_missing', 0)}), aborts {f(summary['aborts'])}",
         f"- prompt tokens {summary['prompt_tokens']}, cached {summary['cached_tokens']}, "
         f"hit ratio (token-weighted) {f(summary['hit_ratio'])}",
         f"- re-prefilled tokens {summary['reprefilled_tokens']}",
-        f"- TTFT p50 {f(summary['ttft_p50_s'])} s, p90 {f(summary['ttft_p90_s'])} s",
-        f"- peak memory {f(meta.get('peak_memory_gb'))} GB, holds {summary['holds']}, agings {summary['agings']}",
+    ]
+    if "ttft_p50_s" in summary:
+        lines.append(f"- TTFT p50 {f(summary['ttft_p50_s'])} s, p90 {f(summary['ttft_p90_s'])} s")
+    lines += [
+        f"- wall time p50 {f(summary.get('wall_p50_s'))} s, p90 {f(summary.get('wall_p90_s'))} s",
+        f"- peak memory {f(meta.get('peak_memory_gb'))} GB, holds {f(summary['holds'])}, agings {f(summary['agings'])}",
         f"- quality: {json.dumps(summary['quality'], sort_keys=True)}",
+    ]
+    if not summary.get("log_available", True):
+        lines.append("- log_available: false (log-derived fields are n/a)")
+    lines += [
         "",
         "| class | requests | re-prefilled tokens |",
         "|---|---:|---:|",
@@ -402,6 +518,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-concurrent", type=int, default=1)
     ap.add_argument("--out", default=None, help="output dir (default: DEFAULT_OUT/replay)")
     ap.add_argument("--keep-cache", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip trace rows already in <out>/rows.jsonl (same trace and filters; "
+                         "the server cache is cold after a restart, so resumed rows are not "
+                         "comparable to an uninterrupted run)")
     args = ap.parse_args(argv)
 
     if not bm.port_allowed(args.port, args.allow_port):
@@ -440,6 +560,8 @@ def main(argv: list[str] | None = None) -> int:
             {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
         )
         log_path = Path(args.server_log) if args.server_log else None
+        if log_path is None:
+            print(f"[replay] WARNING: {LOG_UNAVAILABLE_WARNING}", file=sys.stderr)
     else:
         srv = bp.Server(args.variant, "REPLAY", args.port, args.max_concurrent, out, args.keep_cache)
         srv.prepare()
@@ -464,8 +586,10 @@ def main(argv: list[str] | None = None) -> int:
             offset[0] += len(data)
             return data.decode("utf-8", "replace")
 
-        rows = replay(
-            records, HttpClient(base_url, headers), args.mode, window,
+        log_available = log_path is not None
+        rows, partial = run_replay(
+            records, HttpClient(base_url, headers), args.mode, window, out,
+            resume=args.resume, log_available=log_available,
             progress=lambda i, n: print(f"[replay] {i}/{n}", flush=True),
         )
     finally:
@@ -474,18 +598,21 @@ def main(argv: list[str] | None = None) -> int:
             srv.stop()
             srv.archive_and_clean()
     peaks = [s["footprint_gb"] for s in samples if s.get("footprint_gb") is not None]
-    summary = reduce_results(rows, args.mode)
+    summary = reduce_results(rows, args.mode, partial=partial, log_available=log_available)
     meta = {
         "variant": args.variant, "trace": str(trace), "session": args.session,
         "peak_memory_gb": max(peaks) if peaks else None,
         "port": args.port, "attached": args.attach,
+        "partial": partial, "log_available": log_available,
     }
     stem = f"replay-{args.variant}-{args.mode}-{int(time.time())}"
     (out / f"{stem}.json").write_text(json.dumps({"meta": meta, "summary": summary, "rows": rows}, indent=2))
     (out / f"{stem}.md").write_text(render_markdown(summary, meta))
     print(render_markdown(summary, meta))
     print(f"[replay] wrote {out / stem}.json / .md", flush=True)
-    return 0 if summary["failed_requests"] == 0 else 1
+    if summary["usage_missing"]:
+        print(f"[replay] WARNING: {summary['usage_missing']} request(s) had no usage block", file=sys.stderr)
+    return 0 if summary["failed_requests"] == 0 and not partial else 1
 
 
 if __name__ == "__main__":
