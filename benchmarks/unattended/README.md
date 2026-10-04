@@ -133,3 +133,33 @@ memory failure only when an oMLX error signature appears in stderr or on an
 by exit 0 with a full answer counts as recovered, i.e. success. The P5 verdict
 passes when fork-with has 0 manual interventions and upstream-without shows the
 failure mode. `report.py` includes it.
+
+## Trace replay (cache reuse on real pi traffic)
+
+`replay_trace.py` replays the provider requests recorded by the
+`pi-omlx-unattended` extension (`"traceFile"` option) against an isolated bench
+server (port 8002, fresh cache dir; 8001 is refused unless `--allow-port 8001`).
+Payloads are sent in recorded order with messages, tools and template kwargs
+untouched; auth keys are never read from the trace. Traces hold full prompts and
+code: keep them and the results out of git.
+
+```bash
+# reuse mode (default): max_tokens=1, stream=false -> cached/prompt tokens only
+$PY benchmarks/unattended/replay_trace.py --trace ~/pi-trace.jsonl --variant fork
+# full mode: recorded max_tokens, streaming -> TTFT p50/p90 and quality flags
+$PY benchmarks/unattended/replay_trace.py --trace ~/pi-trace.jsonl --variant upstream --mode full \
+    --session <session-id> --from-ts <ms> --to-ts <ms>
+# attach to a server started with bench_premises.py --serve (no server management)
+$PY benchmarks/unattended/replay_trace.py --trace t.jsonl --variant fork --attach --server-log <server.log>
+```
+
+Per request it records `prompt_tokens`, `cached_tokens`, TTFT, wall time and, from
+the server log window of that request, the prefix divergence position, restore
+source and hold/aging lines. The report (JSON plus markdown, under `<out>/replay`)
+has the token-weighted hit ratio, re-prefilled tokens in total and by heuristic
+class (`cold_start`, `compaction`, `system_update`, `image`, `unknown`), TTFT
+p50/p90 (full mode), peak memory, aborts, and quality flags (literal `</think>`,
+`<function=`, `<parameter=`, tool-parser failure log lines). Replaying twice on
+the same build must give identical `prompt_tokens`/`cached_tokens`
+(`replay_trace.results_equal`). The classifier is a heuristic over the message
+diff, not ground truth.
