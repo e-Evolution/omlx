@@ -1,336 +1,229 @@
-# tests/test_cache_observability.py
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for cache observability module."""
+"""Cache-miss reason classification and TTFT breakdown (A5)."""
 
-import threading
-from unittest.mock import patch
+import logging
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
+from omlx.cache.restore_outcome import (
+    OUTCOMES,
+    RestoreOutcomeCounter,
+    classify_restore_outcome,
+)
+from omlx.scheduler import Scheduler
+from omlx.ttft_breakdown import TtftTracker
+
+BLOCK = 2048
 
 
-def _make_counters(
-    prefix_hits=0,
-    prefix_misses=0,
-    prefix_tokens_matched=0,
-    prefix_tokens_requested=0,
-    prefix_tokens_saved=0,
-    evictions=0,
-    ssd_hot_hits=0,
-    ssd_disk_loads=0,
-    ssd_saves=0,
-    ssd_errors=0,
-    hot_cache_evictions=0,
-    hot_cache_promotions=0,
-    target_static_hits=0,
-    target_static_misses=0,
-    target_static_tokens_restored=0,
-    draft_prefix_hits=0,
-    draft_prefix_misses=0,
-    draft_prefix_tokens_saved=0,
-):
-    return {
-        "prefix_hits": prefix_hits,
-        "prefix_misses": prefix_misses,
-        "prefix_tokens_matched": prefix_tokens_matched,
-        "prefix_tokens_requested": prefix_tokens_requested,
-        "prefix_tokens_saved": prefix_tokens_saved,
-        "evictions": evictions,
-        "ssd_hot_hits": ssd_hot_hits,
-        "ssd_disk_loads": ssd_disk_loads,
-        "ssd_saves": ssd_saves,
-        "ssd_errors": ssd_errors,
-        "hot_cache_evictions": hot_cache_evictions,
-        "hot_cache_promotions": hot_cache_promotions,
-        "target_static_hits": target_static_hits,
-        "target_static_misses": target_static_misses,
-        "target_static_tokens_restored": target_static_tokens_restored,
-        "draft_prefix_hits": draft_prefix_hits,
-        "draft_prefix_misses": draft_prefix_misses,
-        "draft_prefix_tokens_saved": draft_prefix_tokens_saved,
-    }
+def classify(**kw):
+    base = dict(
+        cached=0, common_prefix=None, stored_len=None, block=BLOCK, has_media_keys=False
+    )
+    base.update(kw)
+    return classify_restore_outcome(**base)
 
 
-class TestCacheRateTrackerSnapshot:
+class TestClassify:
+    def test_cold_without_any_probe(self):
+        assert classify() == "cold"
 
-    def test_empty_tracker_returns_empty_rates(self):
-        tracker = CacheRateTracker()
-        result = tracker.get_rates()
-        assert result == {"windows": {}, "cumulative": {}}
+    def test_cold_when_shared_prefix_below_one_block(self):
+        assert classify(common_prefix=100, stored_len=9000) == "cold"
 
-    def test_first_snapshot_always_accepted(self):
-        tracker = CacheRateTracker(min_interval=10.0)
-        assert tracker.maybe_snapshot(_make_counters()) is True
-
-    def test_snapshot_rejected_within_min_interval(self):
-        tracker = CacheRateTracker(min_interval=10.0)
-        tracker.maybe_snapshot(_make_counters())
-        assert tracker.maybe_snapshot(_make_counters()) is False
-
-    def test_snapshot_accepted_after_min_interval(self):
-        tracker = CacheRateTracker(min_interval=0.0)
-        tracker.maybe_snapshot(_make_counters())
-        assert tracker.maybe_snapshot(_make_counters()) is True
-
-    def test_deque_overflow_evicts_oldest(self):
-        tracker = CacheRateTracker(max_snapshots=3, min_interval=0.0)
-        for i in range(5):
-            tracker.maybe_snapshot(_make_counters(prefix_hits=i))
-        result = tracker.get_rates()
-        assert result["cumulative"]["prefix_hits"] == 4
-
-
-class TestCacheRateTrackerRates:
-
-    def _tracker_with_two_snapshots(self, old_counters, new_counters, elapsed=60.0):
-        tracker = CacheRateTracker(min_interval=0.0)
-        fake_time = [1000.0]
-
-        def mock_monotonic():
-            return fake_time[0]
-
-        with patch(
-            "omlx.cache.observability.time.monotonic",
-            side_effect=mock_monotonic,
-        ):
-            tracker.maybe_snapshot(old_counters)
-
-        fake_time[0] = 1000.0 + elapsed
-        with patch(
-            "omlx.cache.observability.time.monotonic",
-            side_effect=mock_monotonic,
-        ):
-            tracker.maybe_snapshot(new_counters)
-
-        with patch(
-            "omlx.cache.observability.time.monotonic",
-            return_value=fake_time[0],
-        ):
-            return tracker.get_rates(windows=(60, 300, 900))
-
-    def test_steady_state_prefix_hit_rate(self):
-        old = _make_counters(prefix_hits=100, prefix_misses=50)
-        new = _make_counters(prefix_hits=200, prefix_misses=75)
-        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
-        assert result["windows"]["1m"]["prefix_hit_rate"] == 0.8
-
-    def test_zero_activity_window_no_nan(self):
-        counters = _make_counters(prefix_hits=50, prefix_misses=10)
-        result = self._tracker_with_two_snapshots(counters, counters, elapsed=60.0)
-        assert result["windows"]["1m"]["prefix_hit_rate"] == 0.0
-        assert result["windows"]["1m"]["prefix_match_efficiency"] == 0.0
-        assert result["windows"]["1m"]["eviction_rate_per_min"] == 0.0
-
-    def test_eviction_rate_per_min(self):
-        old = _make_counters(evictions=10)
-        new = _make_counters(evictions=40)
-        result = self._tracker_with_two_snapshots(old, new, elapsed=300.0)
-        assert result["windows"]["5m"]["eviction_rate_per_min"] == 6.0
-
-    def test_prefix_match_efficiency(self):
-        old = _make_counters(prefix_tokens_matched=0, prefix_tokens_requested=0)
-        new = _make_counters(prefix_tokens_matched=600, prefix_tokens_requested=1000)
-        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
-        assert result["windows"]["1m"]["prefix_match_efficiency"] == 0.6
-
-    def test_ssd_hot_rate(self):
-        old = _make_counters(ssd_hot_hits=0, ssd_disk_loads=0)
-        new = _make_counters(ssd_hot_hits=80, ssd_disk_loads=20)
-        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
-        assert result["windows"]["1m"]["ssd_hot_rate"] == 0.8
-
-    def test_specprefill_target_and_draft_reuse_are_distinct(self):
-        old = _make_counters()
-        new = _make_counters(
-            target_static_hits=3,
-            target_static_misses=1,
-            target_static_tokens_restored=18_000,
-            draft_prefix_hits=7,
-            draft_prefix_misses=2,
-            draft_prefix_tokens_saved=42_000,
+    def test_media_keyed_when_nothing_restored_and_media_keys_present(self):
+        assert classify(has_media_keys=True) == "media_keyed"
+        assert (
+            classify(common_prefix=9000, stored_len=9000, has_media_keys=True)
+            == "media_keyed"
         )
 
-        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
+    def test_hit_tail_when_prompt_extends_stored_sequence(self):
+        assert (
+            classify(cached=8192, common_prefix=9000, stored_len=9000) == "hit_tail"
+        )
 
-        window = result["windows"]["1m"]
-        assert window["target_static_hit_rate"] == 0.75
-        assert window["target_static_tokens_restored"] == 18_000
-        assert window["draft_prefix_hit_rate"] == pytest.approx(7 / 9, abs=0.0001)
-        assert window["draft_prefix_tokens_saved"] == 42_000
-        assert result["cumulative"]["target_static_hits"] == 3
-        assert result["cumulative"]["draft_prefix_hits"] == 7
+    def test_hit_tail_without_probe_when_something_restored(self):
+        assert classify(cached=4096) == "hit_tail"
 
-    def test_insufficient_data_returns_empty_window(self):
-        tracker = CacheRateTracker(min_interval=0.0)
+    def test_block_aligned_divergence_inside_stored_sequence(self):
+        # Diverges at 8000 of 10000; restore stops at the last full block.
+        assert (
+            classify(cached=6144, common_prefix=8000, stored_len=10000)
+            == "block_aligned_divergence"
+        )
 
-        with patch("omlx.cache.observability.time.monotonic", return_value=1000.0):
-            tracker.maybe_snapshot(_make_counters(prefix_hits=10))
+    def test_restore_short_when_shared_prefix_exceeds_served(self):
+        # Shared 9000 tokens but only 2048 served: blocks lost or not restored.
+        assert (
+            classify(cached=2048, common_prefix=9000, stored_len=9000)
+            == "restore_short"
+        )
+        assert classify(cached=0, common_prefix=9000, stored_len=9000) == "restore_short"
 
-        with patch("omlx.cache.observability.time.monotonic", return_value=1000.5):
-            tracker.maybe_snapshot(_make_counters(prefix_hits=20))
-
-        with patch("omlx.cache.observability.time.monotonic", return_value=1000.5):
-            result = tracker.get_rates(windows=(60,))
-        assert result["windows"]["1m"] == {}
-
-    def test_cumulative_uses_latest_snapshot(self):
-        old = _make_counters(prefix_hits=10, prefix_misses=5)
-        new = _make_counters(prefix_hits=100, prefix_misses=20)
-        result = self._tracker_with_two_snapshots(old, new, elapsed=60.0)
-        assert result["cumulative"]["prefix_hits"] == 100
-        assert result["cumulative"]["prefix_misses"] == 20
-        assert abs(result["cumulative"]["prefix_hit_rate"] - 0.8333) < 0.001
-
-
-class TestCacheRateTrackerSnapshotAndGetRates:
-
-    def test_combines_snapshot_and_rates(self):
-        tracker = CacheRateTracker(min_interval=0.0)
-
-        with patch("omlx.cache.observability.time.monotonic", return_value=1000.0):
-            tracker.maybe_snapshot(_make_counters(prefix_hits=0))
-
-        with patch("omlx.cache.observability.time.monotonic", return_value=1060.0):
-            result = tracker.snapshot_and_get_rates(
-                _make_counters(prefix_hits=80, prefix_misses=20)
-            )
-
-        assert result["windows"]["1m"]["prefix_hit_rate"] == 0.8
-        assert result["cumulative"]["prefix_hits"] == 80
+    def test_outcome_names_are_stable(self):
+        assert OUTCOMES == (
+            "hit_tail",
+            "block_aligned_divergence",
+            "cold",
+            "media_keyed",
+            "restore_short",
+        )
 
 
-class TestCacheRateTrackerThreadSafety:
+class TestCounter:
+    def test_counts_per_outcome_with_zero_defaults(self):
+        c = RestoreOutcomeCounter()
+        c.record("cold")
+        c.record("cold")
+        c.record("hit_tail")
+        snap = c.snapshot()
+        assert snap["cold"] == 2 and snap["hit_tail"] == 1
+        assert snap["media_keyed"] == 0
+        assert set(snap) == set(OUTCOMES)
 
-    def test_concurrent_snapshot_and_read(self):
-        tracker = CacheRateTracker(min_interval=0.0)
-        errors = []
-        stop = threading.Event()
-        writer_started = threading.Event()
-        reader_started = threading.Event()
+    def test_unknown_outcome_is_rejected(self):
+        with pytest.raises(ValueError):
+            RestoreOutcomeCounter().record("nope")
 
-        def writer():
-            i = 0
-            while not stop.is_set():
-                try:
-                    tracker.maybe_snapshot(_make_counters(prefix_hits=i))
-                    writer_started.set()
-                    i += 1
-                except Exception as e:
-                    errors.append(e)
-
-        def reader():
-            while not stop.is_set():
-                try:
-                    tracker.get_rates()
-                    reader_started.set()
-                except Exception as e:
-                    errors.append(e)
-
-        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
-        for t in threads:
-            t.start()
-        try:
-            assert writer_started.wait(timeout=5.0)
-            assert reader_started.wait(timeout=5.0)
-        finally:
-            stop.set()
-            for t in threads:
-                t.join(timeout=2.0)
-
-        assert all(not t.is_alive() for t in threads)
-        assert errors == [], f"Thread errors: {errors}"
+    def test_snapshot_is_a_copy(self):
+        c = RestoreOutcomeCounter()
+        c.snapshot()["cold"] = 99
+        assert c.snapshot()["cold"] == 0
 
 
-class TestCacheRateTrackerClear:
+class TestTtftTracker:
+    def test_breakdown_line_format_and_values(self):
+        t = TtftTracker()
+        t.mark_restore(
+            "r1", arrival=100.0, restore_start=102.0, restore_end=102.5, outcome="cold"
+        )
+        line = t.first_token_line(
+            "r1",
+            generation_started_at=112.5,
+            now=112.75,
+            prompt_tokens=30000,
+            cached_tokens=0,
+        )
+        assert line == (
+            "TTFT breakdown: request=r1 prompt_tokens=30000 cached_tokens=0 "
+            "cache=cold hold_s=2.000 restore_s=0.500 prefill_s=10.000 "
+            "first_decode_s=0.250 ttft_s=12.750"
+        )
 
-    def test_clear_resets_state(self):
-        tracker = CacheRateTracker(min_interval=0.0)
-        tracker.maybe_snapshot(_make_counters(prefix_hits=100))
-        tracker.clear()
-        assert tracker.get_rates() == {"windows": {}, "cumulative": {}}
+    def test_line_is_parseable_and_sums_to_ttft(self):
+        t = TtftTracker()
+        t.mark_restore("r", 0.0, 1.0, 3.0, "hit_tail")
+        line = t.first_token_line("r", 8.0, 8.5, 10, 5)
+        f = dict(p.split("=") for p in line.split(": ", 1)[1].split())
+        total = sum(float(f[k]) for k in ("hold_s", "restore_s", "prefill_s", "first_decode_s"))
+        assert total == pytest.approx(float(f["ttft_s"]))
+
+    def test_one_line_per_request(self):
+        t = TtftTracker()
+        t.mark_restore("r", 0.0, 0.0, 0.1, "cold")
+        assert t.first_token_line("r", 1.0, 1.1, 1, 0) is not None
+        assert t.first_token_line("r", 1.0, 2.0, 1, 0) is None
+
+    def test_unknown_request_gives_no_line(self):
+        assert TtftTracker().first_token_line("x", 1.0, 1.1, 1, 0) is None
+
+    def test_negative_gaps_clamp_to_zero(self):
+        t = TtftTracker()
+        t.mark_restore("r", 5.0, 4.0, 3.0, "cold")
+        line = t.first_token_line("r", 2.0, 1.0, 1, 0)
+        assert "-" not in line.split(": ", 1)[1].replace("request=r", "")
+
+    def test_bounded_memory(self):
+        t = TtftTracker(max_entries=3)
+        for i in range(10):
+            t.mark_restore(f"r{i}", 0.0, 0.0, 0.0, "cold")
+        assert t.first_token_line("r0", 1.0, 1.0, 1, 0) is None
+        assert t.first_token_line("r9", 1.0, 1.0, 1, 0) is not None
+
+    def test_discard(self):
+        t = TtftTracker()
+        t.mark_restore("r", 0.0, 0.0, 0.0, "cold")
+        t.discard("r")
+        assert t.first_token_line("r", 1.0, 1.0, 1, 0) is None
 
 
-def test_boundary_snapshot_diagnostics_are_structured_and_thread_safe():
-    diagnostics = BoundarySnapshotDiagnostics()
-    diagnostics.record(
-        "capture_attempt",
-        request_id="req-a",
-        token_count=4096,
-        block_size=4096,
-        source="prefill",
-    )
-    diagnostics.record(
-        "ssd_fallback",
-        reason="ssd_save_failed",
-        request_id="req-a",
-        token_count=4096,
-        block_size=4096,
-        source="prefill",
-        storage="memory",
-    )
-    diagnostics.record(
-        "capture_success",
-        request_id="req-a",
-        token_count=4096,
-        block_size=4096,
-        source="prefill",
-        storage="memory",
-    )
-
-    snapshot = diagnostics.snapshot()
-
-    assert snapshot["capture_attempts"] == 1
-    assert snapshot["captures"] == 1
-    assert snapshot["captures_memory"] == 1
-    assert snapshot["captures_ssd"] == 0
-    assert snapshot["ssd_fallbacks"] == 1
-    assert snapshot["reasons"] == {"ssd_save_failed": 1}
-    assert snapshot["last_event"] == {
-        "event": "capture_success",
-        "request_id": "req-a",
-        "token_count": 4096,
-        "block_size": 4096,
-        "source": "prefill",
-        "storage": "memory",
-    }
+def _sched(block=BLOCK):
+    s = object.__new__(Scheduler)
+    s._cache_probe_seqs = deque(maxlen=4)
+    s.tokenizer = MagicMock()
+    s.config = MagicMock(spec=[])
+    s.config.paged_cache_block_size = block
+    return s
 
 
-def test_boundary_snapshot_diagnostics_preserve_store_skip_cause():
-    diagnostics = BoundarySnapshotDiagnostics()
-    diagnostics.record(
-        "override_miss",
-        reason="ssd_load_failed",
-        request_id="req-a",
-        token_count=4096,
-        block_size=2048,
-        available_boundaries=2,
+def _req(prompt, cached=0, rid="new", keys=None):
+    return SimpleNamespace(
+        request_id=rid,
+        prompt_token_ids=prompt,
+        cached_tokens=cached,
+        vlm_extra_keys_for_cache=keys,
     )
 
-    diagnostics.record(
-        "store_skip",
-        reason="boundary_snapshot_unavailable",
-        request_id="req-a",
-        token_count=4096,
-        block_size=2048,
-        available_boundaries=2,
-    )
 
-    assert diagnostics.snapshot()["last_event"]["cause"] == "ssd_load_failed"
+class TestSchedulerIntegration:
+    def test_divergence_updates_counter_and_lookup(self):
+        s = _sched()
+        s._cache_probe_seqs.append(("old", list(range(10000))))
+        prompt = list(range(8000)) + [999999] * 4143
+        s._log_prefix_divergence(_req(prompt, cached=6144))
+        s.waiting, s.prefilling, s.running = deque(), deque(), {}
+        s.num_requests_processed = s.total_prompt_tokens = 0
+        s.total_completion_tokens = 0
+        s.block_aware_cache = None
+        assert s.get_stats()["cache_outcomes"]["block_aligned_divergence"] == 1
+        assert s._last_prefix_cache_lookup["outcome"] == "block_aligned_divergence"
+
+    def test_cold_and_media_counted_without_probe(self):
+        s = _sched()
+        s._log_prefix_divergence(_req([1, 2, 3]))
+        s._log_prefix_divergence(_req([1, 2, 3], keys=("img",)))
+        counts = s._restore_outcomes.snapshot()
+        assert counts["cold"] == 1 and counts["media_keyed"] == 1
+
+    def test_info_line_gains_outcome_suffix(self, caplog):
+        s = _sched()
+        s._cache_probe_seqs.append(("old", list(range(10000))))
+        prompt = list(range(8000)) + [999999] * 4143
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_prefix_divergence(_req(prompt, cached=6144))
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert len(infos) == 1
+        assert infos[0].endswith("outcome=block_aligned_divergence")
+
+    def test_small_reprefill_still_silent(self, caplog):
+        s = _sched()
+        s._cache_probe_seqs.append(("old", list(range(9000))))
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_prefix_divergence(_req(list(range(9000)) + [7] * 100, cached=7200))
+        assert caplog.text == ""
 
 
-def test_boundary_snapshot_diagnostics_clear_resets_state():
-    diagnostics = BoundarySnapshotDiagnostics()
-    diagnostics.record(
-        "capture_attempt",
-        request_id="req-a",
-        token_count=4096,
-        block_size=2048,
-    )
-
-    diagnostics.clear()
-
-    snapshot = diagnostics.snapshot()
-    assert snapshot["capture_attempts"] == 0
-    assert snapshot["reasons"] == {}
-    assert snapshot["last_event"] is None
+class TestSchedulerTtftHook:
+    def test_logs_one_line_at_first_response_only(self, caplog):
+        s = _sched()
+        req = SimpleNamespace(
+            request_id="r1",
+            arrival_time=10.0,
+            num_prompt_tokens=500,
+            cached_tokens=100,
+            generation_started_at=14.0,
+        )
+        s._get_ttft_tracker().mark_restore("r1", 10.0, 11.0, 11.5, "hit_tail")
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            s._log_ttft_breakdown(req, 14.25)
+            s._log_ttft_breakdown(req, 15.0)
+        lines = [r.getMessage() for r in caplog.records]
+        assert lines == [
+            "TTFT breakdown: request=r1 prompt_tokens=500 cached_tokens=100 "
+            "cache=hit_tail hold_s=1.000 restore_s=0.500 prefill_s=2.500 "
+            "first_decode_s=0.250 ttft_s=4.250"
+        ]

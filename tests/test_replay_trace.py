@@ -99,6 +99,32 @@ class TestLogParsing:
         assert d["log_reprefill_tokens"] == 52000
         assert d["restore_source"] == "paged"
 
+    TTFT = (
+        "x - omlx.scheduler - INFO - [-] - TTFT breakdown: request=r1 prompt_tokens=60000 "
+        "cached_tokens=8000 cache=block_aligned_divergence hold_s=0.500 restore_s=0.250 "
+        "prefill_s=20.000 first_decode_s=0.125 ttft_s=20.875\n"
+    )
+    DIV_WITH_OUTCOME = DIV.replace(
+        "before diverging", "before diverging; outcome=block_aligned_divergence"
+    )
+
+    def test_ttft_breakdown_line(self):
+        d = rt.parse_request_log(self.TTFT)
+        assert d["cache_outcome"] == "block_aligned_divergence"
+        assert d["ttft_hold_s"] == 0.5
+        assert d["ttft_restore_s"] == 0.25
+        assert d["ttft_prefill_s"] == 20.0
+        assert d["ttft_first_decode_s"] == 0.125
+
+    def test_divergence_line_with_outcome_suffix_still_parses(self):
+        d = rt.parse_request_log(self.DIV_WITH_OUTCOME + self.RESTORE)
+        assert d["divergence_position"] == 8192
+        assert d["log_reprefill_tokens"] == 52000
+
+    def test_missing_ttft_line_gives_none(self):
+        d = rt.parse_request_log("nothing here\n")
+        assert d["cache_outcome"] is None and d["ttft_prefill_s"] is None
+
     def test_missing_lines_give_none(self):
         d = rt.parse_request_log("nothing here\n")
         assert d["divergence_position"] is None and d["restore_source"] is None
@@ -411,7 +437,9 @@ class TestLogAvailability:
     def test_attach_without_log_warns_once_and_nulls_log_fields(self, capsys):
         rows = rt.replay([rec(1, "a", [U("x")])], OkClient(), "reuse", lambda: "", log_available=False)
         for k in ("divergence_position", "comparable_tokens", "log_reprefill_tokens",
-                  "restore_source", "holds", "agings", "aborts", "tool_parser_failures", "pool_gb_max"):
+                  "restore_source", "holds", "agings", "aborts", "tool_parser_failures", "pool_gb_max",
+                  "cache_outcome", "ttft_hold_s", "ttft_restore_s", "ttft_prefill_s",
+                  "ttft_first_decode_s"):
             assert rows[0][k] is None, k
         s = rt.reduce_results(rows, "reuse", log_available=False)
         assert s["log_available"] is False
@@ -445,3 +473,32 @@ class TestReuseWallTime:
 
 def test_dead_text_helper_removed():
     assert not hasattr(rt, "_text")
+
+
+class TestCacheOutcomeSummary:
+    def _rows(self):
+        base = {"ok": True, "prompt_tokens": 10, "cached_tokens": 5, "class": "tool_loop",
+                "wall_s": 1.0, "ttft_s": 0.5}
+        return [
+            {**base, "cache_outcome": "hit_tail"},
+            {**base, "cache_outcome": "hit_tail"},
+            {**base, "cache_outcome": "cold"},
+            {**base, "cache_outcome": None},
+        ]
+
+    def test_outcome_counts_and_ttft_stage_medians(self):
+        rows = self._rows()
+        rows[0].update(ttft_prefill_s=2.0)
+        rows[1].update(ttft_prefill_s=4.0)
+        s = rt.reduce_results(rows, "full")
+        assert s["cache_outcomes"] == {"hit_tail": 2, "cold": 1}
+        assert s["ttft_prefill_p50_s"] == 3.0
+
+    def test_outcomes_null_without_log(self):
+        s = rt.reduce_results(self._rows(), "full", log_available=False)
+        assert s["cache_outcomes"] is None
+
+    def test_markdown_lists_outcomes(self):
+        s = rt.reduce_results(self._rows(), "full")
+        md = rt.render_markdown(s, {"variant": "v"})
+        assert "cache outcomes: cold 1, hit_tail 2" in md

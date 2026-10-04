@@ -48,6 +48,27 @@ class TestParseServerLogRagged:
         assert m["batch_max_b"] == 3
 
 
+class TestParseServerLogObservability:
+    EVICT = (
+        "x - omlx.cache.paged_ssd_cache - INFO - [-] - SSD cache evicted: blocks=11 "
+        "bytes=260 sidecars=1 window_s=60.0 total_blocks=12 total_bytes=360 "
+        "total_sidecars=1\n"
+        "x - omlx.cache.paged_ssd_cache - INFO - [-] - SSD cache evicted: blocks=4 "
+        "bytes=40 sidecars=0 window_s=61.0 total_blocks=16 total_bytes=400 "
+        "total_sidecars=1\n"
+    )
+
+    def test_ssd_evictions_are_summed_from_summary_lines(self):
+        m = bm.parse_server_log(self.EVICT)
+        assert m["ssd_evicted_blocks"] == 15
+        assert m["ssd_evicted_bytes"] == 300
+        assert m["ssd_evicted_sidecars"] == 1
+
+    def test_no_eviction_lines_give_zero(self):
+        m = bm.parse_server_log("nothing here\n")
+        assert (m["ssd_evicted_blocks"], m["ssd_evicted_bytes"]) == (0, 0)
+
+
 class TestParseServerLog:
     def test_aborts_split_memory_from_other(self):
         m = bm.parse_server_log(LOG)

@@ -33,6 +33,9 @@ _RE_RELEASE = re.compile(r"Releasing \S+ to decode")
 _RE_BACKFILL = re.compile(r"Backfilling \S+ past held ")
 _RE_AGING = re.compile(r"Aging: \S+ held \d+ s")
 _RE_RESTORE = re.compile(r"Prefix cache restore for \S+: source=\S+ cached=(\d+)")
+_RE_SSD_EVICTED = re.compile(
+    r"SSD cache evicted: blocks=(\d+) bytes=(\d+) sidecars=(\d+)"
+)
 _RE_CACHE_LIMIT = re.compile(r"MLX buffer cache limit set to ([\d.]+) GB")
 _RE_TQ_FUSED = re.compile(
     r"TurboQuant batched attention: (?:per-row fused|ragged single-launch) path "
@@ -61,6 +64,7 @@ def parse_server_log(text: str) -> dict[str, Any]:
     mtp_rows: list[int] = []
     ssd_init = False
     ssd_disabled = False
+    evicted = [0, 0, 0]  # blocks, bytes, sidecars from rate-limited summaries
 
     for line in text.splitlines():
         m = _RE_ABORT.search(line) or _RE_ABORT_HARD.search(line)
@@ -98,6 +102,10 @@ def parse_server_log(text: str) -> dict[str, Any]:
         m = _RE_RESTORE.search(line)
         if m:
             restores.append(int(m.group(1)))
+        m = _RE_SSD_EVICTED.search(line)
+        if m:
+            for i in range(3):
+                evicted[i] += int(m.group(i + 1))
         m = _RE_CACHE_LIMIT.search(line)
         if m:
             cache_limit = float(m.group(1))
@@ -142,6 +150,9 @@ def parse_server_log(text: str) -> dict[str, Any]:
         "batch_max_b": max([*tq_rows, *mtp_rows], default=0),
         "ssd_initialized": ssd_init and not ssd_disabled,
         "ssd_disabled": ssd_disabled,
+        "ssd_evicted_blocks": evicted[0],
+        "ssd_evicted_bytes": evicted[1],
+        "ssd_evicted_sidecars": evicted[2],
     }
 
 
