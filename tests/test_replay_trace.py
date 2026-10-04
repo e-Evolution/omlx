@@ -151,7 +151,8 @@ class TestClassifier:
 def row(prompt, cached, cls, ttft=None, flags=None, ok=True, **kw):
     return {"ok": ok, "prompt_tokens": prompt, "cached_tokens": cached, "class": cls,
             "ttft_s": ttft, "quality_flags": flags or [], "holds": 0, "agings": 0,
-            "tool_parser_failures": kw.get("tpf", 0), "aborts": kw.get("aborts", 0)}
+            "tool_parser_failures": kw.get("tpf", 0), "aborts": kw.get("aborts", 0),
+            "usage_missing": kw.get("usage_missing", False)}
 
 
 class TestReducer:
@@ -177,7 +178,7 @@ class TestReducer:
         full = rt.reduce_results(self.ROWS, "full")
         assert full["ttft_p50_s"] == pytest.approx(3.5)
         assert full["ttft_p90_s"] == pytest.approx(rt.percentile([0.5, 1.0, 6.0, 10.0], 90))
-        assert rt.reduce_results(self.ROWS, "reuse")["ttft_p50_s"] is None
+        assert "ttft_p50_s" not in rt.reduce_results(self.ROWS, "reuse")
 
     def test_percentile_edges(self):
         assert rt.percentile([], 50) is None
@@ -247,3 +248,200 @@ class TestReplayLoop:
         assert [b["messages"] for b in client.bodies] == [r["payload"]["messages"] for r in records]
         assert [r["class"] for r in rows] == ["cold_start", "unknown"]
         assert rows[0]["quality_flags"] == ["literal_think_close"]
+
+
+# --------------------------------------------------------------------------
+# Measurement-integrity follow-ups
+# --------------------------------------------------------------------------
+
+
+class FakeResp:
+    def __init__(self, status=200, body=None, lines=()):
+        self.status_code, self._body, self._lines = status, body or {}, list(lines)
+        self.text = json.dumps(self._body)
+
+    def json(self):
+        return self._body
+
+    def read(self):
+        pass
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeHttpx:
+    def __init__(self, resp):
+        self.resp = resp
+
+    def Timeout(self, *a, **k):
+        return None
+
+    def post(self, *a, **k):
+        return self.resp
+
+    def stream(self, *a, **k):
+        return self.resp
+
+
+def http_client(resp):
+    c = rt.HttpClient("http://x", {})
+    c._httpx = FakeHttpx(resp)
+    return c
+
+
+def sse(*objs, done=True):
+    out = [f"data: {json.dumps(o)}" for o in objs]
+    return out + (["data: [DONE]"] if done else [])
+
+
+TEXT = {"choices": [{"delta": {"content": "hi"}}]}
+
+
+class TestUsageMissing:
+    def test_reuse_200_without_usage_is_usage_missing_not_hit(self):
+        res = http_client(FakeResp(200, {"choices": []})).send({}, "reuse")
+        assert res["usage_missing"] is True
+        assert res["prompt_tokens"] is None and res["cached_tokens"] is None
+
+    def test_reuse_with_usage_not_missing(self):
+        body = {"usage": {"prompt_tokens": 9, "prompt_tokens_details": {"cached_tokens": 4}}}
+        res = http_client(FakeResp(200, body)).send({}, "reuse")
+        assert not res.get("usage_missing")
+        assert (res["prompt_tokens"], res["cached_tokens"]) == (9, 4)
+
+    def test_stream_without_usage_chunk_is_usage_missing(self):
+        res = http_client(FakeResp(200, lines=sse(TEXT))).send({}, "full")
+        assert res["usage_missing"] is True
+        assert res["ok"] is True
+        assert res["prompt_tokens"] is None and res["cached_tokens"] is None
+
+    def test_replay_row_marks_usage_missing_and_reducer_excludes_it(self):
+        class C:
+            def __init__(self):
+                self.n = 0
+
+            def send(self, body, mode):
+                self.n += 1
+                if self.n == 1:
+                    return {"ok": True, "usage_missing": True, "prompt_tokens": None,
+                            "cached_tokens": None, "wall_s": 1.0, "text": "", "error": None}
+                return {"ok": True, "prompt_tokens": 100, "cached_tokens": 50,
+                        "wall_s": 1.0, "text": "", "error": None}
+
+        rows = rt.replay([rec(1, "a", [U("x")]), rec(2, "a", [U("x"), A("y"), U("z")])],
+                         C(), "reuse", log_window=lambda: "")
+        assert rows[0]["usage_missing"] is True
+        assert rows[0]["prompt_tokens"] is None and rows[0]["cached_tokens"] is None
+        assert rows[1]["usage_missing"] is False
+        s = rt.reduce_results(rows, "reuse")
+        assert s["usage_missing"] == 1
+        assert s["prompt_tokens"] == 100 and s["cached_tokens"] == 50
+        assert s["hit_ratio"] == pytest.approx(0.5)
+        assert s["reprefilled_tokens"] == 50
+        assert sum(c["requests"] for c in s["by_class"].values()) == 1
+
+    def test_markdown_warns_prominently(self):
+        rows = [row(10, 5, "unknown", usage_missing=True)]
+        rows[0]["prompt_tokens"] = rows[0]["cached_tokens"] = None
+        md = rt.render_markdown(rt.reduce_results(rows, "reuse"), {"variant": "v"})
+        assert "WARNING" in md and "usage_missing" in md
+        clean = rt.render_markdown(rt.reduce_results([row(10, 5, "unknown")], "reuse"), {"variant": "v"})
+        assert "WARNING" not in clean
+
+
+class OkClient:
+    def __init__(self, fail_at=None, exc=KeyboardInterrupt):
+        self.calls, self.fail_at, self.exc = 0, fail_at, exc
+
+    def send(self, body, mode):
+        self.calls += 1
+        if self.calls - 1 == self.fail_at:
+            raise self.exc()
+        return {"ok": True, "prompt_tokens": 10, "cached_tokens": 0, "wall_s": 0.1,
+                "text": "", "error": None}
+
+
+RECS = [rec(i, "a", [U("x" * (i + 1))]) for i in range(4)]
+
+
+class TestPartialAndResume:
+    def test_rows_are_appended_incrementally_and_survive_interrupt(self, tmp_path):
+        rows, partial = rt.run_replay(RECS, OkClient(fail_at=2), "reuse", lambda: "", tmp_path)
+        assert partial is True and len(rows) == 2
+        lines = (tmp_path / "rows.jsonl").read_text().splitlines()
+        assert [json.loads(l)["index"] for l in lines] == [0, 1]
+
+    def test_generic_exception_also_yields_partial(self, tmp_path):
+        rows, partial = rt.run_replay(RECS, OkClient(fail_at=1, exc=RuntimeError), "reuse", lambda: "", tmp_path)
+        assert partial is True and len(rows) == 1
+
+    def test_complete_run_not_partial(self, tmp_path):
+        rows, partial = rt.run_replay(RECS, OkClient(), "reuse", lambda: "", tmp_path)
+        assert partial is False and len(rows) == 4
+
+    def test_resume_skips_rows_already_present(self, tmp_path):
+        rt.run_replay(RECS, OkClient(fail_at=2), "reuse", lambda: "", tmp_path)
+        client = OkClient()
+        rows, partial = rt.run_replay(RECS, client, "reuse", lambda: "", tmp_path, resume=True)
+        assert client.calls == 2 and partial is False
+        assert [r["index"] for r in rows] == [0, 1, 2, 3]
+        assert [json.loads(l)["index"] for l in (tmp_path / "rows.jsonl").read_text().splitlines()] == [0, 1, 2, 3]
+
+    def test_without_resume_file_is_restarted(self, tmp_path):
+        rt.run_replay(RECS, OkClient(), "reuse", lambda: "", tmp_path)
+        rt.run_replay(RECS[:1], OkClient(), "reuse", lambda: "", tmp_path)
+        assert len((tmp_path / "rows.jsonl").read_text().splitlines()) == 1
+
+    def test_report_marked_partial(self, tmp_path):
+        rows, _ = rt.run_replay(RECS, OkClient(fail_at=1), "reuse", lambda: "", tmp_path)
+        summary = rt.reduce_results(rows, "reuse", partial=True)
+        assert summary["partial"] is True
+        assert "PARTIAL" in rt.render_markdown(summary, {"variant": "v"})
+        assert rt.reduce_results(rows, "reuse")["partial"] is False
+
+
+class TestLogAvailability:
+    def test_attach_without_log_warns_once_and_nulls_log_fields(self, capsys):
+        rows = rt.replay([rec(1, "a", [U("x")])], OkClient(), "reuse", lambda: "", log_available=False)
+        for k in ("divergence_position", "comparable_tokens", "log_reprefill_tokens",
+                  "restore_source", "holds", "agings", "aborts", "tool_parser_failures", "pool_gb_max"):
+            assert rows[0][k] is None, k
+        s = rt.reduce_results(rows, "reuse", log_available=False)
+        assert s["log_available"] is False
+        assert s["holds"] is None and s["agings"] is None and s["aborts"] is None
+        assert s["quality"]["tool_parser_failures"] is None
+        assert "n/a" in rt.render_markdown(s, {"variant": "v"})
+
+    def test_log_available_default_true(self):
+        rows = rt.replay([rec(1, "a", [U("x")])], OkClient(), "reuse", lambda: "")
+        assert rows[0]["holds"] == 0
+        assert rt.reduce_results(rows, "reuse")["log_available"] is True
+
+    def test_startup_warning_text(self):
+        assert "--server-log" in rt.LOG_UNAVAILABLE_WARNING
+
+
+class TestReuseWallTime:
+    def test_reuse_client_does_not_populate_ttft(self):
+        body = {"usage": {"prompt_tokens": 9, "prompt_tokens_details": {"cached_tokens": 4}}}
+        res = http_client(FakeResp(200, body)).send({}, "reuse")
+        assert "ttft_s" not in res and res["wall_s"] is not None
+
+    def test_reuse_rows_and_summary_have_wall_only(self):
+        rows = rt.replay([rec(1, "a", [U("x")])], OkClient(), "reuse", lambda: "")
+        assert rows[0]["ttft_s"] is None and rows[0]["wall_s"] == 0.1
+        s = rt.reduce_results(rows, "reuse")
+        assert "ttft_p50_s" not in s and "ttft_p90_s" not in s
+        assert s["wall_p50_s"] == pytest.approx(0.1)
+        assert "TTFT" not in rt.render_markdown(s, {"variant": "v"})
+
+
+def test_dead_text_helper_removed():
+    assert not hasattr(rt, "_text")
