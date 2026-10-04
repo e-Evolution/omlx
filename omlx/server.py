@@ -190,6 +190,7 @@ from .api.utils import (
     find_lone_surrogate,
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
+    normalize_mid_system_policy,
     prepare_system_messages_for_template,
     cache_reasoning_output,
     uses_native_reasoning_content,
@@ -2047,10 +2048,24 @@ async def _ensure_tokenizer_for_system_probe(
     await engine.start()
 
 
-def _unsupported_mid_system_policy() -> str:
+def _unsupported_mid_system_policy(model_id: str | None = None) -> str:
+    """Resolve the policy for mid-transcript system messages.
+
+    Order: per-model ``mid_system_policy`` > global/env ``mid_system_policy`` >
+    legacy ``preserve_mid_system_cache`` (user_note_safe / strict).
+    """
+    ms = get_model_settings_for_request(model_id) if model_id else None
+    policy = normalize_mid_system_policy(getattr(ms, "mid_system_policy", None))
+    if policy:
+        return policy
     settings = _server_state.global_settings
     preserve_cache = True
     if settings is not None:
+        policy = normalize_mid_system_policy(
+            getattr(settings.server, "mid_system_policy", None)
+        )
+        if policy:
+            return policy
         preserve_cache = bool(
             getattr(settings.server, "preserve_mid_system_cache", True)
         )
@@ -4640,7 +4655,7 @@ async def create_chat_completion(
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=is_partial,
             merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+            unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
         )
         # Validate context window before sending to model
         try:
@@ -7278,7 +7293,7 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=is_partial,
             merge_consecutive_roles=merge_system_fallback_roles,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+            unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
         )
 
         # Validate context window before sending to model
@@ -7600,7 +7615,7 @@ async def _tokenize_chat_messages(
         chat_template_kwargs=merged_ct_kwargs or None,
         is_partial=is_partial,
         merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
-        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
     )
     add_generation_prompt = (
         None if is_partial or request.add_generation_prompt else False
@@ -7953,7 +7968,7 @@ async def create_response(
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=False,
             merge_consecutive_roles=True,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+            unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
         )
 
         # Validate context window

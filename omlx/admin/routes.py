@@ -42,7 +42,7 @@ from pydantic import (
 from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
-from ..api.utils import _try_parse_json
+from ..api.utils import _try_parse_json, normalize_mid_system_policy
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -343,6 +343,8 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     cache_reasoning_output: bool | None = None
+    # "strict" | "user_note_safe" | "inline_note" (None = server default).
+    mid_system_policy: str | None = None
     qwen4_ple_ssd_offload: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
@@ -2826,6 +2828,19 @@ async def update_model_settings(
         current_settings.preserve_thinking = request.preserve_thinking
     if "cache_reasoning_output" in sent:
         current_settings.cache_reasoning_output = request.cache_reasoning_output
+    if "mid_system_policy" in sent:
+        policy = request.mid_system_policy
+        if policy is not None and normalize_mid_system_policy(policy) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "mid_system_policy must be one of strict, user_note_safe, "
+                    "inline_note (or null)."
+                ),
+            )
+        current_settings.mid_system_policy = (
+            normalize_mid_system_policy(policy) if policy is not None else None
+        )
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs
     if "forced_ct_kwargs" in sent:

@@ -16,6 +16,18 @@ from omlx.model_settings import (
 )
 
 
+class TestMidSystemPolicySetting:
+    def test_default_is_none_and_omitted_from_dict(self):
+        ms = ModelSettings()
+        assert ms.mid_system_policy is None
+        assert "mid_system_policy" not in ms.to_dict()
+
+    def test_round_trip(self):
+        ms = ModelSettings.from_dict({"mid_system_policy": "inline_note"})
+        assert ms.mid_system_policy == "inline_note"
+        assert ms.to_dict()["mid_system_policy"] == "inline_note"
+
+
 class TestModelSettings:
     """Tests for ModelSettings dataclass."""
 

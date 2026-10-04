@@ -43,7 +43,14 @@ What it changes in the copy:
   `OMLX_BATCHED_DECODE_HOLD_MAX_S=120` (while that gate holds a long request,
   shorter requests behind it whose combined context still fits are admitted
   past it; once the held request has waited 120 s backfill stops so it cannot
-  starve. 0 = never backfill, strict head-of-line).
+  starve. 0 = never backfill, strict head-of-line),
+  `OMLX_MID_SYSTEM_POLICY=inline_note` (pi sends system-prompt changes as
+  mid-transcript system messages. Templates that reject them used to get them
+  folded into the leading system message, which rewrites the prompt head and
+  invalidates the prefix cache. `inline_note` renders each one in place as its
+  own `<system-update>` user message, so earlier tokens never change. A
+  per-model `mid_system_policy` setting overrides it; upstream default is
+  `user_note_safe`).
   The Swift app passes its own process environment to the server
   (`PythonRuntime.makeEnvironment`) and `omlx/settings.py` applies these
   variables after `settings.json`. Upstream defaults in the repo stay off.

@@ -286,6 +286,7 @@ def test_default_env_enables_d1_and_park(bfa):
         "OMLX_MLX_CACHE_LIMIT_GB": "16",
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000",
         "OMLX_BATCHED_DECODE_HOLD_MAX_S": "120",
+        "OMLX_MID_SYSTEM_POLICY": "inline_note",
     }
     assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
     assert bfa.FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS == "200000"

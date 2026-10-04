@@ -800,3 +800,33 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
             assert exc.value.status_code == 422
 
     manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mid_system_policy_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mid_system_policy="inline_note"),
+    )
+    assert settings.mid_system_policy == "inline_note"
+    assert result["settings"]["mid_system_policy"] == "inline_note"
+
+    await _update_settings(
+        pool, settings, admin_routes.ModelSettingsRequest(mid_system_policy=None)
+    )
+    assert settings.mid_system_policy is None
+
+
+@pytest.mark.asyncio
+async def test_mid_system_policy_rejects_unknown_value():
+    pool, _ = _failed_pool()
+    with pytest.raises(admin_routes.HTTPException, match="mid_system_policy"):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(mid_system_policy="bogus"),
+        )

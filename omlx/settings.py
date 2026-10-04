@@ -200,6 +200,10 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    # Runtime-only override (env OMLX_MID_SYSTEM_POLICY, never persisted):
+    # "strict" | "user_note_safe" | "inline_note". None derives the policy from
+    # preserve_mid_system_cache. A per-model setting still takes precedence.
+    mid_system_policy: str | None = None
     qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
@@ -239,8 +243,10 @@ class ServerSettings:
         return size
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return asdict(self)
+        """Convert to dictionary (runtime-only env overrides are not persisted)."""
+        data = asdict(self)
+        data.pop("mid_system_policy", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
@@ -1267,6 +1273,14 @@ class GlobalSettings:
             self.server.preserve_mid_system_cache = (
                 preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
             )
+        if raw_policy := os.getenv("OMLX_MID_SYSTEM_POLICY"):
+            from .api.utils import normalize_mid_system_policy
+
+            policy = normalize_mid_system_policy(raw_policy)
+            if policy is None:
+                logger.warning(f"Invalid OMLX_MID_SYSTEM_POLICY value: {raw_policy}")
+            else:
+                self.server.mid_system_policy = policy
         if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
             try:
                 self.server.gpu_keep_warm_interval = float(gpu_keep_warm)
