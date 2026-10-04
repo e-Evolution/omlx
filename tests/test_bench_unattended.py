@@ -1012,6 +1012,37 @@ def test_fork_overlay_keeps_app_kernels_and_takes_fork_sources(tmp_path):
     assert "omlx.cli" in launcher.read_text()
 
 
+class TestBenchOverrides:
+    def test_extra_env_parsed_and_restricted_to_omlx_keys(self):
+        import bench_premises as bp
+
+        env = {"OMLX_BENCH_EXTRA_ENV": "OMLX_A=1, OMLX_B=x=y"}
+        assert bp.bench_extra_env(env) == {"OMLX_A": "1", "OMLX_B": "x=y"}
+        assert bp.bench_extra_env({}) == {}
+        with pytest.raises(ValueError):
+            bp.bench_extra_env({"OMLX_BENCH_EXTRA_ENV": "PATH=/x"})
+        with pytest.raises(ValueError):
+            bp.bench_extra_env({"OMLX_BENCH_EXTRA_ENV": "OMLX_A"})
+
+    def test_fork_repo_defaults_to_harness_tree(self, tmp_path):
+        import bench_premises as bp
+
+        assert bp.bench_fork_repo({}) == bp.REPO
+        (tmp_path / "omlx").mkdir()
+        got = bp.bench_fork_repo({"OMLX_BENCH_FORK_REPO": str(tmp_path)})
+        assert got == tmp_path
+        with pytest.raises(ValueError):
+            bp.bench_fork_repo({"OMLX_BENCH_FORK_REPO": str(tmp_path / "nope")})
+
+    def test_server_merges_extra_env(self, monkeypatch, tmp_path):
+        import bench_premises as bp
+
+        monkeypatch.setenv("OMLX_BENCH_EXTRA_ENV", "OMLX_MID_SYSTEM_POLICY=inline_note")
+        srv = bp.Server("fork", "REPLAY", 8002, 1, tmp_path, False)
+        assert srv.env["OMLX_MID_SYSTEM_POLICY"] == "inline_note"
+        assert srv.env["OMLX_MLX_CACHE_LIMIT_GB"] == "16"
+
+
 def test_fork_overlay_refuses_to_delete_foreign_dir(tmp_path):
     import bench_premises as bp
     import pytest

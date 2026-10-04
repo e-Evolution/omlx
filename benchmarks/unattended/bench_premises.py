@@ -136,6 +136,35 @@ def variant_env(
     return env
 
 
+def bench_extra_env(environ: Any = None) -> dict[str, str]:
+    """Extra OMLX_* server env from ``OMLX_BENCH_EXTRA_ENV="K=V,K2=V2"``.
+
+    Lets a bench run enable features the fork app turns on (for example
+    OMLX_MID_SYSTEM_POLICY) without hard-coding them for every variant.
+    """
+    raw = (environ if environ is not None else os.environ).get("OMLX_BENCH_EXTRA_ENV", "")
+    out: dict[str, str] = {}
+    for item in (p.strip() for p in raw.split(",")):
+        if not item:
+            continue
+        key, sep, val = item.partition("=")
+        if not sep or not key.startswith("OMLX_"):
+            raise ValueError(f"OMLX_BENCH_EXTRA_ENV entry must be OMLX_*=value: {item!r}")
+        out[key] = val
+    return out
+
+
+def bench_fork_repo(environ: Any = None) -> Path:
+    """Source tree overlaid on the app runtime: ``OMLX_BENCH_FORK_REPO`` or the harness tree."""
+    raw = (environ if environ is not None else os.environ).get("OMLX_BENCH_FORK_REPO")
+    if not raw:
+        return REPO
+    path = Path(raw).expanduser().resolve()
+    if not (path / "omlx").is_dir():
+        raise ValueError(f"OMLX_BENCH_FORK_REPO has no omlx/ package: {path}")
+    return path
+
+
 def variant_model_settings(ms: dict[str, Any], variant: str) -> dict[str, Any]:
     """Per-variant model_settings.json tweaks (fork-nomtp: MTP off)."""
     out = copy.deepcopy(ms)
@@ -273,6 +302,8 @@ class Server:
         self.base = BENCH_BASE_ROOT / tag
         self.cache_dir = f"{CACHE_ROOT}/{tag}"
         self.env = variant_env(variant, premise, batched_limit)
+        if variant != "upstream":
+            self.env.update(bench_extra_env())
         self.env.update(debug_env(variant, premise, self.base))
         dump = self.env.get("OMLX_DEBUG_LOGPROB_DUMP")
         self.dump_dir = Path(dump) if dump else None
@@ -319,7 +350,7 @@ class Server:
         elif os.environ.get("OMLX_BENCH_FORK_RUNTIME", "app") == "venv":
             exe = str(FORK_BIN)
         else:
-            exe = str(build_fork_overlay())
+            exe = str(build_fork_overlay(fork_repo=bench_fork_repo()))
         return [
             exe,
             "serve",
