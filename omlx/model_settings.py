@@ -348,6 +348,10 @@ class ModelSettings:
     # How non-leading system messages the template cannot render are handled:
     # "strict" | "user_note_safe" | "inline_note" (None = server default).
     mid_system_policy: Optional[str] = None
+    # Deterministic thinking retention (omlx/api/thinking_retention.py): keep
+    # agent-loop thinking across image markers and system-update notes, and
+    # strip it once more than this many tokens would be retained. None = off.
+    thinking_retention_guard_tokens: Optional[int] = None
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

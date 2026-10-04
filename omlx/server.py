@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -171,6 +171,10 @@ from .api.tool_calling import (
     parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
+)
+from .api.thinking_retention import (
+    apply_thinking_retention,
+    normalize_guard_tokens,
 )
 from .api.utils import (
     clean_special_tokens,
@@ -1945,6 +1949,73 @@ async def _ensure_tokenizer_for_system_probe(
     if getattr(engine, "tokenizer", None) is not None:
         return
     await engine.start()
+
+
+def _thinking_retention_guard_tokens(model_id: str | None = None) -> int | None:
+    """Resolve the thinking-retention guard (per-model > global/env > off)."""
+    ms = get_model_settings_for_request(model_id) if model_id else None
+    guard = normalize_guard_tokens(getattr(ms, "thinking_retention_guard_tokens", None))
+    if guard is not None:
+        return guard
+    settings = _server_state.global_settings
+    if settings is None:
+        return None
+    return normalize_guard_tokens(
+        getattr(settings.server, "thinking_retention_guard_tokens", None)
+    )
+
+
+def _engine_token_counter(engine: Any) -> Callable[[str], int]:
+    tokenizer = engine.tokenizer
+
+    def count(text: str) -> int:
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            return len(tokenizer.encode(text))
+
+    return count
+
+
+def _apply_thinking_retention(
+    messages: list[dict],
+    engine: Any,
+    model_id: str | None,
+    chat_template_kwargs: dict[str, Any] | None,
+) -> tuple[list[dict], dict[str, Any] | None, bool]:
+    """Apply deterministic thinking retention to prepared template messages.
+
+    Call after ``prepare_system_messages_for_template`` and after the forced
+    chat_template_kwargs merge, and before ``cache_reasoning_output()``.  Only
+    templates advertising ``preserve_thinking`` support are touched.  When the
+    module takes control the returned kwargs are a copy with
+    ``preserve_thinking=True`` (the forced value is overridden on purpose: the
+    module strips exactly the turns that must be stripped).  Otherwise the
+    inputs come back unchanged.
+    """
+    guard = _thinking_retention_guard_tokens(model_id)
+    if guard is None:
+        return messages, chat_template_kwargs, False
+    if (chat_template_kwargs or {}).get("enable_thinking") is False:
+        return messages, chat_template_kwargs, False
+    entry = get_engine_pool().get_entry(model_id) if model_id else None
+    if entry is None or getattr(entry, "preserve_thinking_default", None) is not True:
+        return messages, chat_template_kwargs, False
+    if getattr(engine, "tokenizer", None) is None:
+        return messages, chat_template_kwargs, False
+    result = apply_thinking_retention(messages, _engine_token_counter(engine), guard)
+    if not result.took_control:
+        return messages, chat_template_kwargs, False
+    logger.debug(
+        "Thinking retention took control (guard=%d, stripped_turns=%d)",
+        guard,
+        result.stripped_turns,
+    )
+    return (
+        result.messages,
+        {**(chat_template_kwargs or {}), "preserve_thinking": True},
+        True,
+    )
 
 
 def _unsupported_mid_system_policy(model_id: str | None = None) -> str:
@@ -4284,6 +4355,9 @@ async def create_chat_completion(
             is_partial=is_partial,
             merge_consecutive_roles=merge_system_fallback_roles,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
+        )
+        messages, merged_ct_kwargs, _ = _apply_thinking_retention(
+            messages, engine, resolved_model, merged_ct_kwargs
         )
         try:
             num_prompt_tokens = engine.count_chat_tokens(
@@ -6779,6 +6853,17 @@ async def create_anthropic_message(
             merge_consecutive_roles=merge_system_fallback_roles,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
         )
+        messages, merged_ct_kwargs, retention_took_control = _apply_thinking_retention(
+            messages, engine, resolved_model, merged_ct_kwargs
+        )
+        if retention_took_control:
+            # chat_kwargs was assembled before the messages were prepared.
+            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+            chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+                ms,
+                native_reasoning=native_reasoning,
+                chat_template_kwargs=merged_ct_kwargs,
+            )
 
         # Validate context window before sending to model
         try:
@@ -7232,6 +7317,9 @@ async def create_response(
             is_partial=False,
             merge_consecutive_roles=True,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
+        )
+        messages, merged_ct_kwargs, _ = _apply_thinking_retention(
+            messages, engine, resolved_model, merged_ct_kwargs
         )
 
         # Validate context window
