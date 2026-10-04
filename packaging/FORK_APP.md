@@ -50,7 +50,20 @@ What it changes in the copy:
   invalidates the prefix cache. `inline_note` renders each one in place as its
   own `<system-update>` user message, so earlier tokens never change. A
   per-model `mid_system_policy` setting overrides it; upstream default is
-  `user_note_safe`).
+  `user_note_safe`),
+  `OMLX_THINKING_RETENTION_GUARD_TOKENS=20000` (pi's `Attached image(s) from
+  tool result:` message and the system-update notes above are user messages,
+  so the Qwen template treats each as a new query and strips the agent loop's
+  thinking mid-history, breaking the prefix cache. With the guard set, those
+  messages no longer move the strip boundary and thinking is retained within
+  the loop, but never more than about 20000 tokens: past that, everything
+  before the turn that crossed the guard is stripped once. A real user
+  message still strips all earlier thinking. Never globally enables
+  `preserve_thinking`, which corrupted output at about 50k retained tokens.
+  Applies only to templates that advertise `preserve_thinking`. Stripped turns
+  render an empty `<think>` block once the module takes control. A per-model
+  `thinking_retention_guard_tokens` setting overrides it; upstream default is
+  off).
   The Swift app passes its own process environment to the server
   (`PythonRuntime.makeEnvironment`) and `omlx/settings.py` applies these
   variables after `settings.json`. Upstream defaults in the repo stay off.

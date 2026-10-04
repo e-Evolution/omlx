@@ -830,3 +830,38 @@ async def test_mid_system_policy_rejects_unknown_value():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(mid_system_policy="bogus"),
         )
+
+
+@pytest.mark.asyncio
+async def test_thinking_retention_guard_is_persisted_and_cleared():
+    pool, _ = _failed_pool()
+    settings = ModelSettings()
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(thinking_retention_guard_tokens=20000),
+    )
+    assert settings.thinking_retention_guard_tokens == 20000
+    assert result["settings"]["thinking_retention_guard_tokens"] == 20000
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(thinking_retention_guard_tokens=None),
+    )
+    assert settings.thinking_retention_guard_tokens is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, -5])
+async def test_thinking_retention_guard_rejects_non_positive(bad):
+    pool, _ = _failed_pool()
+    with pytest.raises(
+        admin_routes.HTTPException, match="thinking_retention_guard_tokens"
+    ):
+        await _update_settings(
+            pool,
+            ModelSettings(),
+            admin_routes.ModelSettingsRequest(thinking_retention_guard_tokens=bad),
+        )

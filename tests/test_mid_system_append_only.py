@@ -14,6 +14,7 @@ import pytest
 from jinja2 import StrictUndefined
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from omlx.api.thinking_retention import apply_thinking_retention
 from omlx.api.utils import (
     MID_SYSTEM_NOTE_KEY,
     normalize_mid_system_policy,
@@ -118,16 +119,30 @@ class TestMidSystemAppendOnly:
         head_of_n1 = n1[: n1.index("<|im_end|>")]
         assert "Updated system prompt section" in head_of_n1
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "A2 pending: with preserve_thinking=false the Qwen template anchors "
-            "last_query_index on the user-role note and strips earlier thinking"
-        ),
-    )
-    def test_inline_note_without_thinking_retention_is_append_only(self):
+    def test_inline_note_with_thinking_retention_is_append_only(self):
+        # A1 left this as a strict xfail: with preserve_thinking=false the
+        # Qwen template anchors last_query_index on the user-role note and
+        # strips earlier thinking. The A2 retention pass treats the note as a
+        # non-query message and renders with preserve_thinking=true.
+        def render_retained(messages):
+            tok = _Tokenizer()
+            prepared = prepare_system_messages_for_template(
+                messages, tok, unsupported_mid_system_policy="inline_note"
+            )
+            result = apply_thinking_retention(prepared, lambda t: len(t.split()), 20000)
+            assert result.took_control
+            return tok.apply_chat_template(
+                result.messages, add_generation_prompt=False, preserve_thinking=True
+            )
+
+        n1 = render_retained(TURN_N1)
+        assert n1.startswith(render_retained(TURN_N + [UPDATE]))
+        assert "Need to inspect the file." in n1  # thinking kept across the note
+
+    def test_inline_note_without_retention_still_strips_thinking(self):
+        # Pins the mechanism the retention pass exists for.
         kw = {"preserve_thinking": False}
-        assert render(TURN_N1, "inline_note", **kw).startswith(
+        assert not render(TURN_N1, "inline_note", **kw).startswith(
             render(TURN_N, "inline_note", **kw)
         )
 

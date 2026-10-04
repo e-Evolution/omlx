@@ -204,6 +204,10 @@ class ServerSettings:
     # "strict" | "user_note_safe" | "inline_note". None derives the policy from
     # preserve_mid_system_cache. A per-model setting still takes precedence.
     mid_system_policy: str | None = None
+    # Runtime-only override (env OMLX_THINKING_RETENTION_GUARD_TOKENS, never
+    # persisted): token guard for deterministic thinking retention. None = off.
+    # A per-model setting still takes precedence.
+    thinking_retention_guard_tokens: int | None = None
     qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
@@ -246,6 +250,7 @@ class ServerSettings:
         """Convert to dictionary (runtime-only env overrides are not persisted)."""
         data = asdict(self)
         data.pop("mid_system_policy", None)
+        data.pop("thinking_retention_guard_tokens", None)
         return data
 
     @classmethod
@@ -1281,6 +1286,16 @@ class GlobalSettings:
                 logger.warning(f"Invalid OMLX_MID_SYSTEM_POLICY value: {raw_policy}")
             else:
                 self.server.mid_system_policy = policy
+        if raw_guard := os.getenv("OMLX_THINKING_RETENTION_GUARD_TOKENS"):
+            from .api.thinking_retention import normalize_guard_tokens
+
+            guard = normalize_guard_tokens(raw_guard)
+            if guard is None:
+                logger.warning(
+                    f"Invalid OMLX_THINKING_RETENTION_GUARD_TOKENS value: {raw_guard}"
+                )
+            else:
+                self.server.thinking_retention_guard_tokens = guard
         if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
             try:
                 self.server.gpu_keep_warm_interval = float(gpu_keep_warm)

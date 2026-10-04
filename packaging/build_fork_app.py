@@ -77,6 +77,11 @@ FORK_ENV = {
     # mid-transcript system messages; folding them into the system head breaks
     # the prefix cache for the whole conversation.
     "OMLX_MID_SYSTEM_POLICY": "inline_note",
+    # Deterministic thinking retention: pi's image marker and the system-update
+    # notes above would otherwise strip the agent loop's thinking mid-history.
+    # Retained thinking is capped at about this many tokens (the unbounded
+    # preserve_thinking=true corrupted output at about 50k).
+    "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap

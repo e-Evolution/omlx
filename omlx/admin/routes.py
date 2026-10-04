@@ -42,6 +42,7 @@ from pydantic import (
 from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
+from ..api.thinking_retention import normalize_guard_tokens
 from ..api.utils import _try_parse_json, normalize_mid_system_policy
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
@@ -345,6 +346,8 @@ class ModelSettingsRequest(BaseModel):
     cache_reasoning_output: bool | None = None
     # "strict" | "user_note_safe" | "inline_note" (None = server default).
     mid_system_policy: str | None = None
+    # Positive token guard for deterministic thinking retention (None = off).
+    thinking_retention_guard_tokens: int | None = None
     qwen4_ple_ssd_offload: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
@@ -2841,6 +2844,17 @@ async def update_model_settings(
         current_settings.mid_system_policy = (
             normalize_mid_system_policy(policy) if policy is not None else None
         )
+    if "thinking_retention_guard_tokens" in sent:
+        guard = request.thinking_retention_guard_tokens
+        if guard is not None and normalize_guard_tokens(guard) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "thinking_retention_guard_tokens must be a positive "
+                    "integer (or null)."
+                ),
+            )
+        current_settings.thinking_retention_guard_tokens = guard
     if "chat_template_kwargs" in sent:
         current_settings.chat_template_kwargs = request.chat_template_kwargs
     if "forced_ct_kwargs" in sent:

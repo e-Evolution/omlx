@@ -279,6 +279,13 @@ def test_fork_version_keeps_the_numeric_prefix_the_swift_parser_reads(bfa):
     assert "a" not in low and "b" not in low
 
 
+def test_fork_env_guard_is_a_valid_thinking_retention_value(bfa):
+    from omlx.api.thinking_retention import normalize_guard_tokens
+
+    raw = bfa.FORK_ENV["OMLX_THINKING_RETENTION_GUARD_TOKENS"]
+    assert normalize_guard_tokens(raw) == 20000
+
+
 def test_default_env_enables_d1_and_park(bfa):
     assert bfa.FORK_ENV == {
         "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
@@ -287,6 +294,7 @@ def test_default_env_enables_d1_and_park(bfa):
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000",
         "OMLX_BATCHED_DECODE_HOLD_MAX_S": "120",
         "OMLX_MID_SYSTEM_POLICY": "inline_note",
+        "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
     }
     assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
     assert bfa.FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS == "200000"

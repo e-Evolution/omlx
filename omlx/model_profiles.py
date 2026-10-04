@@ -38,6 +38,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "guided_grammar",
     "max_tool_result_tokens",
     "mid_system_policy",
+    "thinking_retention_guard_tokens",
     "chat_template_kwargs",
     "forced_ct_kwargs",
 )
