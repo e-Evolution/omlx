@@ -1965,14 +1965,53 @@ def _thinking_retention_guard_tokens(model_id: str | None = None) -> int | None:
     )
 
 
-def _engine_token_counter(engine: Any) -> Callable[[str], int]:
-    tokenizer = engine.tokenizer
+_retention_warned_reasons: set[str] = set()
+
+
+def _warn_retention_degraded(reason: str) -> None:
+    """Log a retention degradation once per process per reason."""
+    if reason in _retention_warned_reasons:
+        return
+    _retention_warned_reasons.add(reason)
+    logger.warning(
+        "Thinking retention skipped, request continues unchanged: %s", reason
+    )
+
+
+def _retention_encoder(engine: Any) -> Callable[..., Any] | None:
+    """Find a usable ``encode`` on the engine.
+
+    Tries ``tokenizer``, ``processor.tokenizer`` and ``_processor.tokenizer``
+    (VLM engines may expose a processor whose own object has no ``encode``).
+    """
+    candidates: list[Any] = [getattr(engine, "tokenizer", None)]
+    for attr in ("processor", "_processor"):
+        candidates.append(getattr(getattr(engine, attr, None), "tokenizer", None))
+    for cand in candidates:
+        encode = getattr(cand, "encode", None) if cand is not None else None
+        if callable(encode):
+            return encode
+    return None
+
+
+def _engine_token_counter(engine: Any) -> Callable[[str], int] | None:
+    """Return a token counter, or None when no usable encoder exists.
+
+    The counter raises ``ValueError`` when ``encode`` returns something that is
+    not a sized sequence; the caller treats any exception as a degradation.
+    """
+    encode = _retention_encoder(engine)
+    if encode is None:
+        return None
 
     def count(text: str) -> int:
         try:
-            return len(tokenizer.encode(text, add_special_tokens=False))
+            ids = encode(text, add_special_tokens=False)
         except TypeError:
-            return len(tokenizer.encode(text))
+            ids = encode(text)
+        if ids is None or isinstance(ids, (str, bytes)) or not hasattr(ids, "__len__"):
+            raise ValueError(f"encode returned {type(ids).__name__}, not a sequence")
+        return len(ids)
 
     return count
 
@@ -1986,12 +2025,16 @@ def _apply_thinking_retention(
     """Apply deterministic thinking retention to prepared template messages.
 
     Call after ``prepare_system_messages_for_template`` and after the forced
-    chat_template_kwargs merge, and before ``cache_reasoning_output()``.  Only
-    templates advertising ``preserve_thinking`` support are touched.  When the
-    module takes control the returned kwargs are a copy with
-    ``preserve_thinking=True`` (the forced value is overridden on purpose: the
-    module strips exactly the turns that must be stripped).  Otherwise the
-    inputs come back unchanged.
+    chat_template_kwargs merge, and before anything that reads
+    ``chat_template_kwargs`` or the messages.  Chat completions and Responses
+    build ``chat_kwargs`` and ``cache_reasoning_output()`` after this call; the
+    Anthropic path calls it before assembling ``chat_kwargs`` as well, so every
+    consumer sees the rebound kwargs.  Only templates advertising
+    ``preserve_thinking`` support are touched.  When the module takes control
+    the returned kwargs are a copy with ``preserve_thinking=True`` (the forced
+    value is overridden on purpose).  Otherwise, and on any failure (no
+    encoder, encode raising or returning garbage), the inputs come back
+    unchanged: retention never fails a request.
     """
     guard = _thinking_retention_guard_tokens(model_id)
     if guard is None:
@@ -2001,9 +2044,15 @@ def _apply_thinking_retention(
     entry = get_engine_pool().get_entry(model_id) if model_id else None
     if entry is None or getattr(entry, "preserve_thinking_default", None) is not True:
         return messages, chat_template_kwargs, False
-    if getattr(engine, "tokenizer", None) is None:
+    try:
+        counter = _engine_token_counter(engine)
+        if counter is None:
+            _warn_retention_degraded("engine exposes no tokenizer with encode()")
+            return messages, chat_template_kwargs, False
+        result = apply_thinking_retention(messages, counter, guard)
+    except Exception as e:  # noqa: BLE001 - retention must never fail a request
+        _warn_retention_degraded(f"{type(e).__name__}: {e}")
         return messages, chat_template_kwargs, False
-    result = apply_thinking_retention(messages, _engine_token_counter(engine), guard)
     if not result.took_control:
         return messages, chat_template_kwargs, False
     logger.debug(
@@ -6833,16 +6882,6 @@ async def create_anthropic_message(
         if internal_tools:
             chat_kwargs["tools"] = internal_tools
 
-        # Add chat template kwargs
-        if merged_ct_kwargs:
-            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-        # Forward partial-mode decision to the engine explicitly
-        chat_kwargs["is_partial"] = is_partial
-        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
-            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
-        )
-
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
             messages,
@@ -6853,17 +6892,19 @@ async def create_anthropic_message(
             merge_consecutive_roles=merge_system_fallback_roles,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(resolved_model),
         )
-        messages, merged_ct_kwargs, retention_took_control = _apply_thinking_retention(
+        messages, merged_ct_kwargs, _ = _apply_thinking_retention(
             messages, engine, resolved_model, merged_ct_kwargs
         )
-        if retention_took_control:
-            # chat_kwargs was assembled before the messages were prepared.
+
+        # Add chat template kwargs
+        if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-            chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
-                ms,
-                native_reasoning=native_reasoning,
-                chat_template_kwargs=merged_ct_kwargs,
-            )
+
+        # Forward partial-mode decision to the engine explicitly
+        chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+        )
 
         # Validate context window before sending to model
         try:
