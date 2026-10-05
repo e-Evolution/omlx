@@ -9,10 +9,15 @@ evaluation of each premise.
 
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
 import os
 import re
+import struct
+import time
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -154,6 +159,330 @@ def parse_server_log(text: str) -> dict[str, Any]:
         "ssd_evicted_bytes": evicted[1],
         "ssd_evicted_sidecars": evicted[2],
     }
+
+
+# --------------------------------------------------------------------------
+# P7: park-instead-of-abort validation
+# --------------------------------------------------------------------------
+
+_RE_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})")
+_RE_EV_PRESSURE = re.compile(
+    r"Memory pressure level: (\w+) -> (\w+) \(current=([\d.]+)GB"
+    r"(?:.*?ceiling=([\d.]+)GB)?"
+)
+_RE_EV_HARD_POLL = re.compile(
+    r"Hard memory pressure: parking a prefill victim on (\d+) scheduler\(s\) "
+    r"instead of aborting \(poll (\d+)/(\d+)\)"
+)
+_RE_EV_PARKED = re.compile(
+    r"Parked request (\S+) at (\d+) tokens committed "
+    r"\(park (\d+)/(\d+)\), reason: (.*)$"
+)
+_RE_EV_RESUMED = re.compile(r"Resumed parked request (\S+): cached=(\d+)")
+_RE_EV_SKIPPED = re.compile(
+    r"Park skipped for (\S+): (.*?) \(memory pressure falls back to abort\)"
+)
+_RE_EV_ABORT = re.compile(r"Aborted (\d+) requests? due to memory pressure")
+
+
+def _log_ts(line: str) -> float | None:
+    m = _RE_LOG_TS.match(line)
+    if not m:
+        return None
+    try:
+        base = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+    return base + int(m.group(2)) / 1000.0
+
+
+def parse_park_events(text: str) -> list[dict[str, Any]]:
+    """Ordered park-relevant events (with timestamps) from a server log window."""
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        ts = _log_ts(line)
+        m = _RE_EV_PRESSURE.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "pressure",
+                    "ts": ts,
+                    "from": m.group(1),
+                    "to": m.group(2),
+                    "current_gb": float(m.group(3)),
+                    "ceiling_gb": float(m.group(4)) if m.group(4) else None,
+                }
+            )
+            continue
+        m = _RE_EV_HARD_POLL.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "hard_park_poll",
+                    "ts": ts,
+                    "schedulers": int(m.group(1)),
+                    "poll": int(m.group(2)),
+                    "max": int(m.group(3)),
+                }
+            )
+            continue
+        m = _RE_EV_PARKED.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "parked",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "committed": int(m.group(2)),
+                    "park_n": int(m.group(3)),
+                    "budget": int(m.group(4)),
+                    "reason": m.group(5).strip(),
+                }
+            )
+            continue
+        m = _RE_EV_RESUMED.search(line)
+        if m:
+            events.append(
+                {"kind": "resumed", "ts": ts, "rid": m.group(1), "cached": int(m.group(2))}
+            )
+            continue
+        m = _RE_EV_SKIPPED.search(line)
+        if m:
+            events.append(
+                {"kind": "park_skipped", "ts": ts, "rid": m.group(1), "reason": m.group(2)}
+            )
+            continue
+        m = _RE_EV_ABORT.search(line)
+        if m:
+            events.append({"kind": "abort", "ts": ts, "n": int(m.group(1))})
+    return events
+
+
+def build_park_tracks(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per server request id: parks, tokens committed, resumes, time parked."""
+    tracks: dict[str, dict[str, Any]] = {}
+    open_at: dict[str, list[float | None]] = {}
+    for e in events:
+        rid = e.get("rid")
+        if e["kind"] == "parked":
+            t = tracks.setdefault(
+                rid,
+                {
+                    "parks": 0,
+                    "parked_tokens": [],
+                    "resume_cached": [],
+                    "parked_s": None,
+                    "unresumed": 0,
+                },
+            )
+            t["parks"] += 1
+            t["parked_tokens"].append(e["committed"])
+            open_at.setdefault(rid, []).append(e["ts"])
+        elif e["kind"] == "resumed" and rid in tracks:
+            t = tracks[rid]
+            t["resume_cached"].append(e["cached"])
+            pending = open_at.get(rid) or []
+            started = pending.pop(0) if pending else None
+            if started is not None and e["ts"] is not None:
+                t["parked_s"] = round((t["parked_s"] or 0.0) + e["ts"] - started, 3)
+    for rid, pending in open_at.items():
+        tracks[rid]["unresumed"] = len(pending)
+    return tracks
+
+
+def attribute_rids(
+    tracks: dict[str, dict[str, Any]], requests: list[dict[str, Any]]
+) -> dict[str, str]:
+    """Best-effort client request name -> server rid.
+
+    The server never exposes its internal request id to the client, so a
+    resumed request is matched through its restored token count: the resume
+    ``cached=N`` equals the ``cached_tokens`` of exactly one client request.
+    Ambiguous or missing matches are left out rather than guessed.
+    """
+    out: dict[str, str] = {}
+    for req in requests:
+        cached = req.get("cached_tokens") or 0
+        if cached <= 0:
+            continue
+        rids = [
+            rid for rid, t in tracks.items() if cached in (t.get("resume_cached") or [])
+        ]
+        clash = [
+            r
+            for r in requests
+            if r is not req and (r.get("cached_tokens") or 0) == cached
+        ]
+        if len(rids) == 1 and not clash:
+            out[req["name"]] = rids[0]
+    return out
+
+
+def classify_p7(s: dict[str, Any]) -> str:
+    """One-word outcome of a P7 run, from a summary's counters."""
+    aborted = s.get("aborted_requests", 0) > 0
+    if s.get("parks", 0) > 0:
+        if s.get("resumes", 0) < s["parks"]:
+            return "parked_not_resumed"
+        return "park_fired_with_aborts" if aborted else "park_fired_ok"
+    if s.get("park_skips", 0) > 0:
+        return "park_skipped_then_abort" if aborted else "park_skipped_survived"
+    if s.get("hard_pressure_seen"):
+        return "hard_pressure_aborted" if aborted else "hard_pressure_survived"
+    if aborted:
+        return "aborted_without_pressure_log"
+    return "no_pressure"
+
+
+def summarize_p7(
+    requests: list[dict[str, Any]],
+    reissues: dict[str, dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Reduce a P7 run: per-request rows plus run-level park counters."""
+    tracks = build_park_tracks(events)
+    names = attribute_rids(tracks, requests)
+    rows: list[dict[str, Any]] = []
+    for r in requests:
+        rid = names.get(r["name"])
+        track = tracks.get(rid, {}) if rid else {}
+        re_ = reissues.get(r["name"])
+        ratio = distinct_ngram_ratio(r.get("text") or "")
+        wall = None
+        if r.get("end_s") is not None and r.get("start_s") is not None:
+            wall = round(r["end_s"] - r["start_s"], 2)
+        ok = bool(r.get("ok"))
+        rows.append(
+            {
+                "name": r["name"],
+                "rid": rid,
+                "ok": ok,
+                "error": r.get("error"),
+                "aborted": not ok,
+                "prompt_tokens": r.get("prompt_tokens"),
+                "completion_tokens": r.get("completion_tokens"),
+                "cached_tokens": r.get("cached_tokens"),
+                "ttft_s": r.get("ttft_s"),
+                "wall_s": wall,
+                "parks": track.get("parks", 0),
+                "parked_tokens": track.get("parked_tokens", []),
+                "resume_cached": track.get("resume_cached", []),
+                "parked_s": track.get("parked_s"),
+                "distinct_4gram": round(ratio, 4) if ratio is not None else None,
+                "degenerate": ratio is not None and ratio < P3_DEGEN_FLOOR,
+                "reissue_ok": bool(re_.get("ok")) if re_ else None,
+                "reissue_cached": re_.get("cached_tokens") if re_ else None,
+                "reissue_ttft_s": re_.get("ttft_s") if re_ else None,
+                "final_ok": ok or bool(re_ and re_.get("ok")),
+            }
+        )
+    summary: dict[str, Any] = {
+        "rows": rows,
+        "parks": sum(1 for e in events if e["kind"] == "parked"),
+        "resumes": sum(1 for e in events if e["kind"] == "resumed"),
+        "park_skips": sum(1 for e in events if e["kind"] == "park_skipped"),
+        "park_skip_reasons": sorted(
+            {e["reason"] for e in events if e["kind"] == "park_skipped"}
+        ),
+        "hard_park_polls": sum(1 for e in events if e["kind"] == "hard_park_poll"),
+        "hard_pressure_seen": any(
+            e["kind"] == "pressure" and e["to"] == "hard" for e in events
+        ),
+        "aborts_logged": sum(e["n"] for e in events if e["kind"] == "abort"),
+        "aborted_requests": sum(1 for row in rows if row["aborted"]),
+        "reissue_cached": [
+            row["reissue_cached"] for row in rows if row["reissue_cached"] is not None
+        ],
+        "all_final_ok": all(row["final_ok"] for row in rows),
+        "events": events,
+    }
+    summary["verdict"] = classify_p7(summary)
+    return summary
+
+
+def p7_default_ceiling_gb(
+    model_gb: float = 16.8, peak_gb: float = 44.0, frac: float = 0.5
+) -> float:
+    """Custom-tier ceiling that lands hard pressure mid-prefill.
+
+    Between the resident model and the working-set peak measured with no
+    guard pressure (P2 on the fork: 44 GB), so the KV growth of two or three
+    long prefills crosses the hard watermark (97% of a custom ceiling)
+    before the prefills finish.
+    """
+    if peak_gb <= model_gb:
+        raise ValueError("peak_gb must be above model_gb")
+    return round(model_gb + frac * (peak_gb - model_gb), 1)
+
+
+def p7_settings_override(ceiling_gb: float) -> dict[str, Any]:
+    return {
+        "memory": {
+            "memory_guard_tier": "custom",
+            "memory_guard_custom_ceiling_gb": ceiling_gb,
+        }
+    }
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """New dict: ``override`` merged into ``base`` recursively (inputs untouched)."""
+    out = copy.deepcopy(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], val)
+        else:
+            out[key] = copy.deepcopy(val)
+    return out
+
+
+def make_png(width: int, height: int, seed: str) -> bytes:
+    """Small deterministic RGB PNG (stdlib only); differs per ``seed``."""
+    digest = hashlib.sha256(seed.encode()).digest()
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # filter: none
+        for x in range(width):
+            rows += bytes(
+                (
+                    (x * 255 // max(1, width - 1) + digest[0]) % 256,
+                    (y * 255 // max(1, height - 1) + digest[1]) % 256,
+                    digest[2 + (x + y) % 20] ^ ((x * y) & 0xFF),
+                )
+            )
+
+    def chunk(typ: bytes, data: bytes) -> bytes:
+        body = typ + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def p7_content(prompt: str, mode: str, seed: str) -> Any:
+    """Chat message content for a P7 request.
+
+    ``text``: the prompt as is. ``image``: an OpenAI ``image_url`` data-URI
+    part placed BEFORE the long text, so the image sits at the start of the
+    history and the request carries ``vlm_inputs_embeds``.
+    """
+    if mode == "text":
+        return prompt
+    if mode != "image":
+        raise ValueError(f"unknown P7 mode: {mode!r}")
+    b64 = base64.b64encode(make_png(112, 112, seed)).decode()
+    return [
+        {"type": "text", "text": "Reference image for the task below."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        {"type": "text", "text": prompt},
+    ]
 
 
 # --------------------------------------------------------------------------

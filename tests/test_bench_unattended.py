@@ -1417,3 +1417,396 @@ class TestPlSummary:
     def test_failed_request_is_not_ok(self):
         reqs = [_pl_req("165k", 0, 10, 60, 101, 1000), {"name": "95k", "ok": False}]
         assert bm.pl_row(_pl_run(reqs))["ok"] is False
+
+
+# --------------------------------------------------------------------------
+# P7: park-instead-of-abort validation (text vs image-bearing prompts)
+# --------------------------------------------------------------------------
+
+P7_LOG = """\
+2026-10-05 04:00:01,000 - omlx.process_memory_enforcer - INFO - [-] - Memory pressure level: ok -> soft (current=29.0GB, soft=27.4GB, hard=29.5GB, ceiling=30.4GB)
+2026-10-05 04:00:05,000 - omlx.process_memory_enforcer - INFO - [-] - Memory pressure level: soft -> hard (current=29.7GB, soft=27.4GB, hard=29.5GB, ceiling=30.4GB)
+2026-10-05 04:00:05,100 - omlx.process_memory_enforcer - INFO - [-] - Hard memory pressure: parking a prefill victim on 1 scheduler(s) instead of aborting (poll 1/30)
+2026-10-05 04:00:05,300 - omlx.scheduler - INFO - [-] - Parked request rid-aaa at 24576 tokens committed (park 1/3), reason: memory pressure
+2026-10-05 04:00:06,200 - omlx.scheduler - INFO - [-] - Park skipped for rid-bbb: decoding, not in chunked prefill (memory pressure falls back to abort)
+2026-10-05 04:00:35,300 - omlx.scheduler - INFO - [-] - Resumed parked request rid-aaa: cached=24576
+2026-10-05 04:00:40,000 - omlx.engine_core - WARNING - [-] - Aborted 2 requests due to memory pressure
+"""
+
+
+class TestParseParkEvents:
+    def test_extracts_each_event_kind_with_timestamps(self):
+        ev = bm.parse_park_events(P7_LOG)
+        kinds = [e["kind"] for e in ev]
+        assert kinds == [
+            "pressure",
+            "pressure",
+            "hard_park_poll",
+            "parked",
+            "park_skipped",
+            "resumed",
+            "abort",
+        ]
+        parked = ev[3]
+        assert parked["rid"] == "rid-aaa"
+        assert parked["committed"] == 24576
+        assert parked["park_n"] == 1 and parked["budget"] == 3
+        assert parked["reason"] == "memory pressure"
+        assert ev[2]["poll"] == 1 and ev[2]["max"] == 30
+        assert ev[4]["rid"] == "rid-bbb" and "decoding" in ev[4]["reason"]
+        assert ev[5]["cached"] == 24576
+        assert ev[6]["n"] == 2
+        assert ev[1]["to"] == "hard" and ev[1]["current_gb"] == 29.7
+        assert ev[5]["ts"] - ev[3]["ts"] == pytest.approx(30.0, abs=0.01)
+
+    def test_empty_and_unrelated_lines(self):
+        assert bm.parse_park_events("") == []
+        assert bm.parse_park_events("2026-10-05 04:00:01,000 - x - INFO - hello\n") == []
+
+    def test_tolerates_unparsable_timestamp(self):
+        ev = bm.parse_park_events("Resumed parked request r1: cached=5\n")
+        assert ev == [{"kind": "resumed", "ts": None, "rid": "r1", "cached": 5}]
+
+
+class TestParkTracks:
+    def test_tracks_pair_parks_with_resumes_and_time_parked(self):
+        tr = bm.build_park_tracks(bm.parse_park_events(P7_LOG))
+        a = tr["rid-aaa"]
+        assert a["parks"] == 1
+        assert a["parked_tokens"] == [24576]
+        assert a["resume_cached"] == [24576]
+        assert a["parked_s"] == pytest.approx(30.0, abs=0.01)
+        assert a["unresumed"] == 0
+        assert "rid-bbb" not in tr  # a skip is not a park
+
+    def test_unresumed_park_is_counted_and_has_no_time(self):
+        log = (
+            "2026-10-05 04:00:05,000 - s - INFO - [-] - Parked request r9 at 100 "
+            "tokens committed (park 1/3), reason: x\n"
+        )
+        a = bm.build_park_tracks(bm.parse_park_events(log))["r9"]
+        assert a["unresumed"] == 1
+        assert a["parked_s"] is None
+
+
+class TestAttributeRids:
+    def test_matches_by_resume_cached_equal_to_client_cached(self):
+        tracks = bm.build_park_tracks(bm.parse_park_events(P7_LOG))
+        reqs = [
+            {"name": "r0", "cached_tokens": 0},
+            {"name": "r1", "cached_tokens": 24576},
+        ]
+        assert bm.attribute_rids(tracks, reqs) == {"r1": "rid-aaa"}
+
+    def test_ambiguous_match_is_left_unattributed(self):
+        tracks = {
+            "a": {"resume_cached": [100]},
+            "b": {"resume_cached": [100]},
+        }
+        reqs = [{"name": "r0", "cached_tokens": 100}]
+        assert bm.attribute_rids(tracks, reqs) == {}
+
+
+def _p7req(name, ok=True, cached=0, error=None, text="a b c d e f g h", ttft=10.0):
+    return {
+        "name": name,
+        "ok": ok,
+        "error": error,
+        "cached_tokens": cached,
+        "prompt_tokens": 100_000,
+        "completion_tokens": 8,
+        "start_s": 0.0,
+        "end_s": 60.0,
+        "ttft_s": ttft,
+        "text": text,
+    }
+
+
+class TestSummarizeP7:
+    def test_park_fired_all_ok(self):
+        reqs = [_p7req("r0"), _p7req("r1", cached=24576), _p7req("r2")]
+        s = bm.summarize_p7(reqs, {}, bm.parse_park_events(P7_LOG))
+        assert s["parks"] == 1
+        assert s["resumes"] == 1
+        assert s["park_skips"] == 1
+        assert s["hard_pressure_seen"] is True
+        assert s["rows"][1]["rid"] == "rid-aaa"
+        assert s["rows"][1]["parks"] == 1
+        assert s["rows"][1]["parked_s"] == pytest.approx(30.0, abs=0.01)
+        assert s["rows"][0]["parks"] == 0
+        assert s["all_final_ok"] is True
+        assert s["verdict"] == "park_fired_ok"
+        assert s["aborts_logged"] == 2
+
+    def test_reissue_recorded_for_failed_request(self):
+        reqs = [_p7req("r0", ok=False, error="aborted"), _p7req("r1")]
+        re_ = {"r0": _p7req("r0", cached=40_000, ttft=3.0)}
+        s = bm.summarize_p7(reqs, re_, [])
+        row = s["rows"][0]
+        assert row["aborted"] is True
+        assert row["reissue_ok"] is True
+        assert row["reissue_cached"] == 40_000
+        assert row["final_ok"] is True
+        assert s["aborted_requests"] == 1
+        assert s["reissue_cached"] == [40_000]
+        assert s["all_final_ok"] is True
+
+    def test_failed_reissue_makes_run_not_ok(self):
+        reqs = [_p7req("r0", ok=False, error="aborted")]
+        re_ = {"r0": _p7req("r0", ok=False, error="aborted again")}
+        s = bm.summarize_p7(reqs, re_, [])
+        assert s["all_final_ok"] is False
+
+    def test_sanity_uses_distinct_4gram_ratio(self):
+        loop = "x y z w " * 50
+        s = bm.summarize_p7([_p7req("r0", text=loop)], {}, [])
+        assert s["rows"][0]["distinct_4gram"] < 0.1
+        assert s["rows"][0]["degenerate"] is True
+        ok = bm.summarize_p7([_p7req("r0", text="one two three four five six")], {}, [])
+        assert ok["rows"][0]["degenerate"] is False
+
+    def test_text_is_not_kept_in_rows(self):
+        s = bm.summarize_p7([_p7req("r0")], {}, [])
+        assert "text" not in s["rows"][0]
+
+
+class TestClassifyP7:
+    def _s(self, **kw):
+        base = {
+            "parks": 0,
+            "resumes": 0,
+            "park_skips": 0,
+            "hard_pressure_seen": False,
+            "aborts_logged": 0,
+            "aborted_requests": 0,
+            "all_final_ok": True,
+        }
+        base.update(kw)
+        return base
+
+    def test_no_pressure(self):
+        assert bm.classify_p7(self._s()) == "no_pressure"
+
+    def test_park_fired_ok(self):
+        s = self._s(parks=1, resumes=1, hard_pressure_seen=True)
+        assert bm.classify_p7(s) == "park_fired_ok"
+
+    def test_park_fired_with_aborts(self):
+        s = self._s(parks=1, resumes=1, hard_pressure_seen=True, aborted_requests=1)
+        assert bm.classify_p7(s) == "park_fired_with_aborts"
+
+    def test_parked_not_resumed(self):
+        s = self._s(parks=2, resumes=1, hard_pressure_seen=True)
+        assert bm.classify_p7(s) == "parked_not_resumed"
+
+    def test_park_skipped_then_abort(self):
+        s = self._s(park_skips=2, hard_pressure_seen=True, aborted_requests=2)
+        assert bm.classify_p7(s) == "park_skipped_then_abort"
+
+    def test_park_skipped_survived(self):
+        s = self._s(park_skips=1, hard_pressure_seen=True)
+        assert bm.classify_p7(s) == "park_skipped_survived"
+
+    def test_hard_pressure_without_park_path(self):
+        s = self._s(hard_pressure_seen=True, aborts_logged=1, aborted_requests=1)
+        assert bm.classify_p7(s) == "hard_pressure_aborted"
+        s = self._s(hard_pressure_seen=True)
+        assert bm.classify_p7(s) == "hard_pressure_survived"
+
+    def test_abort_without_pressure_signal(self):
+        s = self._s(aborted_requests=1)
+        assert bm.classify_p7(s) == "aborted_without_pressure_log"
+
+
+class TestP7Ceiling:
+    def test_default_sits_between_model_and_measured_peak(self):
+        c = bm.p7_default_ceiling_gb(model_gb=16.8, peak_gb=44.0)
+        assert 16.8 < c < 44.0
+        assert c == pytest.approx(30.4, abs=0.05)
+
+    def test_rejects_peak_not_above_model(self):
+        with pytest.raises(ValueError):
+            bm.p7_default_ceiling_gb(model_gb=20.0, peak_gb=20.0)
+
+    def test_settings_override_is_custom_tier_with_ceiling(self):
+        o = bm.p7_settings_override(30.4)
+        assert o == {
+            "memory": {
+                "memory_guard_tier": "custom",
+                "memory_guard_custom_ceiling_gb": 30.4,
+            }
+        }
+
+    def test_deep_merge_keeps_siblings_and_input(self):
+        base = {"memory": {"memory_guard_tier": "aggressive", "x": 1}, "a": {"b": 1}}
+        out = bm.deep_merge(base, bm.p7_settings_override(30.0))
+        assert out["memory"]["memory_guard_tier"] == "custom"
+        assert out["memory"]["x"] == 1
+        assert out["a"] == {"b": 1}
+        assert base["memory"]["memory_guard_tier"] == "aggressive"
+
+
+class TestP7Content:
+    def test_png_is_valid_and_distinct_per_seed(self):
+        import struct
+        import zlib
+
+        a = bm.make_png(32, 24, "a")
+        b = bm.make_png(32, 24, "b")
+        assert a[:8] == b"\x89PNG\r\n\x1a\n"
+        assert a != b
+        assert bm.make_png(32, 24, "a") == a  # deterministic
+        # IHDR then IDAT inflate to (1 + 3*w) * h bytes
+        w, h = struct.unpack(">II", a[16:24])
+        assert (w, h) == (32, 24)
+        pos, idat = 8, b""
+        while pos < len(a):
+            n, typ = struct.unpack(">I4s", a[pos : pos + 8])
+            if typ == b"IDAT":
+                idat += a[pos + 8 : pos + 8 + n]
+            pos += 12 + n
+        assert len(zlib.decompress(idat)) == (1 + 3 * w) * h
+
+    def test_text_mode_content_is_a_plain_string(self):
+        assert bm.p7_content("hello", "text", "s") == "hello"
+
+    def test_image_mode_puts_image_before_the_long_text(self):
+        parts = bm.p7_content("LONG", "image", "s")
+        assert [p["type"] for p in parts] == ["text", "image_url", "text"]
+        assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert parts[2]["text"] == "LONG"
+
+    def test_unknown_mode_rejected(self):
+        with pytest.raises(ValueError):
+            bm.p7_content("x", "video", "s")
+
+
+class TestP7Wiring:
+    def test_p7_registered_with_concurrency_three(self):
+        assert "P7" in bp.SCENARIOS
+        assert bp.PREMISE_CONCURRENCY["P7"] == 3
+        assert "P7" not in bp.ALL_PREMISES  # opt-in only, never part of "all"
+
+    def test_scenario_ok_requires_every_request_to_finish(self):
+        good = {"summary": {"all_final_ok": True}}
+        bad = {"summary": {"all_final_ok": False}}
+        assert bp.scenario_ok("P7", good) is True
+        assert bp.scenario_ok("P7", bad) is False
+
+    def test_server_applies_settings_override(self, tmp_path):
+        env = bp.variant_env("fork", "P7")
+        s = bp.build_settings(REAL, "fork", 8002, "/c", 3, env)
+        out = bm.deep_merge(s, bm.p7_settings_override(31.0))
+        assert out["memory"]["memory_guard_tier"] == "custom"
+        assert out["memory"]["memory_guard_custom_ceiling_gb"] == 31.0
+        assert out["memory"]["mlx_cache_limit_gb"] == 16.0  # untouched
+
+
+class TestScenarioP7:
+    def _ctx(self, fail_first, mode="text"):
+        import argparse
+        import asyncio
+
+        calls = []
+
+        class Srv:
+            def log_size(self):
+                return 0
+
+            def log_since(self, off):
+                return P7_LOG
+
+        class Corpus:
+            def prompt(self, seed, n):
+                return f"PROMPT[{seed}:{n}]"
+
+        class Ctx:
+            server = Srv()
+            corpus = Corpus()
+            args = argparse.Namespace(
+                p7_mode=mode,
+                p7_requests=3,
+                p7_stagger_s=0.0,
+                p7_max_tokens=256,
+                p7_ceiling_gb=30.4,
+                settle_s=0.0,
+                smoke=False,
+            )
+
+            def n(self, nominal):
+                return nominal
+
+            def mt(self, nominal):
+                return nominal
+
+            def seed(self, *parts):
+                return "|".join(map(str, parts))
+
+            async def chat(self, prompt, max_tokens, sampling=None, **kw):
+                calls.append((kw["name"], prompt, max_tokens))
+                name = kw["name"]
+                failed = name in fail_first
+                return {
+                    "name": name,
+                    "ok": not failed,
+                    "error": "aborted" if failed else None,
+                    "cached_tokens": 24576 if name == "req1" else 0,
+                    "text": "alpha beta gamma delta epsilon zeta",
+                    "start_s": 0.0,
+                    "end_s": 1.0,
+                    "ttft_s": 0.5,
+                }
+
+        return Ctx(), calls, asyncio
+
+    def test_failed_request_is_reissued_once_with_same_prompt(self):
+        ctx, calls, asyncio = self._ctx({"req2"})
+        sc = asyncio.run(bp.scenario_p7(ctx))
+        names = [c[0] for c in calls]
+        assert names.count("req2-reissue") == 1
+        orig = next(c for c in calls if c[0] == "req2")
+        again = next(c for c in calls if c[0] == "req2-reissue")
+        assert orig[1] == again[1]
+        assert sc["summary"]["aborted_requests"] == 1
+        assert bp.scenario_ok("P7", sc) is True
+        assert all("text" not in r for r in sc["requests"])
+
+    def test_distinct_prompts_and_image_mode_parts(self):
+        ctx, calls, asyncio = self._ctx(set(), mode="image")
+        asyncio.run(bp.scenario_p7(ctx))
+        prompts = [c[1] for c in calls if c[0].startswith("req")]
+        assert len(prompts) == 3
+        assert all(p[1]["type"] == "image_url" for p in prompts)
+        assert len({p[2]["text"] for p in prompts}) == 3
+        assert len({p[1]["image_url"]["url"] for p in prompts}) == 3
+        assert not any(n.endswith("-reissue") for n, _, _ in calls)
+
+
+def test_collect_setup_records_p7_params_and_override():
+    import argparse
+
+    class Srv:
+        variant, premise = "fork", "P7"
+        settings = {}
+        env = {}
+        max_concurrent = 3
+        cache_dir = "/c"
+        settings_override = bm.p7_settings_override(30.4)
+
+        def command(self):
+            return ["x", "serve"]
+
+    args = argparse.Namespace(
+        smoke=False,
+        p1_cancel_fraction=0.6,
+        p3_max_tokens=1,
+        p4_max_tokens=1,
+        p7_mode="image",
+        p7_ceiling_gb=30.4,
+        p7_requests=3,
+        p7_stagger_s=5.0,
+        p7_max_tokens=256,
+    )
+    setup = bp.collect_setup(args, Srv())
+    assert setup["p7"]["mode"] == "image"
+    assert setup["settings_override"]["memory"]["memory_guard_tier"] == "custom"

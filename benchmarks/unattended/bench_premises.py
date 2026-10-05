@@ -17,7 +17,9 @@ Safety rules enforced here:
 
 Premises: P1 no lost work, P2 no aborts at 2x130k, P3 batch correctness,
 P4 concurrency pays, P6 no single-request regression. (P5 is pi-driven:
-see p5_pi_unattended.sh.)
+see p5_pi_unattended.sh.) P7 (opt-in, never part of "all") forces hard memory
+pressure with a low custom ceiling and records whether the "park, don't
+abort" path fires for text-only vs image-bearing long prefills.
 """
 
 from __future__ import annotations
@@ -108,7 +110,7 @@ FORK_ONLY_SETTINGS = {
 SAMPLING_DEFAULT = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 SAMPLING_GREEDY = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
 
-PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3, "PL": 2}
+PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3, "PL": 2, "P7": 3}
 ALL_PREMISES = ["P6", "P1", "P2", "P3", "P4"]
 
 _LIVE_SERVERS: list[Server] = []
@@ -293,8 +295,11 @@ class Server:
         out: Path,
         keep_cache: bool,
         batched_limit: int | None = None,
+        settings_override: dict[str, Any] | None = None,
     ):
         self.variant, self.premise, self.port = variant, premise, port
+        # Deep-merged over the derived settings.json (never the real one).
+        self.settings_override = settings_override or {}
         self.max_concurrent = max_concurrent
         self.out = out
         self.keep_cache = keep_cache
@@ -330,6 +335,8 @@ class Server:
         self.settings = build_settings(
             real, self.variant, self.port, self.cache_dir, self.max_concurrent, self.env
         )
+        if self.settings_override:
+            self.settings = bm.deep_merge(self.settings, self.settings_override)
         sp = self.base / "settings.json"
         sp.write_text(json.dumps(self.settings, indent=2))
         sp.chmod(0o600)
@@ -611,7 +618,7 @@ class Corpus:
 async def stream_chat(
     client,
     server: Server,
-    prompt: str,
+    prompt: Any,
     max_tokens: int,
     sampling: dict[str, Any],
     t_zero: float,
@@ -939,7 +946,61 @@ async def scenario_pl(ctx: Ctx) -> dict[str, Any]:
     return {"requests": list(res)}
 
 
+P7_NOMINAL_TOKENS = (130_000, 115_000, 100_000)
+
+
+async def scenario_p7(ctx: Ctx) -> dict[str, Any]:
+    """Forced hard pressure: does a prefill get parked instead of aborted?
+
+    2-3 distinct long prompts are started a few seconds apart so they prefill
+    concurrently under a low custom memory ceiling (set on the server by
+    ``--p7-ceiling-gb``). ``--p7-mode image`` puts an image at the start of
+    every prompt (``vlm_inputs_embeds`` set: not parkable). Requests that fail
+    are re-issued once, as the pi extension would, to show how much of the
+    prompt the progress commit kept warm.
+    """
+    a = ctx.args
+    mode = a.p7_mode
+    count = max(1, min(a.p7_requests, len(P7_NOMINAL_TOKENS)))
+    prompts: list[Any] = []
+    for i in range(count):
+        text = ctx.corpus.prompt(ctx.seed("P7", i), ctx.n(P7_NOMINAL_TOKENS[i]))
+        prompts.append(bm.p7_content(text, mode, ctx.seed("P7", i, "img")))
+    mt = ctx.mt(a.p7_max_tokens)
+    off = ctx.server.log_size()
+
+    async def one(i: int) -> dict[str, Any]:
+        await asyncio.sleep(i * a.p7_stagger_s)
+        return await ctx.chat(prompts[i], mt, name=f"req{i}", keep_text=True)
+
+    t = time.time()
+    results = list(await asyncio.gather(*[one(i) for i in range(count)]))
+    wall = round(time.time() - t, 2)
+    reissues: dict[str, dict[str, Any]] = {}
+    for i, r in enumerate(results):
+        if r.get("ok"):
+            continue
+        await asyncio.sleep(a.settle_s)
+        reissues[r["name"]] = await ctx.chat(
+            prompts[i], min(mt, 64), name=f"{r['name']}-reissue", keep_text=True
+        )
+    events = bm.parse_park_events(ctx.server.log_since(off))
+    summary = bm.summarize_p7(results, reissues, events)
+    for r in [*results, *reissues.values()]:
+        r.pop("text", None)
+    return {
+        "mode": mode,
+        "ceiling_gb": a.p7_ceiling_gb,
+        "stagger_s": a.p7_stagger_s,
+        "requests": results,
+        "reissues": reissues,
+        "wall_s": wall,
+        "summary": summary,
+    }
+
+
 SCENARIOS = {
+    "P7": scenario_p7,
     "PL": scenario_pl,
     "P6": scenario_p6,
     "P1": scenario_p1,
@@ -969,6 +1030,8 @@ def scenario_ok(premise: str, sc: dict[str, Any]) -> bool:
         return all(
             okreq(r) for m in ("serial", "concurrent") for r in sc[m]["requests"]
         )
+    if premise == "P7":
+        return bool(sc["summary"]["all_final_ok"])
     return False
 
 
@@ -1051,6 +1114,16 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
         "p1_cancel_fraction": args.p1_cancel_fraction,
         "p3_max_tokens": args.p3_max_tokens,
         "p4_max_tokens": args.p4_max_tokens,
+        "settings_override": server.settings_override,
+        "p7": {
+            "mode": getattr(args, "p7_mode", None),
+            "ceiling_gb": getattr(args, "p7_ceiling_gb", None),
+            "requests": getattr(args, "p7_requests", None),
+            "stagger_s": getattr(args, "p7_stagger_s", None),
+            "max_tokens": getattr(args, "p7_max_tokens", None),
+        }
+        if server.premise == "P7"
+        else None,
         "p3_flow": "cold B=1 (cache populate) -> B=1 restored -> B=3 restored (started together, "
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0 in fork variants, max_concurrent_requests=3)",
     }
@@ -1067,6 +1140,9 @@ async def run_premise_async(
         out,
         args.keep_cache,
         args.batched_decode_limit,
+        settings_override=(
+            bm.p7_settings_override(args.p7_ceiling_gb) if premise == "P7" else None
+        ),
     )
     srv.prepare()
     srv.start()
@@ -1188,8 +1264,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--variant", choices=VARIANTS, required=True)
     ap.add_argument(
-        "--premise", choices=[*ALL_PREMISES, "PL", "all"], default="all"
+        "--premise", choices=[*ALL_PREMISES, "PL", "P7", "all"], default="all"
     )
+    ap.add_argument(
+        "--p7-mode",
+        choices=["text", "image"],
+        default="text",
+        help="P7: text-only prompts, or an image at the start of each prompt",
+    )
+    ap.add_argument(
+        "--p7-ceiling-gb",
+        type=float,
+        default=None,
+        help="P7: custom memory-guard ceiling in GB (default: between the model "
+        "and the unpressured peak, see bench_metrics.p7_default_ceiling_gb)",
+    )
+    ap.add_argument("--p7-requests", type=int, default=3, help="P7: 1-3 prompts")
+    ap.add_argument(
+        "--p7-stagger-s", type=float, default=5.0, help="P7: seconds between starts"
+    )
+    ap.add_argument("--p7-max-tokens", type=int, default=256)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--port", type=int, default=8002)
@@ -1268,6 +1362,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"missing {FORK_BIN}", file=sys.stderr)
         return 2
     CACHE_ROOT = args.cache_root
+    if args.p7_ceiling_gb is None:
+        args.p7_ceiling_gb = bm.p7_default_ceiling_gb()
+    if args.premise == "P7":
+        print(f"[P7] custom memory-guard ceiling = {args.p7_ceiling_gb} GB", flush=True)
     out = Path(args.out)
     (out / "logs").mkdir(parents=True, exist_ok=True)
     real_settings = REAL_BASE / "settings.json"
