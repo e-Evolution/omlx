@@ -2,10 +2,15 @@
 """Memory scheduling is on only where memory pressure is planned for.
 
 ``memory.memory_scheduling`` is ``auto`` (default: on with an explicit custom
-ceiling), ``on`` or ``off``. The process memory enforcer resolves it against
-the prefill memory guard and the ceiling, logs the result and propagates it to
-every scheduler. The admission features that plan against a fixed memory
-budget consult it; off, admission behaves as on upstream ``main``.
+ceiling), ``on`` or ``off``. It gates the admission behaviours that plan
+against a fixed memory budget:
+
+1. the never-fits 400 ``context_exceeds_capacity``, ``GET /v1/omlx/capacity``
+   numbers and the ``X-oMLX-Max-Context-Tokens`` header;
+2. the fits-later wait (a request that fits alone waits instead of being
+   rejected on current usage).
+
+Off, these paths behave as on upstream ``main``.
 """
 
 import logging
@@ -13,17 +18,25 @@ from types import SimpleNamespace
 
 import pytest
 import test_process_memory_enforcer as enforcer_tests
+import test_scheduler_capacity_gate as gate_tests
+import test_server_context_capacity as server_tests
+from fastapi.testclient import TestClient
 from test_process_memory_enforcer import _make_enforcer
-from test_scheduler_prefill_memory_guard import _make_scheduler
+from test_scheduler_capacity_gate import GB
+from test_scheduler_prefill_memory_guard import _make_request, _make_scheduler
+from test_server_context_capacity import _engine_with_scheduler
 
+import omlx.scheduler as scheduler_module
 import omlx.server as server
+from omlx.exceptions import ContextExceedsCapacityError, PrefillMemoryExceededError
 from omlx.process_memory_enforcer import resolve_memory_scheduling
 from omlx.settings import GlobalSettings, MemorySettings
 
-GB = 1024**3
-
-# Shared fixtures: an enforcer's engine pool.
+# Shared fixtures: an enforcer's engine pool, a guarded scheduler and the
+# capacity endpoint's engine pool.
 mock_engine_pool = enforcer_tests.mock_engine_pool
+gated = gate_tests.gated
+capacity_env = server_tests.capacity_env
 
 # --- Resolution -------------------------------------------------------------
 
@@ -210,6 +223,84 @@ def test_the_enforcer_propagates_the_state_to_schedulers(
     enforcer.memory_scheduling = "off"
     enforcer._propagate_memory_limit()
     assert scheduler._memory_scheduling is False
+
+
+# --- Off: these paths behave as on main --------------------------------------
+
+
+def test_off_has_no_capacity_estimate_snapshot_or_hint(gated):
+    scheduler, _usage, _admitted = gated
+    scheduler._memory_scheduling = True
+    assert scheduler.max_viable_context_tokens() is not None
+    scheduler._memory_scheduling = False
+    assert scheduler._capacity_estimate(context_tokens=10, max_tokens=0) is None
+    assert scheduler.capacity_snapshot(context_tokens=10, max_tokens=0) is None
+    # Off after on: the cached hint is not served either.
+    assert scheduler.max_viable_context_tokens() is None
+    assert _engine_with_scheduler(scheduler).max_context_tokens_hint() is None
+
+
+def test_off_prices_only_the_prompt_against_current_usage(gated):
+    """A request whose max_tokens can never fit passes the route preflight on
+    main when its prompt fits now; only on gives the never-fits 400."""
+    scheduler, usage, _admitted = gated
+    scheduler._memory_scheduling = True
+    best = scheduler.max_viable_context_tokens()
+    with pytest.raises(ContextExceedsCapacityError):
+        scheduler.preflight_or_raise(num_prompt_tokens=best - 10_000, max_tokens=20_000)
+    scheduler._memory_scheduling = False
+    usage[0] = 0
+    scheduler.preflight_or_raise(num_prompt_tokens=best - 10_000, max_tokens=20_000)
+
+
+def test_off_rejects_a_fits_later_request_with_the_old_error(gated):
+    scheduler, usage, admitted = gated
+    usage[0] = 99 * GB
+    admitted[0] = 2
+    scheduler._memory_scheduling = True
+    scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+    request = _make_request(50_000)
+    with pytest.raises(scheduler_module._PreflightDeferredError):
+        scheduler._preflight_memory_check(request)
+
+    scheduler._memory_scheduling = False
+    with pytest.raises(PrefillMemoryExceededError) as info:
+        scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+    assert not isinstance(info.value, ContextExceedsCapacityError)
+    assert "Prefill would require" in str(info.value)
+    rejection = scheduler._preflight_memory_check(request)
+    assert rejection is not None
+    assert rejection.capacity is None  # the old current-usage rejection
+    assert rejection.message.startswith("Prefill would require")
+
+
+def test_off_endpoint_says_why_capacity_is_unavailable(
+    capacity_env,
+    monkeypatch,
+):
+    engine, _snapshot = capacity_env
+    engine.capacity_snapshot.return_value = None
+    monkeypatch.setattr(
+        server._server_state,
+        "process_memory_enforcer",
+        SimpleNamespace(
+            memory_scheduling_enabled=False,
+            memory_scheduling_reason="no explicit memory ceiling",
+        ),
+    )
+    client = TestClient(server.app)
+    resp = client.get("/v1/omlx/capacity", params={"model": "loaded-model"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is False
+    assert body["memory_scheduling"] == "off"
+    assert body["reason"] == "memory scheduling is off (no explicit memory ceiling)"
+    # Unknown and unloaded models keep their 404 and 409.
+    assert client.get("/v1/omlx/capacity", params={"model": "nope"}).status_code == 404
+    assert (
+        client.get("/v1/omlx/capacity", params={"model": "cold-model"}).status_code
+        == 409
+    )
 
 
 # --- Admin settings -----------------------------------------------------------

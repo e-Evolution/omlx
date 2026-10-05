@@ -53,9 +53,9 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi import Request as FastAPIRequest
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -209,6 +209,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ContextExceedsCapacityError,
     ModelUnavailableError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
@@ -1077,6 +1078,10 @@ async def distributed_unavailable_handler(
 
 
 def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
+    if isinstance(exc, ContextExceedsCapacityError):
+        # Waiting cannot help: the message carries the capacity numbers and
+        # tells the client to compact, shorten or lower max_tokens.
+        return f"oMLX memory guard rejected this request: {str(exc)}"
     if isinstance(exc, PrefillMemoryAbortedError):
         # This request was admitted and then killed mid-prefill, so "rejected
         # this prompt" would be wrong. The message already names usage, the
@@ -1108,16 +1113,27 @@ def _streaming_error_payload(e: Exception, context: str) -> dict:
     return {"error": {"message": str(e), "type": "server_error"}}
 
 
+def _prefill_memory_code(exc: PrefillMemoryExceededError) -> str:
+    if isinstance(exc, ContextExceedsCapacityError):
+        return ContextExceedsCapacityError.omlx_code
+    if isinstance(exc, PrefillMemoryAbortedError):
+        return "prefill_memory_aborted"
+    return "prefill_memory_exceeded"
+
+
+def _add_capacity_fields(target: dict, exc: PrefillMemoryExceededError) -> None:
+    """Never-fits numbers (bytes and tokens) and ``retryable: false``."""
+    if isinstance(exc, ContextExceedsCapacityError):
+        target.update(exc.capacity_fields)
+        target["retryable"] = False
+
+
 def _prefill_memory_openai_error_body(
     exc: PrefillMemoryExceededError,
     *,
     status_code: int = 400,
 ) -> dict:
-    code = (
-        "prefill_memory_aborted"
-        if isinstance(exc, PrefillMemoryAbortedError)
-        else "prefill_memory_exceeded"
-    )
+    code = _prefill_memory_code(exc)
     content = _openai_error_body(
         _prefill_memory_error_detail(exc),
         status_code,
@@ -1129,6 +1145,7 @@ def _prefill_memory_openai_error_body(
         content["error"]["estimated_bytes"] = exc.estimated_bytes
     if exc.limit_bytes is not None:
         content["error"]["limit_bytes"] = exc.limit_bytes
+    _add_capacity_fields(content["error"], exc)
     return content
 
 
@@ -1173,12 +1190,17 @@ async def prefill_memory_exceeded_handler(
     else:
         content = {
             "detail": detail,
-            "omlx_code": "prefill_memory_exceeded",
+            "omlx_code": (
+                ContextExceedsCapacityError.omlx_code
+                if isinstance(exc, ContextExceedsCapacityError)
+                else "prefill_memory_exceeded"
+            ),
         }
         if exc.estimated_bytes is not None:
             content["estimated_bytes"] = exc.estimated_bytes
         if exc.limit_bytes is not None:
             content["limit_bytes"] = exc.limit_bytes
+        _add_capacity_fields(content, exc)
     return JSONResponse(status_code=status_code, content=content)
 
 
@@ -3792,6 +3814,77 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
 
+@app.get("/v1/omlx/capacity")
+async def get_model_capacity(
+    model: str,
+    context_tokens: int = Query(0, ge=0),
+    max_tokens: int = Query(0, ge=0),
+    _: bool = Depends(verify_inference_api_key),
+):
+    """Memory capacity of a loaded model for a request of the given size.
+
+    Returns whether ``context_tokens + max_tokens`` fits with nothing else
+    running (the never-fits gate's numbers: ``required_bytes``,
+    ``capacity_bytes``, ``weights_bytes``, ``kv_bytes_per_token``,
+    ``max_viable_context_tokens``) plus ``free_bytes_now``. Never loads a
+    model: an unloaded one is a 409. ``available`` is false when the
+    capacity cannot be estimated (no memory limit, unknown weights), or when
+    memory scheduling is off (``memory.memory_scheduling``): the endpoint
+    still answers, with ``memory_scheduling: "off"`` and the reason.
+    """
+    if _server_state.engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    model_id = resolve_model_id(model) or model
+    entry = _server_state.engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model}")
+    engine = entry.engine
+    if engine is None:
+        raise HTTPException(status_code=409, detail=f"Model not loaded: {model}")
+    snapshot_fn = getattr(engine, "capacity_snapshot", None)
+    snapshot = (
+        snapshot_fn(context_tokens=context_tokens, max_tokens=max_tokens)
+        if callable(snapshot_fn)
+        else None
+    )
+    if not isinstance(snapshot, dict):
+        enforcer = _server_state.process_memory_enforcer
+        if enforcer is not None and not getattr(
+            enforcer, "memory_scheduling_enabled", True
+        ):
+            reason = getattr(enforcer, "memory_scheduling_reason", "")
+            return {
+                "model": model_id,
+                "available": False,
+                "memory_scheduling": "off",
+                "reason": f"memory scheduling is off ({reason})",
+            }
+        return {
+            "model": model_id,
+            "available": False,
+            "reason": "capacity cannot be estimated for this model",
+        }
+    return {"model": model_id, "available": True, **snapshot}
+
+
+_MAX_CONTEXT_TOKENS_HEADER = "X-oMLX-Max-Context-Tokens"
+
+
+def _capacity_headers(engine: Any) -> dict[str, str]:
+    """``X-oMLX-Max-Context-Tokens``: the largest context plus max_tokens
+    that fits alone (cached by the scheduler); empty when unknown."""
+    hint_fn = getattr(engine, "max_context_tokens_hint", None)
+    if not callable(hint_fn):
+        return {}
+    try:
+        hint = hint_fn()
+    except Exception:  # noqa: BLE001 - a hint must never fail a request
+        return {}
+    if isinstance(hint, bool) or not isinstance(hint, int) or hint < 0:
+        return {}
+    return {_MAX_CONTEXT_TOKENS_HEADER: str(hint)}
+
+
 # =============================================================================
 # Embeddings Endpoint
 # =============================================================================
@@ -4819,6 +4912,7 @@ async def create_chat_completion(
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             if response_format_warning:
                 sse_headers["Warning"] = response_format_warning
+            sse_headers.update(_capacity_headers(engine))
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -4990,10 +5084,14 @@ async def create_chat_completion(
             ).model_dump_json(exclude_none=True)
 
         json_headers = (
-            {"Warning": response_format_warning} if response_format_warning else None
+            {"Warning": response_format_warning} if response_format_warning else {}
         )
+        json_headers.update(_capacity_headers(engine))
         return await _json_response_or_keepalive(
-            http_request, _build_chat_completion(), lease=lease, headers=json_headers
+            http_request,
+            _build_chat_completion(),
+            lease=lease,
+            headers=json_headers or None,
         )
 
     except BaseException:

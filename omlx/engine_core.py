@@ -37,6 +37,7 @@ from typing import (
 import mlx.core as mx
 
 from .exceptions import (
+    ContextExceedsCapacityError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     RequestAbortedError,
@@ -165,6 +166,14 @@ class _EngineTeardown:
 
 
 def _raise_request_output_error(output: RequestOutput) -> None:
+    if output.error_code == "context_exceeds_capacity":
+        metadata = dict(output.error_metadata or {})
+        request_id = metadata.pop("request_id", None)
+        raise ContextExceedsCapacityError(
+            message=output.error or "Context exceeds capacity",
+            request_id=str(request_id) if request_id is not None else output.request_id,
+            capacity_fields=metadata,
+        )
     if output.error_code in ("prefill_memory_exceeded", "prefill_memory_aborted"):
         metadata = output.error_metadata or {}
         request_id = metadata.get("request_id")
