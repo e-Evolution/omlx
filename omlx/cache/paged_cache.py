@@ -1298,15 +1298,25 @@ class PagedCacheManager(CacheManager):
                 for block_id in table.block_ids:
                     self.free_block(block_id)
 
-    def release_block_table(self, request_id: str) -> None:
+    def release_block_table(
+        self, request_id: str, table: BlockTable | None = None
+    ) -> None:
         """Drop a request's block table without freeing its blocks.
 
         Its references are released for eviction (``release_for_eviction``),
         so the blocks stay cached and findable by later prefix lookups, as
         after a completed request's store.
+
+        With ``table``, only that table instance is released: its refs are
+        given back, and the request's entry is dropped only while it still
+        is that table. A newer table the request got since (a re-admission
+        replaces the entry) keeps its entry and its refs.
         """
         with self._lock:
-            table = self.request_tables.pop(request_id, None)
+            if table is None:
+                table = self.request_tables.pop(request_id, None)
+            elif self.request_tables.get(request_id) is table:
+                del self.request_tables[request_id]
             if table:
                 self.release_for_eviction(table.block_ids)
 

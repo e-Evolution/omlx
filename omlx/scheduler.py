@@ -264,6 +264,34 @@ _MAX_VIABLE_CONTEXT_CACHE_TTL_S = 30.0
 # Seconds between "fits later" log lines for the same waiting request.
 _FITS_LATER_LOG_INTERVAL_S = 30.0
 
+# A fits-later head that deferred gave back its restored prefix, so each
+# retry restores it again (from SSD). It is retried only once the memory
+# picture changed: an admitted row left (finished, aborted or paused), free
+# memory rose by more than this fraction of the admission line, or its
+# exponential backoff (base doubling per deferral, capped) expired.
+DEFERRED_ADMISSION_FREE_DELTA_FRACTION = 0.02
+DEFERRED_ADMISSION_RETRY_BASE_S = 0.25
+DEFERRED_ADMISSION_RETRY_MAX_S = 4.0
+
+
+def _deferred_admission_backoff_s(attempts: int) -> float:
+    """Seconds a head waits after its ``attempts``-th consecutive deferral."""
+    exponent = min(max(int(attempts), 1) - 1, 32)
+    return min(
+        DEFERRED_ADMISSION_RETRY_BASE_S * (2**exponent),
+        DEFERRED_ADMISSION_RETRY_MAX_S,
+    )
+
+
+@dataclass
+class _DeferredAdmissionWait:
+    """The memory picture a fits-later head deferred on."""
+
+    attempts: int
+    retry_at: float
+    free_bytes: int | None
+    admitted_ids: frozenset[str]
+
 
 @dataclass
 class _AdmissionEstimate:
@@ -2432,6 +2460,8 @@ class Scheduler:
         # Chunked prefill queue: requests whose prefill spans multiple steps.
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
+        # Fits-later heads that deferred, and the memory picture they wait on.
+        self._deferred_admissions: dict[str, _DeferredAdmissionWait] = {}
         self._prefill_states: dict[str, _PrefillState] = {}
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
@@ -14132,9 +14162,16 @@ class Scheduler:
         # fetch_cache builds the lookup's block table without registering it
         # with the prefix cache, so release_cache above leaves it. Release its
         # refs for eviction: the blocks stay findable for the re-admission.
+        # The release may wait behind an in-flight prefill commit, so it is
+        # keyed to this attempt's table: run after a re-admission, it gives
+        # back only the old table's refs and leaves the new table alone.
         manager = self.paged_cache_manager
         if manager is not None and hasattr(manager, "release_block_table"):
-            self._after_commit(rid, lambda: manager.release_block_table(rid))
+            table = manager.get_block_table(rid)
+            if table is not None:
+                self._after_commit(
+                    rid, lambda: manager.release_block_table(rid, table=table)
+                )
         request.prompt_cache = None
         request.block_table = None
         request.cached_tokens = 0
@@ -14142,6 +14179,53 @@ class Scheduler:
         request.remaining_tokens = request.prompt_token_ids
         request.specprefill_indices = None
         self._prefix_cache_prepared.discard(rid)
+
+    def _admitted_request_ids(self) -> frozenset[str]:
+        """Ids of the rows occupying scheduler capacity (running, prefilling)."""
+        return frozenset(self.running) | frozenset(
+            r.request_id for r in self.prefilling
+        )
+
+    def _note_deferred_admission(self, request: "Request") -> None:
+        """Record the memory picture a fits-later head deferred on."""
+        rid = request.request_id
+        # Requests that left the scheduler while waiting drop their record.
+        for stale in [r for r in self._deferred_admissions if r not in self.requests]:
+            self._deferred_admissions.pop(stale, None)
+        previous = self._deferred_admissions.get(rid)
+        attempts = (previous.attempts if previous is not None else 0) + 1
+        self._deferred_admissions[rid] = _DeferredAdmissionWait(
+            attempts=attempts,
+            retry_at=time.monotonic() + _deferred_admission_backoff_s(attempts),
+            free_bytes=self._park_free_bytes(),
+            admitted_ids=self._admitted_request_ids(),
+        )
+
+    def _deferred_admission_holds(self, head: "Request") -> bool:
+        """Whether a deferred fits-later ``head`` waits instead of retrying.
+
+        It retries once the memory picture changed since it deferred: no row
+        is admitted any more (the fits-later wait no longer applies), a row
+        it waited on left (finished, aborted or paused), free memory rose by
+        more than ``DEFERRED_ADMISSION_FREE_DELTA_FRACTION`` of the admission
+        line, or its backoff expired. The record stays, so a new deferral
+        doubles the backoff.
+        """
+        wait = self._deferred_admissions.get(head.request_id)
+        if wait is None:
+            return False
+        if not self._num_admitted_requests():
+            return False
+        if not wait.admitted_ids <= self._admitted_request_ids():
+            return False
+        free = self._park_free_bytes()
+        if free is not None and wait.free_bytes is not None:
+            threshold = int(
+                self._admission_limit_bytes() * DEFERRED_ADMISSION_FREE_DELTA_FRACTION
+            )
+            if free - wait.free_bytes > threshold:
+                return False
+        return time.monotonic() < wait.retry_at
 
     def _capacity_limit_bytes(self) -> int:
         """The line a request must fit under alone: the tighter of the
@@ -14649,6 +14733,10 @@ class Scheduler:
             # overtakes them while they wait.
             if self.waiting[0].parked and self._park_hold_applies(self.waiting[0]):
                 break
+            # A fits-later head that deferred keeps the hold until the memory
+            # picture changes; retrying earlier only restores its prefix again.
+            if self._deferred_admission_holds(self.waiting[0]):
+                break
 
             admitted = self._num_admitted_requests()
             if self._admission_paused and admitted:
@@ -14755,6 +14843,10 @@ class Scheduler:
                 # A previous run of this id is still being torn down behind
                 # its prefill commit; only this request waits (no blocking)
                 # so the deferred cleanup cannot hit the new run's state.
+                # A deferred fits-later head is not set aside: nothing behind
+                # it overtakes it, so it keeps the hold until the release ran.
+                if request.request_id in self._deferred_admissions:
+                    break
                 held.append(self.waiting.popleft())
                 continue
 
@@ -14905,8 +14997,10 @@ class Scheduler:
                 # nothing behind it overtakes it while the admitted rows run,
                 # holding no paged-cache refs or restored prefix meanwhile.
                 self._release_deferred_admission(request)
+                self._note_deferred_admission(request)
                 self.waiting.appendleft(request)
                 break
+            self._deferred_admissions.pop(request.request_id, None)
             if preflight_rejection is not None:
                 logger.warning(
                     f"Request {request.request_id} rejected by prefill "
