@@ -33,6 +33,9 @@ What it changes in the copy:
   the suffix has no dev/alpha/beta/rc marker), and `LSEnvironment`.
 - **D1, park, a bounded MLX buffer cache and serialized long-context decode ON** through `LSEnvironment`:
   `OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS=4`, `OMLX_MEMORY_PRESSURE_PARK=true`,
+  `OMLX_MEDIA_TEXT_SUFFIX_CHUNKED=true` (a media prompt whose images are all
+  cached prefills its text suffix chunked, so decode keeps running and the
+  prefill is parkable),
   `OMLX_MLX_CACHE_LIMIT_GB=16` (`mx.set_cache_limit`, applied at server startup;
   keeps the enforcer's pool from growing to 65-73 GB during MTP batch decode.
   Upstream default is 0 = unbounded),

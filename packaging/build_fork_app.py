@@ -73,6 +73,9 @@ FORK_ENV = {
     # Hard pressure with nothing parkable aborts the one largest request
     # instead of every in-flight one (emergency and unload still abort all).
     "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
+    # A media prompt whose images are all cached prefills its text suffix in
+    # the chunked path: decode keeps running and the prefill can be parked.
+    "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true",
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
     "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
     "OMLX_BATCHED_DECODE_HOLD_MAX_S": FORK_BATCHED_DECODE_HOLD_MAX_S,
