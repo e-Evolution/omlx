@@ -263,6 +263,8 @@ class Request:
     parked: bool = False
     parked_at: float = 0.0  # time.monotonic() of the latest park
     park_count: int = 0  # Parks taken so far (bounded by max_parks_per_request)
+    # Prompt tokens a prefill park left committed in the prefix cache.
+    park_committed_tokens: int = 0
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

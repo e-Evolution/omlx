@@ -1370,8 +1370,14 @@ PARK_SETTLE_POLLS = 3
 # A pressure monitor that has not reported for this long is considered gone;
 # parked requests then resume instead of waiting for polls that never come.
 PARK_SIGNAL_STALE_S = 60.0
-# Longest a parked head holds admission on a non-hard pressure level.
+# Longest a parked head holds admission on a non-hard pressure level when no
+# memory estimate is available (with one, the head waits for its fit).
 PARK_MAX_HOLD_S = 300.0
+# Free memory a parked request must find beyond its own estimated need before
+# it resumes, as a fraction of the admission line (estimate error margin).
+PARK_RESUME_MARGIN_FRACTION = 0.02
+# Seconds between "waiting" log lines for the same parked head.
+_PARK_WAIT_LOG_INTERVAL_S = 30.0
 # Saturation value of ``_polls_since_resume``: "long enough since the last
 # resume that the hysteresis gate is open". It is the initial value (no resume
 # has happened yet) and the cap that keeps the counter from growing without
@@ -2367,6 +2373,10 @@ class Scheduler:
         self._polls_since_resume: int = _POLLS_SINCE_RESUME_SATURATION
         self._last_pressure_poll_at: float | None = None
         self._last_pressure_level: str = "ok"
+        # Memory-aware resume: the fit that released the head (request id,
+        # need, free) for the resume log, and the last "waiting" log line.
+        self._park_resume_fit: tuple[str, int, int] | None = None
+        self._park_wait_logged: tuple[str, float] | None = None
         self._park_pins: dict[str, _ParkPins] = {}
         # Decode pause: ids asked for by request_decode_pause (thread-safe set,
         # drained at step start) and the resume record of each paused row.
@@ -12084,32 +12094,166 @@ class Scheduler:
         else:
             self._ok_polls = 0
 
-    def _park_resume_allowed(self) -> bool:
-        """True once enough consecutive ok polls were seen (or no monitor runs)."""
+    def _park_signal_stale(self) -> bool:
+        """No live pressure monitor (never polled, or silent for too long)."""
         seen = self._last_pressure_poll_at
-        if seen is None or time.monotonic() - seen > PARK_SIGNAL_STALE_S:
-            return True  # no live pressure monitor: never starve a parked request
+        return seen is None or time.monotonic() - seen > PARK_SIGNAL_STALE_S
+
+    def _park_ok_polls_met(self) -> bool:
         need = getattr(self.config, "park_resume_ok_polls", 3)
         return self._ok_polls >= max(1, need)
+
+    def _park_resume_allowed(self, head: "Request | None" = None) -> bool:
+        """Whether a parked request may resume now.
+
+        With no live pressure monitor, always (never starve a parked
+        request). Otherwise, when ``head`` has a memory estimate, once the
+        free memory covers its need plus a margin; without an estimate, once
+        enough consecutive ok polls were seen.
+        """
+        if self._park_signal_stale():
+            return True
+        if head is not None:
+            fit = self._park_memory_fit(head)
+            if fit is not None:
+                return fit
+        return self._park_ok_polls_met()
 
     def _park_hold_applies(self, head: "Request") -> bool:
         """Whether a parked head still blocks admission.
 
-        Never when nothing is admitted (admission must be able to recover),
-        and not past PARK_MAX_HOLD_S unless the last pressure was hard. Every
-        escape resumes one request per scheduling pass, and the max-hold
+        The hold is the head's reservation: nothing newer is admitted while
+        it waits, so nothing consumes the headroom it waits for. It never
+        applies when nothing is admitted (admission must be able to recover)
+        or without a live pressure monitor. With a memory estimate the head
+        resumes when it fits. Without one it resumes after an ok-poll streak,
+        or past PARK_MAX_HOLD_S unless the last pressure was hard; that
         escape also waits ``park_resume_ok_polls`` polls after the previous
-        resume, so a burst of resumes cannot re-trigger hard pressure.
+        resume. Every escape resumes one request per scheduling pass, so a
+        burst of resumes cannot re-trigger hard pressure.
         """
         if self._park_resumed_this_pass:
             return True
-        if self._park_resume_allowed() or not self._num_admitted_requests():
+        if not self._num_admitted_requests() or self._park_signal_stale():
+            return False
+        fit = self._park_memory_fit(head)
+        if fit is not None:
+            return not fit
+        if self._park_ok_polls_met():
             return False
         need = max(1, getattr(self.config, "park_resume_ok_polls", 3))
         held_s = time.monotonic() - head.parked_at
         if held_s >= PARK_MAX_HOLD_S and self._last_pressure_level != "hard":
             return self._polls_since_resume < need
         return True
+
+    def _park_memory_fit(self, head: "Request") -> bool | None:
+        """Whether the free memory covers ``head``'s need plus the margin.
+
+        None when either side cannot be estimated (the caller falls back to
+        the ok-poll rule). A head never resumes on hard pressure, whatever
+        the estimate says. Logs the wait (rate-limited) and records the fit
+        for the resume log.
+        """
+        need = self._parked_resume_need_bytes(head)
+        free = self._park_free_bytes()
+        if need is None or free is None:
+            return None
+        margin = int(self._admission_limit_bytes() * PARK_RESUME_MARGIN_FRACTION)
+        if self._last_pressure_level == "hard" or free < need + margin:
+            self._log_park_wait(head.request_id, need, free)
+            return False
+        self._park_resume_fit = (head.request_id, need, free)
+        return True
+
+    def _log_park_wait(self, request_id: str, need: int, free: int) -> None:
+        now = time.monotonic()
+        last = self._park_wait_logged
+        if (
+            last is not None
+            and last[0] == request_id
+            and now - last[1] < _PARK_WAIT_LOG_INTERVAL_S
+        ):
+            return
+        self._park_wait_logged = (request_id, now)
+        logger.info(
+            "Parked request %s waiting: need %.1f GB, free %.1f GB",
+            request_id,
+            need / 1024**3,
+            free / 1024**3,
+        )
+
+    def _parked_resume_need_bytes(self, request: "Request") -> int | None:
+        """Live bytes a parked request needs to resume and run to its end.
+
+        A paused decoding row: the KV of its final length (saved context,
+        the kickoff and every remaining token) plus one decode step's
+        transient. A parked prefill: the KV of prompt plus max_tokens (the
+        committed prefix comes back from SSD into memory, so it counts too)
+        plus the prefill transient of what is left to compute. None when
+        nothing can be estimated.
+        """
+        monitor = self.memory_monitor
+        if monitor is None:
+            return None
+        record = self._decode_resumes.get(request.request_id)
+        if record is not None:
+            final = len(record.tokens) + 1 + max(0, record.remaining_max_tokens)
+            kv = monitor.estimate_resident_kv_bytes(final)
+            transient = monitor.estimate_chunk_transient_bytes(1, final)
+        else:
+            prompt = int(request.num_prompt_tokens or 0)
+            max_tokens = int(getattr(request.sampling_params, "max_tokens", 0) or 0)
+            final = prompt + max(0, max_tokens)
+            kv = monitor.estimate_resident_kv_bytes(final)
+            est = self._admission_estimate(
+                num_prompt_tokens=prompt,
+                cached_tokens=min(int(request.park_committed_tokens or 0), prompt),
+                current=0,
+            )
+            transient = (
+                est.transient
+                if est is not None
+                else monitor.estimate_chunk_transient_bytes(1, final)
+            )
+        need = int(kv + transient)
+        return need if need > 0 else None
+
+    def _park_free_bytes(self) -> int | None:
+        """Free bytes under the admission line, net of in-flight prefills.
+
+        None without an admission line (no limit was propagated).
+        """
+        limit = self._admission_limit_bytes()
+        if limit <= 0:
+            return None
+        return (
+            limit - self._current_usage_bytes() - self._inflight_prefill_reserve_bytes()
+        )
+
+    def _inflight_prefill_reserve_bytes(self) -> int:
+        """KV the running prefills still have to allocate.
+
+        A prefill that resumed (or was admitted) a pass ago has allocated
+        only its first chunks; the next parked head must not count the rest
+        as free memory.
+        """
+        monitor = self.memory_monitor
+        if monitor is None:
+            return 0
+        total = 0
+        for request in list(self.prefilling):
+            state = self._prefill_states.get(request.request_id)
+            if state is None:
+                continue
+            prompt = int(request.num_prompt_tokens or 0)
+            done = int(state.base_size) + int(state.tokens_processed)
+            if prompt > done:
+                remaining = monitor.estimate_resident_kv_bytes(
+                    prompt
+                ) - monitor.estimate_resident_kv_bytes(done)
+                total += max(0, int(remaining))
+        return total
 
     def select_memory_victim(self, *, spare_parked: bool = True) -> MemoryVictim | None:
         """Pick the one live request whose abort frees the most memory.
@@ -12875,6 +13019,7 @@ class Scheduler:
         request.parked = True
         request.parked_at = time.monotonic()
         request.park_count += 1
+        request.park_committed_tokens = committed
         self._clear_request_admission_bookkeeping(rid)
         get_prefill_tracker().remove(rid)
         # Order matters: pin first, then release the table's own refs.
@@ -13004,6 +13149,15 @@ class Scheduler:
         if preserved_tokens is None:
             preserved_tokens = request.cached_tokens or 0
         self._park_stats["tokens_preserved"] += preserved_tokens
+        fit = self._park_resume_fit
+        self._park_resume_fit = None
+        if fit is not None and fit[0] == request.request_id:
+            logger.info(
+                "Resuming parked request %s: need %.1f GB fits in free %.1f GB",
+                request.request_id,
+                fit[1] / 1024**3,
+                fit[2] / 1024**3,
+            )
         if log:
             logger.info(
                 "Resumed parked request %s: cached=%d",
@@ -16530,6 +16684,8 @@ class Scheduler:
         self._park_requested = False
         self._polls_since_park = None
         self._park_resumed_this_pass = False
+        self._park_resume_fit = None
+        self._park_wait_logged = None
         self._prefill_commits.clear()
         self._cache_freshness_waits.clear()
         self._prefix_cache_prepared.clear()

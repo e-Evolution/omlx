@@ -362,7 +362,9 @@ class SchedulerSettings:
     memory_pressure_park: bool = False
     # Parks a single request may take before it falls back to the abort.
     max_parks_per_request: int = 3
-    # Consecutive "ok" pressure polls before parked requests may resume.
+    # Consecutive "ok" pressure polls before parked requests may resume when
+    # no memory estimate is available (with one, a parked request resumes
+    # once the estimated free memory covers its need).
     park_resume_ok_polls: int = 3
 
     def to_dict(self) -> dict[str, Any]:
