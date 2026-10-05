@@ -388,6 +388,9 @@ class _DrainingVictim:
     victim: Any  # MemoryVictim
     polls: int = 0  # polls since its abort was requested
     executed: bool = False  # its abort was seen to have run
+    # A decode-pause victim reports through its scheduler instead of the
+    # engine's abort probe: "pending", "declined" or "done".
+    status: Any = None  # Callable[[], str] | None
 
 
 class ProcessMemoryEnforcer:
@@ -1695,17 +1698,86 @@ class ProcessMemoryEnforcer:
             # Its abort ran and a further poll was observed: settled.
             self._draining_victim = None
             return None
-        draining.executed = not self._victim_abort_pending(engine, rid)
+        if draining.status is not None:
+            draining.executed = self._pause_status(draining) != "pending"
+        else:
+            draining.executed = not self._victim_abort_pending(engine, rid)
         logger.info(
             "Hard memory pressure: waiting for victim %s memory to drain on "
-            "'%s' (poll %d/%d, abort %s)",
+            "'%s' (poll %d/%d, %s %s)",
             rid,
             model_id,
             draining.polls,
             self._SINGLE_VICTIM_SETTLE_MAX_POLLS,
+            "pause" if draining.status is not None else "abort",
             "ran" if draining.executed else "pending",
         )
         return draining.victim
+
+    @staticmethod
+    def _pause_status(draining: _DrainingVictim) -> str:
+        """A decode-pause victim's status; a failing probe counts as done."""
+        try:
+            status = draining.status()
+        except Exception:  # noqa: BLE001
+            return "done"
+        return status if status in ("pending", "declined") else "done"
+
+    def _request_decode_pause(self) -> int:
+        """At hard pressure with no prefill to park, pause one decoding row.
+
+        Runs after ``_request_scheduler_park`` found no prefill victim. While
+        a pause victim drains (its pause has not run, or its exact chain still
+        waits for the SSD writer, then one settle poll) nothing else is
+        paused or aborted. A declined pause is forgotten at once, so the same
+        poll pauses another row or falls back to the single-victim abort.
+        While an aborted victim drains, no row is paused either. Returns 1
+        when the abort is deferred, else 0.
+        """
+        draining = self._draining_victim
+        if draining is not None and draining.status is None:
+            # An aborted victim is draining: the abort path waits for it.
+            return 0
+        if draining is not None:
+            if self._pause_status(draining) == "declined":
+                logger.warning(
+                    "Hard memory pressure: the decode pause of %s was declined "
+                    "on '%s'",
+                    draining.victim.request_id,
+                    draining.model_id,
+                )
+                self._draining_victim = None
+            elif self._still_draining_victim(None, draining.model_id) is not None:
+                return 1
+        for model_id, entry in self._engine_pool._entries.items():
+            scheduler = self._resolve_scheduler(entry)
+            select = getattr(scheduler, "select_decode_pause_victim", None)
+            pause = getattr(scheduler, "request_decode_pause", None)
+            status = getattr(scheduler, "decode_pause_status", None)
+            if not (callable(select) and callable(pause) and callable(status)):
+                continue
+            try:
+                victim = select()
+                rid = getattr(victim, "request_id", None)
+                if not isinstance(rid, str) or pause(rid) is not True:
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Decode pause request failed on '%s': %s", model_id, exc)
+                continue
+            self._draining_victim = _DrainingVictim(
+                model_id, victim, status=lambda rid=rid, probe=status: probe(rid)
+            )
+            logger.warning(
+                "Hard memory pressure: pausing decoding victim %s instead of "
+                "aborting (%d tokens, ~%.1f GB) on '%s'; %d request(s) kept",
+                rid,
+                victim.tokens,
+                victim.est_bytes / 1024**3,
+                model_id,
+                victim.kept,
+            )
+            return 1
+        return 0
 
     @staticmethod
     def _victim_abort_pending(engine: Any, request_id: str) -> bool:
@@ -2021,10 +2093,12 @@ class ProcessMemoryEnforcer:
             and self._park_deferred_polls < self._PARK_DEFER_POLLS_MAX
         ):
             parked_on = self._request_scheduler_park()
+            if not parked_on:
+                parked_on = self._request_decode_pause()
             if parked_on:
                 self._park_deferred_polls += 1
                 logger.info(
-                    "Hard memory pressure: parking a prefill victim on %d "
+                    "Hard memory pressure: parking or pausing a victim on %d "
                     "scheduler(s) instead of aborting (poll %d/%d)",
                     parked_on,
                     self._park_deferred_polls,

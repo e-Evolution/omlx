@@ -1405,6 +1405,10 @@ class _DecodeResume:
     stop_matcher: Any = None
 
 
+class _DecodePauseDeclinedError(Exception):
+    """A decode pause cannot proceed; the row keeps decoding (message: why)."""
+
+
 class _ResumedStopSequences:
     """Stop sequences whose first matcher resumes at a saved position.
 
@@ -12181,6 +12185,9 @@ class Scheduler:
     def _decode_pause_exclusion_reason(self, request: Request) -> str | None:
         """Why a decoding row cannot be paused exactly (v1), or None."""
         rid = request.request_id
+        failed = getattr(request, "_decode_pause_failed", None)
+        if failed:
+            return f"an earlier decode pause failed ({failed})"
         if (
             request.specprefill_indices is not None
             or self._specprefill_active_request_id == rid
@@ -12335,23 +12342,96 @@ class Scheduler:
     def _process_pending_decode_pauses(self, output: SchedulerOutput | None) -> bool:
         acted = False
         while self._pending_decode_pauses:
-            rid = self._pending_decode_pauses.pop()
-            request = self.requests.get(rid)
-            if (
-                request is None
-                or rid not in self.running
-                or rid in self._pending_abort_ids
-                or not self._park_enabled()
-            ):
-                continue
-            reason = self._park_exclusion_reason(request)
-            if reason is not None:
-                logger.info("Decode pause skipped for %s: %s", rid, reason)
-                continue
-            if self._pause_decoding_request(request, output):
-                self._polls_since_park = 0
-                acted = True
+            # The id stays pending until its pause has run, so the enforcer's
+            # drain probe never sees a pause in progress as finished.
+            rid = next(iter(list(self._pending_decode_pauses)))
+            try:
+                acted = self._process_one_decode_pause(rid, output) or acted
+            finally:
+                self._pending_decode_pauses.discard(rid)
         return acted
+
+    def _process_one_decode_pause(
+        self, rid: str, output: SchedulerOutput | None
+    ) -> bool:
+        request = self.requests.get(rid)
+        if (
+            request is None
+            or rid not in self.running
+            or rid in self._pending_abort_ids
+            or not self._park_enabled()
+        ):
+            return False
+        reason = self._park_exclusion_reason(request)
+        if reason is not None:
+            logger.info("Decode pause skipped for %s: %s", rid, reason)
+            return False
+        if not self._pause_decoding_request(request, output):
+            return False
+        self._polls_since_park = 0
+        return True
+
+    def select_decode_pause_victim(self) -> MemoryVictim | None:
+        """Pick the decoding row whose pause frees the most memory.
+
+        Candidates are decoding rows ``_park_exclusion_reason`` accepts that
+        are not already pending an abort or a pause. The largest live KV
+        (prompt plus output) goes first, the most recent arrival breaks ties.
+        The oldest admitted request is protected unless it is the only
+        candidate, as for a prefill park. Read-only: the caller asks for the
+        pause with ``request_decode_pause``. None when nothing is pausable.
+        """
+        if not self._park_enabled():
+            return None
+        try:
+            running = list(self.running.values())
+            admitted = list(self.prefilling) + running
+            busy = set(self._pending_abort_ids) | set(self._pending_decode_pauses)
+            candidates = [
+                request
+                for request in running
+                if request.request_id not in busy
+                and self._park_exclusion_reason(request) is None
+            ]
+        except RuntimeError:
+            return None  # the queues mutated mid-read on the MLX thread
+        if not candidates:
+            return None
+        oldest = min(admitted, key=lambda r: (r.arrival_time, r.request_id))
+        candidates.sort(
+            key=lambda r: (r.num_tokens, r.arrival_time, r.request_id), reverse=True
+        )
+        victim = next(
+            (r for r in candidates if r.request_id != oldest.request_id),
+            candidates[0],
+        )
+        tokens = victim.num_tokens
+        monitor = self.memory_monitor
+        est_bytes = (
+            int(monitor.estimate_prompt_kv_bytes(tokens)) if monitor is not None else 0
+        )
+        return MemoryVictim(victim.request_id, tokens, est_bytes, kept=len(running) - 1)
+
+    def decode_pause_status(self, request_id: str) -> str:
+        """Where a requested decode pause stands, for the memory enforcer.
+
+        ``pending`` while the pause waits for its step or runs, and after it
+        ran while its exact chain's SSD writes still sit in memory;
+        ``declined`` when it failed and the row kept decoding; ``done`` once
+        the row's memory is free (paused and written, finished, or gone).
+        """
+        if request_id in self._pending_decode_pauses:
+            return "pending"
+        request = self.requests.get(request_id)
+        if request is not None and getattr(request, "_decode_pause_failed", None):
+            return "declined"
+        pins = self._park_pins.get(request_id)
+        ssd = self.paged_ssd_cache_manager
+        if request_id in self._decode_resumes and pins is not None and ssd is not None:
+            has_pending = getattr(ssd, "has_pending_writes", None)
+            if callable(has_pending) and has_pending(pins.hashes) is True:
+                return "pending"
+        return "done"
 
     def _pause_decoding_request(
         self, request: Request, output: SchedulerOutput | None
@@ -12365,119 +12445,130 @@ class Scheduler:
         normally), the KV is stored as an exact chain under a request domain
         and pinned, and the row leaves the batch the way an abort removes it
         while the request keeps its output, detokenizer, parser session and
-        client stream. Any failure before the emission leaves the row
-        decoding untouched.
+        client stream.
+
+        Any failure before the emission leaves the row decoding untouched:
+        a stored chain is unpinned and deleted, the request is marked so it
+        is not chosen again, and the caller falls back to an abort. A failure
+        after the emission cannot keep decoding (the token is streamed but
+        still pending in the batch), so the request ends with an error.
         """
         rid = request.request_id
-        uid = self.request_id_to_uid[rid]
-        generation_batch = self._generation_batch()
-        _safe_sync_stream(self._stream)
-        row = generation_batch.uids.index(uid)
-        with mx.stream(self._stream):
-            mx.eval(generation_batch._next_tokens)
-        pending = int(generation_batch._next_tokens[row].item())
-
-        matcher = generation_batch._matchers[row]
-        stop_matcher = type(matcher)(matcher._root)
-        stop_matcher._node = matcher._node
-        stops = stop_matcher.advance(pending)
-        emitted = generation_batch._num_tokens[row] + 1
-        max_tokens = generation_batch.max_tokens[row]
-        if stops or emitted >= max_tokens:
-            logger.info(
-                "Decode pause skipped for %s: its pending token finishes the "
-                "request",
-                rid,
-            )
-            return False
-
-        row_cache, row_tokens = self.batch_generator.extract_cache([uid])[uid]
-        saved_tokens = [int(t) for t in row_tokens]
-        offset = max((_cache_layer_token_count(c) for c in row_cache), default=0)
-        expected = request.num_prompt_tokens + request.num_output_tokens
-        if offset != len(saved_tokens) or len(saved_tokens) != expected:
-            logger.warning(
-                "Decode pause declined for %s: cache offset %d, batch tokens %d, "
-                "prompt + output %d disagree",
-                rid,
-                offset,
-                len(saved_tokens),
-                expected,
-            )
-            return False
-
-        park_number = request.park_count + 1
-        storage_id = f"{rid}:decode-pause-{park_number}"
-        domain_key = (
-            "decode-resume",
-            rid,
-            str(park_number),
-            str(request.vlm_extra_keys_for_cache or ()),
-        )
-        cache_states, model_cache_config = self._extract_cache_states(row_cache)
-        table = None
-        if cache_states:
+        chain = None  # (tokens, domain) once a store may have written blocks
+        emitting = False
+        try:
+            uid = self.request_id_to_uid[rid]
+            generation_batch = self._generation_batch()
+            _safe_sync_stream(self._stream)
+            row = generation_batch.uids.index(uid)
             with mx.stream(self._stream):
-                arrays = self._collect_arrays_from_extracted_cache(cache_states)
-                if arrays:
-                    mx.eval(*arrays)
-            table = self.block_aware_cache.store_exact_prefix(
-                storage_id,
-                saved_tokens,
-                cache_states,
-                model_cache_config=model_cache_config,
-                domain_key=domain_key,
-            )
-        if table is None or not self._pin_exact_chain(rid, table):
-            logger.warning(
-                "Decode pause declined for %s: the exact prefix of %d tokens "
-                "could not be stored and pinned",
+                mx.eval(generation_batch._next_tokens)
+            pending = int(generation_batch._next_tokens[row].item())
+
+            matcher = generation_batch._matchers[row]
+            stop_matcher = type(matcher)(matcher._root)
+            stop_matcher._node = matcher._node
+            stops = stop_matcher.advance(pending)
+            emitted = generation_batch._num_tokens[row] + 1
+            max_tokens = generation_batch.max_tokens[row]
+            if stops or emitted >= max_tokens:
+                logger.info(
+                    "Decode pause skipped for %s: its pending token finishes the "
+                    "request",
+                    rid,
+                )
+                return False
+
+            row_cache, row_tokens = self.batch_generator.extract_cache([uid])[uid]
+            saved_tokens = [int(t) for t in row_tokens]
+            offset = max((_cache_layer_token_count(c) for c in row_cache), default=0)
+            expected = request.num_prompt_tokens + request.num_output_tokens
+            if offset != len(saved_tokens) or len(saved_tokens) != expected:
+                raise _DecodePauseDeclinedError(
+                    f"cache offset {offset}, batch tokens {len(saved_tokens)}, "
+                    f"prompt + output {expected} disagree"
+                )
+
+            park_number = request.park_count + 1
+            storage_id = f"{rid}:decode-pause-{park_number}"
+            domain_key = (
+                "decode-resume",
                 rid,
-                len(saved_tokens),
+                str(park_number),
+                str(request.vlm_extra_keys_for_cache or ()),
             )
+            cache_states, model_cache_config = self._extract_cache_states(row_cache)
+            table = None
+            if cache_states:
+                with mx.stream(self._stream):
+                    arrays = self._collect_arrays_from_extracted_cache(cache_states)
+                    if arrays:
+                        mx.eval(*arrays)
+                chain = (saved_tokens, domain_key)
+                table = self.block_aware_cache.store_exact_prefix(
+                    storage_id,
+                    saved_tokens,
+                    cache_states,
+                    model_cache_config=model_cache_config,
+                    domain_key=domain_key,
+                )
+            if table is None or not self._pin_exact_chain(rid, table):
+                raise _DecodePauseDeclinedError(
+                    f"the exact prefix of {len(saved_tokens)} tokens could not be "
+                    "stored and pinned"
+                )
+
+            response = GenerationBatch.Response(
+                uid=uid,
+                token=pending,
+                logprobs=(
+                    generation_batch._next_logprobs[row]
+                    if row < len(generation_batch._next_logprobs)
+                    else None
+                ),
+                finish_reason=None,
+                prompt_cache=None,
+                all_tokens=None,
+            )
+            emitting = True
+            outputs, finished_ids = self._process_batch_responses([response])
+            if output is not None:
+                output.outputs.extend(outputs)
+                output.finished_request_ids.update(finished_ids)
+            if finished_ids:
+                # A stop string or parser stop ended it: no pause after all.
+                self._discard_exact_chain(rid, chain)
+                self._cleanup_finished(finished_ids)
+                return False
+
+            from .api.grammar import GrammarConstraintProcessor
+
+            processors = list(generation_batch.logits_processors[row] or ())
+            for processor in processors:
+                if (
+                    isinstance(processor, GrammarConstraintProcessor)
+                    and processor.pending
+                ):
+                    processor.accept_token(pending)
+
+            self._decode_resumes[rid] = _DecodeResume(
+                storage_id=storage_id,
+                domain_key=domain_key,
+                tokens=saved_tokens,
+                kickoff=pending,
+                remaining_max_tokens=max_tokens - emitted,
+                sampler=generation_batch.samplers[row],
+                logits_processors=processors,
+                stop_sequences=_unwrap_stop_sequences(
+                    generation_batch.stop_sequences[row]
+                ),
+                stop_matcher=stop_matcher,
+            )
+            self._remove_decoding_row(rid, uid)
+        except Exception as exc:  # noqa: BLE001
+            self._decode_pause_failed(request, chain, exc, emitted=emitting, out=output)
             return False
 
-        response = GenerationBatch.Response(
-            uid=uid,
-            token=pending,
-            logprobs=(
-                generation_batch._next_logprobs[row]
-                if row < len(generation_batch._next_logprobs)
-                else None
-            ),
-            finish_reason=None,
-            prompt_cache=None,
-            all_tokens=None,
-        )
-        outputs, finished_ids = self._process_batch_responses([response])
-        if output is not None:
-            output.outputs.extend(outputs)
-            output.finished_request_ids.update(finished_ids)
-        if finished_ids:
-            # A stop string or parser stop ended it: no pause after all.
-            self._unpin_parked(rid)
-            self._cleanup_finished(finished_ids)
-            return False
-
-        from .api.grammar import GrammarConstraintProcessor
-
-        processors = list(generation_batch.logits_processors[row] or ())
-        for processor in processors:
-            if isinstance(processor, GrammarConstraintProcessor) and processor.pending:
-                processor.accept_token(pending)
-
-        self._decode_resumes[rid] = _DecodeResume(
-            storage_id=storage_id,
-            domain_key=domain_key,
-            tokens=saved_tokens,
-            kickoff=pending,
-            remaining_max_tokens=max_tokens - emitted,
-            sampler=generation_batch.samplers[row],
-            logits_processors=processors,
-            stop_sequences=_unwrap_stop_sequences(generation_batch.stop_sequences[row]),
-            stop_matcher=stop_matcher,
-        )
-        self._remove_decoding_row(rid, uid)
         request.status = RequestStatus.WAITING
         request.batch_uid = None
         request.prompt_cache = None
@@ -12498,6 +12589,90 @@ class Scheduler:
             request.num_output_tokens,
         )
         return True
+
+    def _decode_pause_failed(
+        self,
+        request: Request,
+        chain: tuple[list[int], tuple[str, ...]] | None,
+        exc: Exception,
+        *,
+        emitted: bool,
+        out: SchedulerOutput | None,
+    ) -> None:
+        """Undo a failed decode pause (see ``_pause_decoding_request``)."""
+        rid = request.request_id
+        reason = (
+            str(exc)
+            if isinstance(exc, _DecodePauseDeclinedError)
+            else f"{type(exc).__name__}: {exc}"
+        )
+        self._decode_resumes.pop(rid, None)
+        try:
+            self._discard_exact_chain(rid, chain)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Decode pause cleanup for %s could not delete its exact chain",
+                rid,
+                exc_info=True,
+            )
+        # Never chosen again: the enforcer falls back to its abort instead.
+        request._decode_pause_failed = reason  # type: ignore[attr-defined]
+        if not emitted:
+            logger.warning(
+                "Decode pause declined for %s: %s; the row keeps decoding",
+                rid,
+                reason,
+            )
+            return
+        logger.error(
+            "Decode pause failed for %s after its pending token was streamed: %s; "
+            "ending the request with an error",
+            rid,
+            reason,
+            exc_info=not isinstance(exc, _DecodePauseDeclinedError),
+        )
+        self._do_abort_request(rid)
+        if out is not None:
+            out.outputs.append(
+                RequestOutput(
+                    request_id=rid,
+                    finished=True,
+                    finish_reason="error",
+                    error=f"decode_pause_failed: {reason}",
+                    error_code="decode_pause_failed",
+                )
+            )
+            out.finished_request_ids.add(rid)
+
+    def _discard_exact_chain(
+        self,
+        request_id: str,
+        chain: tuple[list[int], tuple[str, ...]] | None,
+    ) -> None:
+        """Unpin and delete an exact chain stored for a pause that did not happen.
+
+        The chain is found by its domain hashes, so blocks a store wrote
+        before it failed are found too. They belong to one request domain
+        (never shared by dedup), so deleting them cannot hurt another request.
+        """
+        self._unpin_parked(request_id)
+        cache = self.block_aware_cache
+        exact_hashes = getattr(cache, "_exact_prefix_hashes", None)
+        if chain is None or not callable(exact_hashes):
+            return
+        tokens, domain_key = chain
+        manager = self.paged_cache_manager
+        ssd = self.paged_ssd_cache_manager
+        for block_hash, _ in exact_hashes(tokens, domain_key):
+            if ssd is not None:
+                ssd.delete_block(bytes(block_hash))
+            block = (
+                manager.cached_block_hash_to_block.get_block(block_hash)
+                if manager is not None
+                else None
+            )
+            if block is not None and block.ref_count == 0:
+                manager.evict_block_permanently(block.block_id)
 
     def _remove_decoding_row(self, request_id: str, uid: int) -> None:
         """Take a row out of the batch as an abort does, keeping the request."""
