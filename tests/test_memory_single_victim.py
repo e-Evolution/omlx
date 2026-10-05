@@ -206,9 +206,55 @@ class TestEngineAbortOneRequestForMemory:
         collectors["a"].put.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_victim_without_a_collector_is_not_reported(self):
+    async def test_a_victim_without_a_collector_is_reported_as_skipped(self):
+        """Distinct from "no victim" (None): the caller can tell them apart."""
         sched = _scheduler_for_engine("ghost")
         engine = _engine(sched, {"other": MagicMock()})
 
-        assert await engine.abort_one_request_for_memory() is None
+        victim = await engine.abort_one_request_for_memory()
+
+        assert victim is not None and victim.request_id == "ghost"
+        assert victim.skipped == "no_client"
         sched.abort_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_already_finished_victim_is_reported_as_skipped(self):
+        sched = _scheduler_for_engine("done")
+        collectors = {"done": MagicMock()}
+        engine = _engine(sched, collectors)
+        engine._finished_at["done"] = 1.0
+
+        victim = await engine.abort_one_request_for_memory()
+
+        assert victim is not None and victim.skipped == "already_finished"
+        sched.abort_request.assert_not_called()
+        collectors["done"].put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_aborted_victim_is_not_skipped(self):
+        sched = _scheduler_for_engine("big")
+        engine = _engine(sched, {"big": MagicMock()})
+
+        with patch("omlx.utils.proc_memory.get_phys_footprint", return_value=97 * GB):
+            victim = await engine.abort_one_request_for_memory()
+
+        assert victim.skipped is None
+
+
+class TestMemoryVictimPending:
+    """The enforcer asks whether a victim's deferred abort has run yet."""
+
+    def test_pending_until_the_scheduler_has_run_the_abort(self):
+        sched = SimpleNamespace(_pending_abort_ids={"big"}, requests={"big": 1})
+        engine = _engine(sched, {})
+        assert engine.memory_victim_pending("big") is True
+
+        sched._pending_abort_ids.clear()  # step popped it, abort in progress
+        assert engine.memory_victim_pending("big") is True
+
+        sched.requests.clear()  # _do_abort_request dropped the request
+        assert engine.memory_victim_pending("big") is False
+
+    def test_no_scheduler_means_nothing_pending(self):
+        engine = _engine(None, {})
+        assert engine.memory_victim_pending("big") is False

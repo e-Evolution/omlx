@@ -1579,6 +1579,12 @@ class BatchedEngine(BaseEngine):
             )
         return None
 
+    def memory_victim_pending(self, request_id: str) -> bool:
+        """Whether a memory victim's deferred abort has not run yet."""
+        if self._engine and self._engine.engine:
+            return self._engine.engine.memory_victim_pending(request_id)
+        return False
+
     async def abort_all_requests(
         self,
         *,
