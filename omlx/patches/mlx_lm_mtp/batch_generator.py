@@ -3679,6 +3679,28 @@ def _handoff_mtp_for_late_join(gen_batch: Any, state: _MtpState) -> bool:
     return True
 
 
+def handoff_singleton_mtp_for_pause(gen_batch: Any) -> str:
+    """Return a singleton Lightning MTP row to the standard step for a pause.
+
+    A decode pause stores the KV of every streamed token and resumes from the
+    pending ``_next_tokens``, which only the standard step defines. This is
+    the late-join handoff, taken at the same drained-queue boundary where it
+    is exact. Returns ``"standard"`` when no MTP state is active,
+    ``"deferred"`` while more than one committed token is still queued (the
+    queue drains by one per step), ``"handed_off"`` after the handoff, and
+    ``"failed"`` for a stale state or a handoff that could not feed the next
+    token.
+    """
+    state = getattr(gen_batch, "_omlx_mtp_state", None)
+    if state is None:
+        return "standard"
+    if not _mtp_state_valid_for_batch(gen_batch, state):
+        return "failed"
+    if len(state.queue) > 1:
+        return "deferred"
+    return "handed_off" if _handoff_mtp_for_late_join(gen_batch, state) else "failed"
+
+
 def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     """Emit one token; run a verify cycle if the queue is empty."""
     if state.queue:
