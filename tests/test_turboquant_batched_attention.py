@@ -15,7 +15,11 @@ from mlx_vlm.models.qwen3_5 import language as q35_lang
 from mlx_vlm.turboquant import TurboQuantKVCache
 
 from omlx.patches import turboquant_attention as tqa
-from omlx.turboquant_kv import BatchTurboQuantKVCache
+from omlx.turboquant_kv import (
+    BatchTurboQuantKVCache,
+    carry_own_padding_mask,
+    is_own_padding_mask,
+)
 
 pytestmark = pytest.mark.turboquant
 
@@ -406,3 +410,135 @@ def test_greedy_decode_b3_equals_b1_vlm_left_padded_decode_path():
     worst = max(_max_abs(blg[i], single_logits[i]) for i in range(3))
     assert worst < 5e-2, f"max logits diff {worst:.4f}"
     assert batched == singles
+
+
+# ---------------------------------------------------------------------------
+# MTP verify shape (B>1, L>1, left-padded) and mlx-vlm's per-layer mask slice
+# ---------------------------------------------------------------------------
+# mlx-vlm's attention layer re-slices the model's mask (``mask[..., :kv]``) on
+# every layer, so the TurboQuant layer receives a new array object, not the one
+# ``make_mask`` returned. A padded B>1 call with L > 1 must still attend each
+# row's own slice only, instead of dequantizing the whole padded context.
+
+
+def _spy_per_row(monkeypatch):
+    calls = []
+    real = tqa._per_row_batched_attention
+
+    def spy(*args, **kwargs):
+        calls.append(args[1].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tqa, "_per_row_batched_attention", spy)
+    return calls
+
+
+@pytest.mark.parametrize("new_len", [1, 2, 3, 5])
+def test_resliced_own_mask_takes_per_row_path_and_matches_single_row(
+    new_len, monkeypatch
+):
+    batch, rows, q, keys, values = _build(LENGTHS, new_len)
+    own = batch._test_mask
+    derived = own[..., : own.shape[-1]]  # what mlx-vlm hands to each layer
+    assert derived is not own
+    # The wrapped ``_prepare_projected_qkv`` carries the tag onto the slice.
+    carry_own_padding_mask(own, derived)
+    calls = _spy_per_row(monkeypatch)
+    out = _batched(batch, q, keys, values, mask=derived)
+    mx.eval(out)
+    assert len(calls) == 1, "padded B>1 call left the per-row path"
+    for i, rs in enumerate(rows):
+        ref = _single(rs, q[i : i + 1], None)
+        diff = _max_abs(out[i : i + 1], ref)
+        assert diff < 2e-3, f"row {i} (len {LENGTHS[i]}) max|diff|={diff:.5f}"
+
+
+@pytest.mark.parametrize("verify_len", [2, 3, 5])
+def test_real_model_verify_forward_takes_per_row_path(verify_len, monkeypatch):
+    model = _tiny_vlm_language_model()
+    mx.random.seed(33)
+    prompts = [mx.random.randint(0, 64, (n,)).tolist() for n in (300, 900, 1500)]
+    draft = mx.random.randint(0, 64, (3, verify_len))
+
+    def prefill(prompt):
+        caches = [
+            TurboQuantKVCache(bits=BITS) if type(c).__name__ == "KVCache" else c
+            for c in model.make_cache()
+        ]
+        model(mx.array(prompt)[None], cache=caches)
+        return caches
+
+    rows = [prefill(p) for p in prompts]
+    refs = [
+        _logits(model(draft[i : i + 1], cache=prefill(prompts[i])))[0] for i in range(3)
+    ]
+    batch = []
+    for layer in range(len(rows[0])):
+        group = [r[layer] for r in rows]
+        cls = (
+            BatchTurboQuantKVCache
+            if isinstance(group[0], TurboQuantKVCache)
+            else type(group[0])
+        )
+        batch.append(cls.merge(group))
+
+    calls = _spy_per_row(monkeypatch)
+    out = _logits(model(draft, cache=batch, speculative_verify=True))
+    mx.eval(out)
+
+    n_tq_layers = sum(isinstance(c, BatchTurboQuantKVCache) for c in batch)
+    assert n_tq_layers > 0
+    assert len(calls) == n_tq_layers, (
+        "verify forward left the per-row path: "
+        f"{len(calls)} per-row calls for {n_tq_layers} TurboQuant layers"
+    )
+    for i in range(3):
+        assert _max_abs(out[i], refs[i]) < 5e-2
+
+
+def test_wrapped_prepare_keeps_own_mask_tag_for_the_real_attention_layer():
+    attn_cls = q35_lang.Qwen3_5Attention
+    assert getattr(attn_cls._prepare_projected_qkv, "_omlx_carries_own_mask", False)
+
+
+def test_carried_own_mask_tag_is_scoped_to_full_width_slices_of_own_masks():
+    batch, rows, q, keys, values = _build([1200, 2400], 2)
+    own = batch._test_mask
+    total = own.shape[-1]
+
+    derived = own[..., :total]
+    assert derived is not own
+    assert not is_own_padding_mask(derived, 2, total, 2)
+    carry_own_padding_mask(own, derived)
+    assert is_own_padding_mask(derived, 2, total, 2)
+
+    # A truncated slice is a different mask: never tagged.
+    short = own[..., : total - 1]
+    carry_own_padding_mask(own, short)
+    assert not is_own_padding_mask(short, 2, total - 1, 2)
+
+    # A foreign source never lends its (absent) tag.
+    foreign = mx.array(own)
+    foreign_derived = foreign[..., :total]
+    carry_own_padding_mask(foreign, foreign_derived)
+    assert not is_own_padding_mask(foreign_derived, 2, total, 2)
+
+
+@pytest.mark.parametrize("new_len", [1, 3])
+def test_foreign_mask_with_own_mask_shape_is_honored(new_len):
+    # A foreign boolean mask with exactly the shape of the cache's own mask
+    # must not be mistaken for it: it attends the padding columns.
+    batch, rows, q, keys, values = _build([1200, 2400], new_len)
+    own = batch._test_mask
+    total = own.shape[-1]
+    causal = (
+        mx.arange(total)[None, :] <= (total - new_len + mx.arange(new_len))[:, None]
+    )
+    foreign = mx.broadcast_to(causal, own.shape)
+    assert not mx.array_equal(foreign, own).item()
+    out = _batched(batch, q, keys, values, mask=foreign)
+    dk, dv = batch.dequantize(keys, values)
+    ref = mx.fast.scaled_dot_product_attention(
+        q, dk.astype(q.dtype), dv.astype(q.dtype), scale=SCALE, mask=foreign
+    )
+    assert _max_abs(out, ref) < 2e-3

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import weakref
 from typing import List, Optional
 
 import mlx.core as mx
@@ -287,6 +288,60 @@ def _empty_state_batch_like(state, batch_size: int):
 
 
 # ---------------------------------------------------------------------------
+# Own padding-mask tag
+# ---------------------------------------------------------------------------
+# The batched attention replacement may only substitute per-row slices for a
+# mask when that mask IS the left-padding + causal mask the cache built.
+# Comparing arrays (``array_equal(...).item()``) is a GPU sync on every layer,
+# so ``make_mask`` tags the mask OBJECT it returns (a weak identity registry,
+# because mx.array takes no attributes) together with its structure (query
+# rows, physical column count before the append, batch size). A foreign array
+# with the same shape is a different object and is never mistaken for it.
+
+_OWN_PADDING_MASKS: dict = {}
+
+
+def mark_own_padding_mask(mask, n: int, phys: int, batch: int) -> None:
+    """Tag ``mask`` as the padding mask this cache built for ``n`` rows."""
+    if not isinstance(mask, mx.array):
+        return
+    key = id(mask)
+
+    def _forget(_ref, key=key):
+        _OWN_PADDING_MASKS.pop(key, None)
+
+    _OWN_PADDING_MASKS[key] = (weakref.ref(mask, _forget), (n, phys, batch))
+
+
+def carry_own_padding_mask(src, dst) -> None:
+    """Tag ``dst`` when it is a full-width re-slice of the own mask ``src``.
+
+    mlx-vlm's attention layer hands the model's mask on as ``mask[..., :kv]``,
+    a new object per layer whose values are unchanged while ``kv`` covers every
+    column. A truncated slice (fewer columns) is a different mask and is never
+    tagged.
+    """
+    if dst is src or not isinstance(dst, mx.array) or not isinstance(src, mx.array):
+        return
+    entry = _OWN_PADDING_MASKS.get(id(src))
+    if entry is None or entry[0]() is not src:
+        return
+    if dst.ndim != src.ndim or dst.shape != src.shape:
+        return
+    n, phys, batch = entry[1]
+    mark_own_padding_mask(dst, n, phys, batch)
+
+
+def is_own_padding_mask(mask, n: int, total: int, batch: int) -> bool:
+    """True iff ``mask`` is a padding mask built for ``n`` rows ending at ``total``."""
+    entry = _OWN_PADDING_MASKS.get(id(mask))
+    if entry is None:
+        return False
+    ref, signature = entry
+    return ref() is mask and signature == (n, total - n, batch)
+
+
+# ---------------------------------------------------------------------------
 # BatchTurboQuantKVCache — inherits TurboQuantKVCache
 # ---------------------------------------------------------------------------
 
@@ -403,9 +458,12 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # row departs, offset.max() undercounts and blinds the survivors to
         # their own tail context.
         phys = self._phys_end
-        return create_causal_mask(
+        mask = create_causal_mask(
             N, offset=phys, window_size=window_size, left_padding=self.left_padding
         )
+        if window_size is None:
+            mark_own_padding_mask(mask, N, phys, self.left_padding.shape[0])
+        return mask
 
     # prefill_attention and dequantize inherited from TurboQuantKVCache
 

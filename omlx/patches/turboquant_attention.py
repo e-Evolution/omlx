@@ -429,21 +429,19 @@ def _is_batch_padding_mask(real_cache, mask, queries, keys) -> bool:
     """True iff ``mask`` is exactly the left-padding + causal mask of the cache.
 
     The per-row path hard-codes that mask, so an arbitrary caller-supplied
-    boolean mask (anything but the cache's own) must keep the masked path.
+    boolean mask (anything but the cache's own, recognised by the tag
+    ``make_mask`` leaves on it) must keep the masked path.
     """
     left_padding = getattr(real_cache, "left_padding", None)
     if left_padding is None or int(left_padding.max().item()) <= 0:
         return False
-    from mlx_lm.models.cache import create_causal_mask
-
-    from ..turboquant_kv import _state_length
+    from ..turboquant_kv import _state_length, is_own_padding_mask
 
     L = queries.shape[-2]
     total = _state_length(real_cache._unwrap(keys))
     if mask.ndim != 4 or mask.shape[-2:] != (L, total):
         return False
-    expected = create_causal_mask(L, offset=total - L, left_padding=left_padding)
-    return bool(mx.array_equal(mask, expected).item())
+    return is_own_padding_mask(mask, L, total, queries.shape[0])
 
 
 def _per_row_batched_attention(real_cache, queries, keys, values, scale):
@@ -588,6 +586,32 @@ def _patch_update_eval_policy() -> None:
     cls._omlx_multirow_eval_patched = True
 
 
+def _wrap_prepare_projected_qkv(q35_lang) -> None:
+    """Keep the cache's own-mask tag across mlx-vlm's per-layer mask slice.
+
+    ``Qwen3_5Attention._prepare_projected_qkv`` returns ``mask[..., :kv]``: a
+    new array object on every layer, so the tag ``make_mask`` left on the
+    model's mask would never match at the attention call and every batched MTP
+    verify would miss the per-row path.
+    """
+    from ..turboquant_kv import carry_own_padding_mask
+
+    cls = getattr(q35_lang, "Qwen3_5Attention", None)
+    original = getattr(cls, "_prepare_projected_qkv", None)
+    if original is None or getattr(original, "_omlx_carries_own_mask", False):
+        return
+
+    def prepare(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        src = kwargs["mask"] if "mask" in kwargs else (args[-1] if args else None)
+        if isinstance(src, mx.array) and isinstance(result[4], mx.array):
+            carry_own_padding_mask(src, result[4])
+        return result
+
+    prepare._omlx_carries_own_mask = True
+    cls._prepare_projected_qkv = prepare
+
+
 def _patch_vlm_target_verify_attention() -> None:
     """Make mlx-vlm's qwen3_5 MTP verify attention TurboQuant-safe.
 
@@ -627,10 +651,20 @@ def _patch_vlm_target_verify_attention() -> None:
             return sdpa(
                 queries, keys, values, cache=cache, scale=scale, mask="causal"
             )
-        if queries.shape[0] > 1 and not isinstance(mask, mx.array):
-            # B>1 without an explicit mask (mlx-vlm's "left_padded_decode"
-            # hands mask=None): rows are left-padded, so each must attend only
-            # its own slice. Without padding the batched kernels are exact.
+        if (
+            queries.shape[0] > 1
+            and isinstance(real_cache, BatchTurboQuantKVCache)
+            and (
+                not isinstance(mask, mx.array)
+                or _is_batch_padding_mask(real_cache, mask, queries, keys)
+            )
+        ):
+            # B>1 on left-padded rows: either no explicit mask (mlx-vlm's
+            # "left_padded_decode" hands mask=None) or the cache's own padding
+            # + causal mask (MTP verify, possibly re-sliced per layer). Each
+            # row must attend only its own slice, at ANY query length; never
+            # the dequantize-once path below, whose softmax would include the
+            # zero padding columns of the whole batch.
             left_padding = getattr(real_cache, "left_padding", None)
             if left_padding is not None and int(left_padding.max().item()) > 0:
                 result = _per_row_batched_attention(
@@ -638,7 +672,7 @@ def _patch_vlm_target_verify_attention() -> None:
                 )
                 if result is not None:
                     return result
-            else:
+            elif not isinstance(mask, mx.array):
                 return sdpa(
                     queries, keys, values, cache=cache, scale=scale, mask="causal"
                 )
@@ -668,6 +702,7 @@ def _patch_vlm_target_verify_attention() -> None:
             axis=2,
         )
 
+    _wrap_prepare_projected_qkv(q35_lang)
     q35_lang._qwen3_5_left_padded_attention = patched
     q35_lang._omlx_tq_target_verify_original = original
     q35_lang._omlx_tq_target_verify_patched = True
@@ -737,16 +772,16 @@ def apply_turboquant_attention_patch() -> bool:
                 )
             if (
                 queries.shape[0] > 1
-                and queries.shape[-2] <= _DECODE_MULTIROW_MAX_Q_LEN
                 and isinstance(real_cache, BatchTurboQuantKVCache)
                 and isinstance(mask, mx.array)
                 and mask.dtype == mx.bool_
                 and _is_batch_padding_mask(real_cache, mask, queries, keys)
             ):
-                # Decode-shaped call on a left-padded batch with the cache's own
-                # padding+causal mask: equivalent to attending each row's
+                # Call on a left-padded batch with the cache's own padding+causal
+                # mask, at any query length: equivalent to attending each row's
                 # unpadded slice with a row-local causal tail, but through the
-                # fused single-row kernels instead of the masked chunk loop.
+                # fused single-row kernels (or the per-row dequantize of the
+                # unpadded slice) instead of the masked chunk loop.
                 result = _per_row_batched_attention(
                     real_cache, queries, keys, values, scale
                 )
