@@ -563,6 +563,85 @@ class TestBlockAwarePrefixCache:
         finally:
             ssd_manager.close()
 
+    @staticmethod
+    def _exact_kv(token_count: int, offset: float) -> list[dict]:
+        import mlx.core as mx
+
+        keys = mx.arange(token_count, dtype=mx.float32).reshape(1, 1, token_count, 1)
+        return [
+            {
+                "state": (keys + offset, keys + offset + 0.5),
+                "meta_state": (token_count,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            }
+        ]
+
+    def test_exact_prefix_domains_isolate_identical_token_sequences(self, tmp_path):
+        """Two requests with the same tokens never read each other's exact chain."""
+        import mlx.core as mx
+
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "exact-domains"
+        )
+        tokens = list(range(11))  # two full blocks plus a partial terminal
+        try:
+            for domain, offset in ((("req-a",), 0.0), (("req-b",), 100.0)):
+                stored = prefix_cache.store_exact_prefix(
+                    f"store-{domain[0]}",
+                    tokens,
+                    self._exact_kv(len(tokens), offset),
+                    domain_key=domain,
+                )
+                assert stored is not None and stored.num_tokens == len(tokens)
+
+            for domain, offset in ((("req-a",), 0.0), (("req-b",), 100.0)):
+                restored = prefix_cache.restore_exact_prefix(
+                    f"restore-{domain[0]}",
+                    tokens,
+                    promote_to_hot_cache=False,
+                    domain_key=domain,
+                )
+                assert restored is not None
+                keys, _ = restored[0].keys_and_values()
+                assert keys.shape[2] == len(tokens)
+                expected = self._exact_kv(len(tokens), offset)[0]["state"][0]
+                assert mx.array_equal(keys, expected).item()
+
+            # Another domain, or no domain at all, sees nothing.
+            for domain in (("req-c",), None):
+                assert (
+                    prefix_cache.restore_exact_prefix(
+                        "restore-other",
+                        tokens,
+                        promote_to_hot_cache=False,
+                        domain_key=domain,
+                    )
+                    is None
+                )
+            # Domain blocks never enter ordinary prefix matching.
+            table, remaining = prefix_cache.fetch_cache("ordinary", [*tokens, 30])
+            assert table is None and remaining == [*tokens, 30]
+        finally:
+            ssd_manager.close()
+
+    def test_exact_prefix_hashes_depend_on_the_domain(self, tmp_path):
+        prefix_cache, _, ssd_manager = self._make_ssd_prefix_cache(
+            tmp_path / "exact-domain-hashes"
+        )
+        tokens = list(range(9))
+        try:
+            plain = prefix_cache._exact_prefix_hashes(tokens)
+            first = prefix_cache._exact_prefix_hashes(tokens, domain_key=("a",))
+            second = prefix_cache._exact_prefix_hashes(tokens, domain_key=("b",))
+            assert len(plain) == len(first) == len(second) == 3
+            assert not {h for h, _ in plain} & {h for h, _ in first}
+            assert not {h for h, _ in first} & {h for h, _ in second}
+            # Deterministic for the same domain.
+            assert first == prefix_cache._exact_prefix_hashes(tokens, domain_key=("a",))
+        finally:
+            ssd_manager.close()
+
     def test_store_cache_creates_block_table(self, prefix_cache):
         """Test store_cache creates a block table."""
         tokens = [1, 2, 3, 4]  # One full block
