@@ -1281,6 +1281,30 @@ class _DecodeResume:
     stop_matcher: Any = None
 
 
+class _ResumedStopSequences:
+    """Stop sequences whose first matcher resumes at a saved position.
+
+    mlx-lm builds a fresh matcher for every row it starts. A resumed decode
+    row must continue a stop sequence that began before its pause instead,
+    so the first ``matcher()`` call hands out the stashed position; later
+    calls (a row restart) start fresh like the wrapped automaton.
+    """
+
+    def __init__(self, base: StopSequences, matcher: Any):
+        self.base = base
+        self._matcher = matcher
+
+    def matcher(self) -> Any:
+        matcher, self._matcher = self._matcher, None
+        return matcher if matcher is not None else self.base.matcher()
+
+
+def _unwrap_stop_sequences(stop_sequences: Any) -> Any:
+    if isinstance(stop_sequences, _ResumedStopSequences):
+        return stop_sequences.base
+    return stop_sequences
+
+
 def _prefill_commit_blocks(config: Any) -> int:
     """``prefill_progress_commit_blocks`` of a config, 0 when unset or invalid."""
     value = getattr(config, "prefill_progress_commit_blocks", 0)
@@ -11670,7 +11694,7 @@ class Scheduler:
             remaining_max_tokens=max_tokens - emitted,
             sampler=generation_batch.samplers[row],
             logits_processors=processors,
-            stop_sequences=generation_batch.stop_sequences[row],
+            stop_sequences=_unwrap_stop_sequences(generation_batch.stop_sequences[row]),
             stop_matcher=stop_matcher,
         )
         self._remove_decoding_row(rid, uid)
@@ -11755,6 +11779,10 @@ class Scheduler:
             )
             return
 
+        stop_sequences = record.stop_sequences
+        if record.stop_matcher is not None:
+            # Continue a stop sequence that began before the pause.
+            stop_sequences = _ResumedStopSequences(stop_sequences, record.stop_matcher)
         with mx.stream(self._stream):
             uids = self.batch_generator.insert(
                 [[record.kickoff]],
@@ -11763,7 +11791,7 @@ class Scheduler:
                 all_tokens=[list(record.tokens)],
                 samplers=[record.sampler],
                 logits_processors=[record.logits_processors],
-                stop_sequences=[record.stop_sequences],
+                stop_sequences=[stop_sequences],
             )
         uid = uids[0]
         _register_uid_rows(
