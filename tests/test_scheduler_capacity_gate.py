@@ -355,3 +355,210 @@ def test_a_request_that_never_fits_ends_with_the_structured_error(
         assert "big" not in scheduler.requests
     finally:
         rig.close()
+
+
+# --- Route and in-stream never-fits checks agree ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "engine_kind,method",
+    [
+        ("batched", "preflight_chat"),
+        ("batched", "preflight_completion"),
+        ("vlm", "preflight_chat"),
+        ("vlm", "preflight_completion"),
+    ],
+)
+async def test_route_preflight_prices_the_resolved_default_max_tokens(
+    engine_kind, method
+):
+    """An omitted max_tokens is not 0 output
+    tokens; the gate uses the default the request itself will run with."""
+    from test_engine_preflight import _build_engine_with_stub_scheduler
+
+    from omlx.engine.base import ENGINE_DEFAULT_MAX_TOKENS
+    from omlx.engine.batched import BatchedEngine
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    seen = []
+
+    class _Scheduler:
+        def preflight_eviction_request(self, **kw):
+            seen.append(("eviction", kw.get("max_tokens")))
+            return None
+
+        def preflight_or_raise(self, **kw):
+            seen.append(("check", kw.get("max_tokens")))
+
+    cls = BatchedEngine if engine_kind == "batched" else VLMBatchedEngine
+    engine = _build_engine_with_stub_scheduler(cls, _Scheduler())
+    engine._preprocess_messages = lambda m: m
+    if method == "preflight_chat":
+        await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+    else:
+        await engine.preflight_completion(prompt="x")
+    assert seen and all(value == ENGINE_DEFAULT_MAX_TOKENS for _, value in seen)
+
+    seen.clear()
+    if method == "preflight_chat":
+        await engine.preflight_chat(
+            messages=[{"role": "user", "content": "x"}], max_tokens=77
+        )
+    else:
+        await engine.preflight_completion(prompt="x", max_tokens=77)
+    assert seen and all(value == 77 for _, value in seen)
+
+
+def test_engine_default_max_tokens_matches_the_generate_default():
+    import inspect
+
+    from omlx.engine.base import ENGINE_DEFAULT_MAX_TOKENS
+    from omlx.engine.batched import BatchedEngine
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    for cls in (BatchedEngine, VLMBatchedEngine):
+        for name in ("generate", "stream_generate", "chat", "stream_chat"):
+            default = inspect.signature(getattr(cls, name)).parameters["max_tokens"]
+            assert default.default == ENGINE_DEFAULT_MAX_TOKENS
+
+
+async def test_completion_route_preflights_with_the_resolved_max_tokens(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import omlx.server as server
+    from omlx.api.openai_models import CompletionRequest
+
+    class _StopError(Exception):
+        pass
+
+    seen = {}
+
+    async def preflight_completion(prompt, request_id=None, **kwargs):
+        seen.update(kwargs)
+        raise _StopError()
+
+    engine = MagicMock()
+    engine.tokenizer.encode = lambda text: [1, 2, 3]
+    engine.preflight_completion = preflight_completion
+
+    async def get_engine(model, lease=None):
+        return engine
+
+    monkeypatch.setattr(server, "get_engine_for_model", get_engine)
+    monkeypatch.setattr(server, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_serving_model_id", lambda lease, model: model)
+    monkeypatch.setattr(server._server_state, "oq_manager", None)
+    monkeypatch.setattr(server._server_state, "settings_manager", None)
+    monkeypatch.setattr(server._server_state.sampling, "max_tokens", 777)
+    expected = server.get_sampling_params(None, None, "m")[7]
+    assert expected == 777
+    request = CompletionRequest(model="m", prompt="hi")
+    with pytest.raises(_StopError):
+        await server.create_completion(request, SimpleNamespace(headers={}))
+    assert seen.get("max_tokens") == expected
+
+    seen.clear()
+    request = CompletionRequest(model="m", prompt="hi", max_tokens=33)
+    with pytest.raises(_StopError):
+        await server.create_completion(request, SimpleNamespace(headers={}))
+    assert seen.get("max_tokens") == 33
+
+
+def test_route_preflight_with_only_queued_work_keeps_the_rejection(gated):
+    """Queued requests hold no memory, so with
+    nothing admitted waiting cannot help; both checks share one predicate."""
+    scheduler, usage, admitted = gated
+    usage[0] = 99 * GB
+    admitted[0] = 0
+    scheduler.waiting.append(_make_request(10))
+    with pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+    admitted[0] = 1
+    scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+
+
+def test_route_and_in_stream_fits_later_share_one_predicate(gated):
+    scheduler, _usage, admitted = gated
+    capacity = scheduler._capacity_estimate(context_tokens=10, max_tokens=0)
+    scheduler.waiting.append(_make_request(10))
+    admitted[0] = 0
+    assert scheduler._fits_later(capacity) is False
+    admitted[0] = 2
+    assert scheduler._fits_later(capacity) is True
+    assert scheduler._fits_later(None) is False
+
+
+def test_weights_fallback_is_not_cached_and_gives_no_estimate(gated):
+    """Unknown weights mean no estimate (never
+    a never-fits rejection) and are recomputed on the next call."""
+    scheduler, _usage, _admitted = gated
+    scheduler._weights_bytes = None
+    scheduler.memory_monitor._baseline_memory = 64 * GB
+    assert scheduler._model_weights_bytes() == 0
+    assert scheduler._weights_bytes is None
+    assert scheduler._capacity_estimate(context_tokens=10, max_tokens=0) is None
+    huge = 10_000_000
+    scheduler._memory_hard_limit_bytes = 100 * GB
+    try:
+        scheduler.preflight_or_raise(num_prompt_tokens=huge, max_tokens=0)
+    except ContextExceedsCapacityError:  # pragma: no cover - the defect
+        pytest.fail("unknown weights must not reject as never-fits")
+    except PrefillMemoryExceededError:
+        pass  # the older current-usage rejection may still apply
+
+
+def test_a_deferred_request_releases_its_prefix_restore_and_readmits(
+    tmp_path, mock_tokenizer, monkeypatch
+):
+    """A fits-later request holds no paged-cache refs
+    or restored prefix while it waits, and its re-admission works."""
+    rig, usage = _guarded_rig(
+        tmp_path, mock_tokenizer, monkeypatch, weights_gb=20, free_gb=50
+    )
+    try:
+        scheduler = rig.scheduler
+        # Warm the prefix so the deferred request restores cached blocks.
+        first = submit(rig, "warm", PROMPT_C, arrival=0.5, max_tokens=1)
+        step_until(rig, lambda: first.is_finished())
+        for future in list(scheduler._inflight_store_futures.values()):
+            future.result(timeout=30)
+        rig.drain()
+
+        scheduler._prefill_memory_guard = True
+        admitted = [1]
+        monkeypatch.setattr(scheduler, "_num_admitted_requests", lambda: admitted[0])
+        usage[0] = scheduler._admission_limit_bytes()
+        restores = []
+        real_prepare = scheduler._prepare_prefix_cache_for_request
+
+        def prepare(request):
+            real_prepare(request)
+            restores.append(request.cached_tokens)
+
+        monkeypatch.setattr(scheduler, "_prepare_prefix_cache_for_request", prepare)
+        # Longer than the warm prompt: a prefix hit plus a suffix to prefill.
+        # No idle model to evict: the request defers (an eviction pause keeps
+        # the restore on purpose, #2180, and is not what this checks).
+        monkeypatch.setattr(
+            scheduler, "_raise_prefill_eviction_if_available", lambda **_kw: None
+        )
+        later = submit(rig, "later", PROMPT_C + PROMPT_A[:12], arrival=1.0)
+        outputs = step(rig, 2)
+        assert not [o for o in outputs if o.error]
+        assert waiting_ids(rig) == ["later"]
+        assert restores and restores[0] > 0  # it did restore a prefix
+        # ...and gave it back while it waits.
+        assert later.prompt_cache is None
+        assert later.block_table is None
+        assert later.cached_tokens == 0
+        assert rig.paged.get_block_table("later") is None
+        assert "later" not in scheduler._prefix_cache_prepared
+
+        admitted[0] = 0
+        usage[0] = scheduler._admission_limit_bytes() - 50 * GB
+        step_until(rig, lambda: later.is_finished())
+        assert later.finish_reason != "error"
+        assert restores[-1] > 0, restores  # the re-admission restored it again
+    finally:
+        rig.close()

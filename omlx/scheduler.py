@@ -13879,7 +13879,7 @@ class Scheduler:
             )
         # Fits alone: while rows are admitted, their memory comes back when
         # they finish, so the request waits at the head instead of failing.
-        fits_later = capacity is not None and self._num_admitted_requests() > 0
+        fits_later = self._fits_later(capacity)
 
         # A request resumed after an eviction pause keeps its prompt cache.
         # Capacity reserved there already holds part of the KV priced below.
@@ -14092,8 +14092,11 @@ class Scheduler:
     def _model_weights_bytes(self) -> int:
         """Resident bytes of this model's weights; 0 when unknown.
 
-        Summed once from the model's parameter arrays (shape metadata only,
-        nothing is evaluated); a measured monitor baseline is the fallback.
+        Summed from the model's parameter arrays (shape metadata only,
+        nothing is evaluated) and cached once known. Unknown stays 0 and is
+        recomputed on the next call: the gate then has no estimate and never
+        rejects as never-fits. The monitor's process baseline is not a
+        weights size and is not used.
         """
         cached = self._weights_bytes
         if cached is not None:
@@ -14107,13 +14110,38 @@ class Scheduler:
             )
         except Exception:  # noqa: BLE001 - unknown model shape: no estimate
             total = 0
-        if total <= 0 and self.memory_monitor is not None:
-            baseline = getattr(self.memory_monitor, "_baseline_memory", 0)
-            if isinstance(baseline, int) and not isinstance(baseline, bool):
-                total = baseline
         if total > 0:
             self._weights_bytes = total
-        return total
+        return max(0, total)
+
+    def _fits_later(self, capacity: "_CapacityEstimate | None") -> bool:
+        """A request that fits alone waits instead of failing only while
+        admitted rows hold memory that comes back when they finish. Queued
+        requests hold none, so they never justify waiting."""
+        return capacity is not None and self._num_admitted_requests() > 0
+
+    def _release_deferred_admission(self, request: "Request") -> None:
+        """Undo this admission attempt for a request that waits (fits later).
+
+        Releases the paged-cache refs and the restored prefix the prefix
+        lookup took, so the request holds no memory while it waits. The next
+        attempt repeats the lookup (and any SpecPrefill scoring).
+        """
+        rid = request.request_id
+        self._release_paged_cache_for_request(rid)
+        # fetch_cache builds the lookup's block table without registering it
+        # with the prefix cache, so release_cache above leaves it. Release its
+        # refs for eviction: the blocks stay findable for the re-admission.
+        manager = self.paged_cache_manager
+        if manager is not None and hasattr(manager, "release_block_table"):
+            self._after_commit(rid, lambda: manager.release_block_table(rid))
+        request.prompt_cache = None
+        request.block_table = None
+        request.cached_tokens = 0
+        request.shared_prefix_blocks = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.specprefill_indices = None
+        self._prefix_cache_prepared.discard(rid)
 
     def _capacity_limit_bytes(self) -> int:
         """The line a request must fit under alone: the tighter of the
@@ -14321,8 +14349,8 @@ class Scheduler:
         A request that cannot fit even alone (weights + KV of prompt plus
         ``max_tokens`` + transient over the capacity line) raises
         ``ContextExceedsCapacityError`` whatever the current usage. One that
-        fits alone but not now passes while other work is admitted or
-        queued: it waits for that work to finish instead of being rejected.
+        fits alone but not now passes while other work is admitted: it waits
+        for that work to finish instead of being rejected.
         """
         if not self._prefill_memory_guard:
             return
@@ -14365,11 +14393,9 @@ class Scheduler:
         if est is None:
             return
 
-        # Fits alone (checked above) and something running or queued will
-        # free memory: wait instead of rejecting.
-        fits_later = capacity is not None and (
-            self._num_admitted_requests() > 0 or len(self.waiting) > 0
-        )
+        # Fits alone (checked above) and admitted rows will free memory:
+        # wait instead of rejecting (the same rule as the in-stream check).
+        fits_later = self._fits_later(capacity)
         hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
@@ -14876,7 +14902,9 @@ class Scheduler:
                 break
             except _PreflightDeferredError:
                 # Fits alone but not now: it keeps its place at the head and
-                # nothing behind it overtakes it while the admitted rows run.
+                # nothing behind it overtakes it while the admitted rows run,
+                # holding no paged-cache refs or restored prefix meanwhile.
+                self._release_deferred_admission(request)
                 self.waiting.appendleft(request)
                 break
             if preflight_rejection is not None:

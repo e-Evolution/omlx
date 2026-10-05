@@ -4262,9 +4262,21 @@ async def create_completion(
         # log line and the FastAPI handler trace correlate with whatever
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
+        # The never-fits gate prices the output budget the generation will
+        # actually use (request, model setting or server default).
+        preflight_max_tokens = get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_max_tokens=request.max_tokens,
+        )[7]
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            await engine.preflight_completion(
+                prompt,
+                request_id=upstream_request_id,
+                max_tokens=preflight_max_tokens,
+            )
         await _raise_if_llm_lease_abort_requested(lease)
         inference_request_id = _request_abort_id(engine)
 
