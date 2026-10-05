@@ -191,6 +191,12 @@ class Request:
     vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = (
         None  # [(token_start, cumulative_image_hash)]
     )
+    # Token index just after the last image/video/audio placeholder, or None
+    # when unknown. A media request whose cached prefix reaches it prefills
+    # only text and can take the chunked text path.
+    vlm_media_end: int | None = None
+    # Set at admission when that text-suffix route was taken (parkable).
+    media_text_suffix: bool = False
     rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
     @property

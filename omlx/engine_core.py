@@ -672,6 +672,7 @@ class EngineCore:
         vlm_image_hash: Optional[str] = None,
         vlm_cache_key_start: int = 0,
         vlm_cache_key_ranges: Optional[List[Tuple[int, str]]] = None,
+        vlm_media_end: int | None = None,
         specprefill: Optional[bool] = None,
         specprefill_keep_pct: Optional[float] = None,
         specprefill_threshold: Optional[int] = None,
@@ -696,6 +697,8 @@ class EngineCore:
             vlm_inputs_embeds: Pre-computed vision+text embeddings for VLM
             vlm_extra_kwargs: Model-specific VLM kwargs (e.g., position_ids)
             vlm_image_hash: SHA256 hash of images for prefix cache
+            vlm_media_end: Token index after the last media placeholder
+                (None when unknown)
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
@@ -721,6 +724,7 @@ class EngineCore:
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            vlm_media_end=vlm_media_end,
             skip_cache_store=skip_cache_store,
             preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,

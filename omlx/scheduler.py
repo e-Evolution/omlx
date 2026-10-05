@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import queue
 import threading
 import time
@@ -1621,6 +1622,56 @@ def _materialize_cache_storage(cache_list: list[Any]) -> None:
     if arrays:
         with _mx_buffer_access_lock:
             mx.eval(*arrays)
+
+
+def _media_text_suffix_chunked_enabled() -> bool:
+    """Switch: ``OMLX_MEDIA_TEXT_SUFFIX_CHUNKED`` (default off).
+
+    On, a media request whose last media token is inside the cached prefix
+    prefills its text suffix through the chunked text path (decode fairness,
+    parkable). The fork's packaged app turns it on.
+    """
+    raw = os.getenv("OMLX_MEDIA_TEXT_SUFFIX_CHUNKED", "")
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def _captured_rope_delta(request: Any) -> float | None:
+    """The per-request mRoPE delta captured at embedding time, or None."""
+    extra = getattr(request, "vlm_extra_kwargs", None) or {}
+    captured = extra.get("_captured_rope_deltas")
+    if captured is None:
+        return None
+    if isinstance(captured, mx.array):
+        return float(captured.reshape(-1)[0].item())
+    if hasattr(captured, "item"):
+        return float(captured.item())
+    return float(captured)
+
+
+def _media_suffix_positions_are_text(
+    position_ids: Any, cached: int, total: int, delta: float
+) -> bool:
+    """True when every uncached position is a text position ``k + delta``.
+
+    That is what the chunked text path computes from the cache offset and the
+    bound delta; an image, video or audio token in the suffix has grid
+    positions that differ across the mRoPE planes and fails the check.
+    """
+    if not isinstance(position_ids, mx.array) or delta != int(delta):
+        return False
+    if position_ids.ndim == 3 and position_ids.shape[1] == 1:
+        rows = position_ids[:, 0, :]
+    elif position_ids.ndim == 2 and position_ids.shape[0] == 1:
+        rows = position_ids
+    else:
+        return False
+    if rows.shape[-1] != total or not 0 < cached < total:
+        return False
+    expected = mx.arange(cached + int(delta), total + int(delta))
+    suffix = rows[:, cached:]
+    return bool(
+        mx.array_equal(suffix, mx.broadcast_to(expected, suffix.shape)).item()
+    )
 
 
 def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> None:
@@ -4498,7 +4549,11 @@ class Scheduler:
                         self.model,
                         getattr(request, "rope_deltas", 0.0),
                     )
-                    request.text_positions_proven = True
+                    # A media text suffix runs here with its non-zero delta;
+                    # only canonical positions keep the decode proof.
+                    request.text_positions_proven = (
+                        getattr(request, "rope_deltas", 0.0) == 0.0
+                    )
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
                     if extra_kwargs:
@@ -6617,7 +6672,8 @@ class Scheduler:
         # if even prefill_min_chunk_tokens would exceed the cap; #1405
         # cleanup paths in _schedule_waiting / _advance_chunked_prefills
         # convert that into a finish_reason="error" output for the client.
-        # Chunked prefill is text-only (VLM never builds _PrefillState).
+        # Media requests reach it only on the text-suffix route; they are
+        # priced like the admission estimate (not text-only).
         qwen4_accounting = Scheduler._qwen4_prefill_accounting_enabled(self)
         cache_tokens = state.base_size + state.tokens_processed
 
@@ -6818,7 +6874,9 @@ class Scheduler:
             self.model,
             getattr(state.request, "rope_deltas", 0.0),
         )
-        state.request.text_positions_proven = True
+        state.request.text_positions_proven = (
+            getattr(state.request, "rope_deltas", 0.0) == 0.0
+        )
         prefill_model = getattr(self.model, "_omlx_prefill", self.model)
         chunk_kwargs = {}
         if self._supports_skip_lm_head():
@@ -6841,7 +6899,11 @@ class Scheduler:
             state = plan.state
             chunk = state.tokens_remaining[:, : plan.tokens]
             state.tokens_remaining = state.tokens_remaining[:, plan.tokens :]
-            state.request.text_positions_proven = True
+            # A media text suffix keeps its non-zero delta; only canonical
+            # positions keep the decode proof (as in _forward_prefill_chunk).
+            state.request.text_positions_proven = (
+                getattr(state.request, "rope_deltas", 0.0) == 0.0
+            )
             rows.append(
                 PackedRow(
                     request_id=state.request.request_id,
@@ -12185,6 +12247,72 @@ class Scheduler:
         stats["pinned_requests"] = len(self._park_pins)
         return stats
 
+    def _capture_request_rope_deltas(self, request: Request) -> None:
+        """Capture a media request's mRoPE delta for its text positions.
+
+        Prefers ``_captured_rope_deltas`` from the request's extra kwargs (set
+        during get_input_embeddings): the model-global ``_rope_deltas`` may be
+        stale when explicit position_ids are used.
+        """
+        captured = _captured_rope_delta(request)
+        if captured is not None:
+            request.rope_deltas = captured
+        elif hasattr(self.model, "get_last_rope_deltas"):
+            request.rope_deltas = self.model.get_last_rope_deltas()
+
+    def _media_text_suffix_route(
+        self, request: Request, tokens_to_process: list[int]
+    ) -> bool:
+        """Whether a media request may prefill its uncached suffix as text.
+
+        Requires the switch, a known media end inside the cached prefix, a
+        captured mRoPE delta, no atomic media prefix, no SpecPrefill, more
+        than one token left, and the data proof that every suffix position
+        is the text position ``k + delta`` the chunked path will compute.
+        Anything else keeps the external media path.
+        """
+        if not _media_text_suffix_chunked_enabled():
+            return False
+        media_end = getattr(request, "vlm_media_end", None)
+        cached = int(request.cached_tokens or 0)
+        if not isinstance(media_end, int) or media_end <= 0 or cached < media_end:
+            return False
+        if request.specprefill_indices is not None or len(tokens_to_process) <= 1:
+            return False
+        total = int(request.num_prompt_tokens)
+        if cached + len(tokens_to_process) != total:
+            return False
+        delta = _captured_rope_delta(request)
+        if delta is None:
+            return False
+        prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
+        if callable(prefix_hook):
+            minimum_prefix = prefix_hook(tokens_to_process)
+            if isinstance(minimum_prefix, int) and minimum_prefix > 0:
+                return False
+        extra = request.vlm_extra_kwargs or {}
+        with mx.stream(self._stream):
+            proven = _media_suffix_positions_are_text(
+                extra.get("position_ids"), cached, total, delta
+            )
+        if not proven:
+            logger.info(
+                "Media text-suffix route declined for %s: the uncached "
+                "positions are not text positions (external media prefill)",
+                request.request_id,
+            )
+            return False
+        logger.debug(
+            "Media text-suffix route for %s: %d cached (media end %d), %d "
+            "text tokens chunked, rope delta %d",
+            request.request_id,
+            cached,
+            media_end,
+            len(tokens_to_process),
+            int(delta),
+        )
+        return True
+
     def _park_exclusion_reason(self, request: Request) -> str | None:
         """Why ``request`` cannot be parked now, or None when it can.
 
@@ -12193,7 +12321,8 @@ class Scheduler:
         to completion inside one ``_schedule_waiting`` call and are never
         between steps; media embeddings and SpecPrefill patch model-wide state,
         so they are excluded as well. A text prompt on a VLM engine takes the
-        chunked loop like any other model and is parkable. A decoding row
+        chunked loop like any other model and is parkable, and so does a media
+        prompt on the text-suffix route (its media are all cached). A decoding row
         qualifies for a decode pause unless ``_decode_pause_exclusion_reason``
         names why not.
         """
@@ -12204,7 +12333,10 @@ class Scheduler:
             return self._decode_pause_exclusion_reason(request)
         if request.specprefill_indices is not None:
             return "SpecPrefill sparse prefill patches model-wide state"
-        if request.vlm_inputs_embeds is not None:
+        if (
+            request.vlm_inputs_embeds is not None
+            and getattr(request, "media_text_suffix", False) is not True
+        ):
             return (
                 "multimodal prompt (fused media embeddings) prefills in the "
                 "external loop, not between steps"
@@ -14879,12 +15011,23 @@ class Scheduler:
             # SpecPrefill already handled its own prefill above, so skip for those.
             if request.specprefill_indices is None and len(tokens_to_process) > 1:
                 vlm_embeds = None
+                request.media_text_suffix = False
                 if request.vlm_inputs_embeds is not None:
-                    vlm_embeds = (
-                        request.vlm_inputs_embeds,
-                        request.vlm_extra_kwargs or {},
-                        request.cached_tokens,
-                    )
+                    # Re-proven by the route below (or never, externally).
+                    request.text_positions_proven = False
+                    if self._media_text_suffix_route(request, tokens_to_process):
+                        # Every media token is cached: the suffix is plain
+                        # text at offset + delta. Bind the delta before the
+                        # first chunk; the embeddings stay on the request for
+                        # an OOM requeue or a park re-admit.
+                        request.media_text_suffix = True
+                        self._capture_request_rope_deltas(request)
+                    else:
+                        vlm_embeds = (
+                            request.vlm_inputs_embeds,
+                            request.vlm_extra_kwargs or {},
+                            request.cached_tokens,
+                        )
 
                 # Chunked prefill: non-VLM prompts longer than one step are
                 # spread across multiple step() calls. The first chunk is run
@@ -15094,24 +15237,8 @@ class Scheduler:
                 cache_to_use = prefilled_cache
                 tokens_to_process = last_token
 
-            # Capture per-request mRoPE rope_deltas for decode.
-            # Prefer _captured_rope_deltas from per-request extra_kwargs
-            # (set during get_input_embeddings), since the global
-            # _rope_deltas may be stale when explicit position_ids are used.
             if request.vlm_inputs_embeds is not None:
-                extra = request.vlm_extra_kwargs or {}
-                captured = extra.get("_captured_rope_deltas")
-                if captured is not None:
-                    if isinstance(captured, mx.array):
-                        request.rope_deltas = float(
-                            captured.reshape(-1)[0].item()
-                        )
-                    elif hasattr(captured, "item"):
-                        request.rope_deltas = float(captured.item())
-                    else:
-                        request.rope_deltas = float(captured)
-                elif hasattr(self.model, "get_last_rope_deltas"):
-                    request.rope_deltas = self.model.get_last_rope_deltas()
+                self._capture_request_rope_deltas(request)
 
             # Build per-request state machine for stop tokens
             sm = self._build_state_machine(request)
