@@ -33,6 +33,7 @@ import logging
 import subprocess
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -379,6 +380,16 @@ def preview_tier_ceilings() -> dict[str, dict[str, Any]]:
     return previews
 
 
+@dataclass
+class _DrainingVictim:
+    """The single victim whose memory the enforcer waits on before another."""
+
+    model_id: str
+    victim: Any  # MemoryVictim
+    polls: int = 0  # polls since its abort was requested
+    executed: bool = False  # its abort was seen to have run
+
+
 class ProcessMemoryEnforcer:
     """
     Background task that enforces process-level memory limits.
@@ -475,6 +486,10 @@ class ProcessMemoryEnforcer:
         # Consecutive hard-pressure polls whose abort was deferred in favor of
         # parking a prefill victim. See _request_scheduler_park.
         self._park_deferred_polls: int = 0
+        # The single victim aborted on the hard path whose memory has not
+        # settled yet; no other victim is chosen meanwhile. See
+        # _abort_single_victim.
+        self._draining_victim: _DrainingVictim | None = None
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1282,6 +1297,10 @@ class ProcessMemoryEnforcer:
     # scheduler reports a prefill victim to park (or one just parked). Bounds
     # the deferral if the scheduler never gets to act on the request.
     _PARK_DEFER_POLLS_MAX = 30
+    # Max polls the next single victim waits for the previous one's abort to
+    # run and its memory to settle. A prefill chunk can hold the scheduler
+    # step for ~5 one-second polls, so this covers two chunk boundaries.
+    _SINGLE_VICTIM_SETTLE_MAX_POLLS = 10
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1600,19 +1619,47 @@ class ProcessMemoryEnforcer:
     async def _abort_single_victim(self, engine: Any, model_id: str) -> Any:
         """Abort the one request freeing the most memory; None means fall back.
 
-        Returns None when the switch is off, the engine has no such hook, or
-        no live request can be chosen, so the caller aborts everything as
-        before. At most one victim per call, so the next poll re-measures
-        before another request is sacrificed.
+        Returns None when the switch is off, the engine has no such hook, the
+        hook fails, no live request can be chosen, or the chosen one could
+        not be aborted (``skipped``), so the caller aborts everything as
+        before for this poll. The abort itself is deferred to the scheduler
+        step, so while the previous victim's abort is pending or its memory
+        has not settled (abort seen to have run, then one more poll) the
+        same victim is returned and nobody else is sacrificed, for at most
+        ``_SINGLE_VICTIM_SETTLE_MAX_POLLS`` polls. Emergency pressure never
+        reaches this path: it aborts everything.
         """
         if not self._abort_single_victim_enabled():
             return None
         abort_one = getattr(engine, "abort_one_request_for_memory", None)
         if not callable(abort_one):
             return None
-        victim = await abort_one(spare_parked=True)
+        draining = self._still_draining_victim(engine, model_id)
+        if draining is not None:
+            return draining
+        try:
+            victim = await abort_one(spare_parked=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Single-victim abort failed on '%s': %s; falling back to "
+                "aborting all requests",
+                model_id,
+                exc,
+            )
+            return None
         if victim is None:
             return None
+        skipped = getattr(victim, "skipped", None)
+        if skipped:
+            logger.warning(
+                "Single-victim abort skipped %s on '%s' (%s); falling back to "
+                "aborting all requests",
+                victim.request_id,
+                model_id,
+                skipped,
+            )
+            return None
+        self._draining_victim = _DrainingVictim(model_id, victim)
         logger.warning(
             "Hard memory pressure: aborted 1 victim %s (%d tokens, ~%.1f GB) "
             "on '%s'; %d request(s) kept",
@@ -1623,6 +1670,57 @@ class ProcessMemoryEnforcer:
             victim.kept,
         )
         return victim
+
+    def _still_draining_victim(self, engine: Any, model_id: str) -> Any:
+        """The previous single victim while its memory settles, else None."""
+        draining = self._draining_victim
+        if draining is None:
+            return None
+        draining.polls += 1
+        rid = draining.victim.request_id
+        if draining.model_id != model_id:
+            self._draining_victim = None
+            return None
+        if draining.polls > self._SINGLE_VICTIM_SETTLE_MAX_POLLS:
+            logger.warning(
+                "Hard memory pressure: victim %s memory did not drain within %d "
+                "polls on '%s'; choosing another victim",
+                rid,
+                self._SINGLE_VICTIM_SETTLE_MAX_POLLS,
+                model_id,
+            )
+            self._draining_victim = None
+            return None
+        if draining.executed:
+            # Its abort ran and a further poll was observed: settled.
+            self._draining_victim = None
+            return None
+        draining.executed = not self._victim_abort_pending(engine, rid)
+        logger.info(
+            "Hard memory pressure: waiting for victim %s memory to drain on "
+            "'%s' (poll %d/%d, abort %s)",
+            rid,
+            model_id,
+            draining.polls,
+            self._SINGLE_VICTIM_SETTLE_MAX_POLLS,
+            "ran" if draining.executed else "pending",
+        )
+        return draining.victim
+
+    @staticmethod
+    def _victim_abort_pending(engine: Any, request_id: str) -> bool:
+        """Whether the engine still holds the victim (abort not run yet).
+
+        An engine without the probe, or a failing probe, counts as run: the
+        settle poll that follows still lets its memory return.
+        """
+        probe = getattr(engine, "memory_victim_pending", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(request_id) is True
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _abort_loaded_requests_for_memory_emergency(self) -> int:
         """Abort active requests on loaded models without unloading them."""
@@ -1825,6 +1923,8 @@ class ProcessMemoryEnforcer:
         self._note_pressure_poll(new_level)
         if new_level != "hard":
             self._park_deferred_polls = 0
+            # The episode ended: a later one starts without a draining victim.
+            self._draining_victim = None
 
         if new_level == "ok":
             # The pressure episode ended (drain worked or the load finished):
@@ -1995,10 +2095,6 @@ class ProcessMemoryEnforcer:
                             and entry.engine is not None
                             and hasattr(entry.engine, "abort_all_requests")
                         ):
-                            # Only the non-emergency path keeps the model
-                            # loaded and lets parked requests resume; an
-                            # emergency unload must abort them, or they keep
-                            # the engine non-idle and the unload never drains.
                             # Deliberate safety brake: only the non-emergency
                             # hard path narrows to one victim. The emergency
                             # path (beyond the ceiling) and model unload keep
@@ -2013,6 +2109,10 @@ class ProcessMemoryEnforcer:
                             )
                             if single is not None:
                                 break
+                            # Only the non-emergency path keeps the model
+                            # loaded and lets parked requests resume; an
+                            # emergency unload must abort them, or they keep
+                            # the engine non-idle and the unload never drains.
                             aborted = await self._abort_all_requests(
                                 entry.engine, spare_parked=not emergency
                             )

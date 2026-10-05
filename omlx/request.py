@@ -103,6 +103,9 @@ class MemoryVictim:
     tokens: int  # live KV tokens (prompt + generated, or prefilled so far)
     est_bytes: int  # estimated KV bytes freed (0 when no estimator is wired)
     kept: int  # live requests left running
+    # Why the chosen request was NOT aborted ("no_client", "already_finished"),
+    # None when it was. "No victim at all" is reported as None instead.
+    skipped: str | None = None
 
 
 @dataclass

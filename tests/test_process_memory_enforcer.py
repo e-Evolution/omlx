@@ -3634,6 +3634,8 @@ class TestSingleVictimFallback:
             ]
             + [None]
         )
+        # Each victim's deferred abort has already run by the next poll.
+        engine.memory_victim_pending = MagicMock(return_value=False)
         return engine
 
     @staticmethod
@@ -3670,7 +3672,7 @@ class TestSingleVictimFallback:
         assert "'big-model'" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_persisting_pressure_aborts_one_more_victim_per_poll(
+    async def test_persisting_pressure_aborts_the_next_victim_once_the_first_drained(
         self, enforcer, monkeypatch
     ):
         enforcer._single_victim_on = True
@@ -3680,9 +3682,123 @@ class TestSingleVictimFallback:
         await self._tick(enforcer, 97)
         assert engine.abort_one_request_for_memory.await_count == 1
 
+        # The abort ran; this poll lets its memory return to the OS.
+        await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 1
+
         await self._tick(enforcer, 97)
         assert engine.abort_one_request_for_memory.await_count == 2
         engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_second_victim_while_the_first_abort_is_pending(
+        self, enforcer, monkeypatch, caplog
+    ):
+        enforcer._single_victim_on = True
+        engine = self._engine([("first", 2), ("second", 1)])
+        engine.memory_victim_pending = MagicMock(side_effect=[True, True, False])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+        with caplog.at_level("INFO"):
+            for _ in range(3):  # pending, pending, then ran (settling)
+                await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 1
+        engine.abort_all_requests.assert_not_awaited()
+        assert "waiting for victim first memory to drain" in caplog.text
+        engine.memory_victim_pending.assert_called_with("first")
+
+        await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 2
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_victim_that_never_drains_is_waited_on_for_bounded_polls(
+        self, enforcer, monkeypatch, caplog
+    ):
+        enforcer._single_victim_on = True
+        engine = self._engine([("first", 2), ("second", 1)])
+        engine.memory_victim_pending = MagicMock(return_value=True)
+        self._busy(enforcer, engine)
+        bound = enforcer._SINGLE_VICTIM_SETTLE_MAX_POLLS
+
+        await self._tick(enforcer, 97)
+        for _ in range(bound):
+            await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 1
+
+        with caplog.at_level("WARNING"):
+            await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 2
+        assert "did not drain" in caplog.text
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emergency_while_a_victim_drains_aborts_everything(
+        self, enforcer, monkeypatch
+    ):
+        enforcer._single_victim_on = True
+        engine = self._engine([("first", 2)])
+        engine.memory_victim_pending = MagicMock(return_value=True)
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+        await self._tick(enforcer, 103)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=False)
+        assert engine.abort_one_request_for_memory.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_relief_below_hard_forgets_the_draining_victim(
+        self, enforcer, monkeypatch
+    ):
+        enforcer._single_victim_on = True
+        engine = self._engine([("first", 2), ("second", 1)])
+        engine.memory_victim_pending = MagicMock(return_value=True)
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+        await self._tick(enforcer, 90)  # soft: the episode is over
+        await self._tick(enforcer, 97)
+
+        assert engine.abort_one_request_for_memory.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failing_hook_falls_back_to_abort_all_for_that_poll(
+        self, enforcer, monkeypatch, caplog
+    ):
+        enforcer._single_victim_on = True
+        engine = self._engine([])
+        engine.abort_one_request_for_memory = AsyncMock(
+            side_effect=RuntimeError("scheduler gone")
+        )
+        self._busy(enforcer, engine)
+
+        with caplog.at_level("WARNING"):
+            await self._tick(enforcer, 97)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=True)
+        assert "scheduler gone" in caplog.text
+        assert "falling back to aborting all requests" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_victim_falls_back_to_abort_all(
+        self, enforcer, monkeypatch, caplog
+    ):
+        from omlx.request import MemoryVictim
+
+        enforcer._single_victim_on = True
+        engine = self._engine([])
+        engine.abort_one_request_for_memory = AsyncMock(
+            return_value=MemoryVictim("ghost", 10, 0, 1, skipped="no_client")
+        )
+        self._busy(enforcer, engine)
+
+        with caplog.at_level("WARNING"):
+            await self._tick(enforcer, 97)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=True)
+        assert "ghost" in caplog.text and "no_client" in caplog.text
 
     @pytest.mark.asyncio
     async def test_recovered_pressure_aborts_no_second_victim(

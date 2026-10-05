@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     AsyncIterator,
@@ -890,7 +890,11 @@ class EngineCore:
         The victim is chosen by the scheduler (largest live KV, newest arrival
         on ties) and receives the same error frame ``abort_all_requests``
         sends under memory pressure; every other request keeps running.
-        Returns the victim, or None when nothing live can be aborted.
+        Returns the aborted victim, None when nothing live can be chosen, or
+        the chosen victim with ``skipped`` set ("no_client": no consumer is
+        attached; "already_finished": its client was already finished) when
+        it was not aborted. The abort itself runs at the next scheduler step;
+        ``memory_victim_pending`` tells when it has.
         """
         sched = self.scheduler
         select = getattr(sched, "select_memory_victim", None)
@@ -902,13 +906,28 @@ class EngineCore:
         rid = victim.request_id
         # Only a request with a client attached (and not already finished) is
         # worth aborting: otherwise the abort frees nothing observable.
-        if rid not in self._output_collectors or rid in self._finished_at:
-            return None
+        if rid not in self._output_collectors:
+            return replace(victim, skipped="no_client")
+        if rid in self._finished_at:
+            return replace(victim, skipped="already_finished")
         sched.abort_request(rid)
         self._emit_memory_abort(rid, self._memory_abort_context(None), None, None)
         self._mark_request_finished(rid)
         self._wake_engine_loop()
         return victim
+
+    def memory_victim_pending(self, request_id: str) -> bool:
+        """Whether a memory victim's deferred abort has not run yet.
+
+        True while the scheduler still queues the abort or still holds the
+        request (and with it the request's KV); False once it is dropped.
+        """
+        sched = self.scheduler
+        if sched is None:
+            return False
+        return request_id in getattr(
+            sched, "_pending_abort_ids", ()
+        ) or request_id in getattr(sched, "requests", {})
 
     def _memory_abort_context(self, reason: str | None) -> dict[str, Any]:
         """Measured usage, limits and advice behind a memory-pressure abort."""
@@ -1546,6 +1565,11 @@ class AsyncEngineCore:
         if engine is None:
             return None
         return await engine.abort_one_request_for_memory(spare_parked=spare_parked)
+
+    def memory_victim_pending(self, request_id: str) -> bool:
+        """Whether a memory victim's deferred abort has not run yet."""
+        engine = getattr(self, "engine", None)
+        return engine is not None and engine.memory_victim_pending(request_id)
 
     async def abort_all_requests(
         self,
