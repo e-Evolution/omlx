@@ -471,6 +471,42 @@ class PrefillMemoryExceededError(OMLXMemoryError):
         self.limit_bytes = limit_bytes
 
 
+class ContextExceedsCapacityError(PrefillMemoryExceededError):
+    """
+    The request cannot fit even with nothing else running.
+
+    Raised by the never-fits gate when the model weights plus the KV of the
+    whole context (prompt plus max_tokens) plus the prefill transient exceed
+    the memory guard's capacity line. Waiting cannot help, so it is not
+    retryable as is: the client must compact or shorten the context, or
+    lower max_tokens. Subclassing PrefillMemoryExceededError keeps the
+    HTTP 400 mapping and the existing error envelope.
+
+    Attributes:
+        capacity_fields: ``required_bytes``, ``capacity_bytes``,
+            ``weights_bytes``, ``kv_bytes_per_token``,
+            ``requested_context_tokens``, ``requested_max_tokens`` and
+            ``max_viable_context_tokens`` (prompt plus max_tokens).
+    """
+
+    omlx_code = "context_exceeds_capacity"
+
+    def __init__(
+        self,
+        message: str,
+        request_id: str | None = None,
+        *,
+        capacity_fields: dict,
+    ):
+        super().__init__(
+            message,
+            request_id=request_id,
+            estimated_bytes=capacity_fields.get("required_bytes"),
+            limit_bytes=capacity_fields.get("capacity_bytes"),
+        )
+        self.capacity_fields = dict(capacity_fields)
+
+
 class PrefillMemoryAbortedError(PrefillMemoryExceededError):
     """
     An admitted request was aborted mid-prefill by the memory enforcer.

@@ -89,6 +89,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     eviction_callback: Any | None,
     executor: Any | None = None,
     text_only: bool = False,
+    max_tokens: int | None = None,
 ) -> None:
     """Run route preflight after transient post-request cleanup settles.
 
@@ -104,18 +105,22 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     """
     deadline = time.monotonic() + _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S
     waited_for_cleanup = False
+    # max_tokens feeds the never-fits gate; omitted when the caller has none.
+    output_budget = {"max_tokens": max_tokens} if max_tokens is not None else {}
 
     while True:
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
             text_only=text_only,
+            **output_budget,
         )
         if eviction_request is None:
             scheduler.preflight_or_raise(
                 num_prompt_tokens=num_prompt_tokens,
                 request_id=request_id,
                 text_only=text_only,
+                **output_budget,
             )
             return
 
@@ -192,6 +197,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
             text_only=text_only,
+            **output_budget,
         )
         return
 
@@ -553,6 +559,41 @@ class BaseEngine(ABC):
         See :meth:`preflight_chat` for the rationale.
         """
         return None
+
+    def _capacity_scheduler(self) -> Any:
+        """The scheduler behind an EngineCore-backed engine, or None."""
+        core = getattr(getattr(self, "_engine", None), "engine", None)
+        return getattr(core, "scheduler", None)
+
+    def capacity_snapshot(
+        self, *, context_tokens: int = 0, max_tokens: int = 0
+    ) -> dict[str, int] | None:
+        """Never-fits capacity numbers plus the free bytes now, or None.
+
+        Engines whose scheduler has no memory estimate (or no scheduler at
+        all) return None.
+        """
+        fn = getattr(self._capacity_scheduler(), "capacity_snapshot", None)
+        if not callable(fn):
+            return None
+        try:
+            snapshot = fn(context_tokens=context_tokens, max_tokens=max_tokens)
+        except Exception:  # noqa: BLE001 - a hint must never fail a request
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def max_context_tokens_hint(self) -> int | None:
+        """Cached largest context plus max_tokens that fits alone, or None."""
+        fn = getattr(self._capacity_scheduler(), "max_viable_context_tokens", None)
+        if not callable(fn):
+            return None
+        try:
+            hint = fn()
+        except Exception:  # noqa: BLE001 - a hint must never fail a request
+            return None
+        if isinstance(hint, bool) or not isinstance(hint, int):
+            return None
+        return hint
 
 
 class ActivityTrackingMixin:

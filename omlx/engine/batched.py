@@ -107,6 +107,7 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        max_tokens: int | None = None,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -119,6 +120,7 @@ class BatchedEngine(BaseEngine):
                 None,
             ),
             text_only=True,
+            max_tokens=max_tokens,
         )
 
     @property
@@ -1366,7 +1368,10 @@ class BatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            max_tokens=kwargs.get("max_tokens"),
         )
 
     async def preflight_completion(
@@ -1396,7 +1401,10 @@ class BatchedEngine(BaseEngine):
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
         await self._preflight_or_raise_with_eviction(
-            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
+            scheduler,
+            num_prompt_tokens=num_tokens,
+            request_id=request_id,
+            max_tokens=kwargs.get("max_tokens"),
         )
 
     async def stream_chat(
