@@ -91,6 +91,16 @@ class SamplingParams:
             self.stop_token_ids = []
 
 
+@dataclass(frozen=True)
+class MemoryVictim:
+    """The one request a memory-pressure abort chose, and what it held."""
+
+    request_id: str
+    tokens: int  # live KV tokens (prompt + generated, or prefilled so far)
+    est_bytes: int  # estimated KV bytes freed (0 when no estimator is wired)
+    kept: int  # live requests left running
+
+
 @dataclass
 class Request:
     """

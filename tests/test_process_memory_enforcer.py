@@ -3560,3 +3560,161 @@ class TestPrefillParkRequest:
         await self._tick(enforcer, usage=96 * 1024**3)
         scheduler.note_pressure_poll.assert_called_with("hard")
         assert scheduler.note_pressure_poll.call_count == 2
+
+
+class TestSingleVictimFallback:
+    """Hard pressure with nothing parkable aborts one victim, not every request.
+
+    The emergency path (beyond the ceiling) and model unload keep abort-all as
+    a deliberate safety brake. ``OMLX_MEMORY_ABORT_SINGLE_VICTIM`` off restores
+    the legacy abort-all on the hard path.
+    """
+
+    @pytest.fixture
+    def enforcer(self, mock_engine_pool):
+        # Hard watermark (95 GB) below the ceiling (100 GB): hard is not
+        # emergency until usage passes the ceiling by the emergency margin.
+        return _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.85,
+            hard_threshold=0.95,
+        )
+
+    @staticmethod
+    def _engine(victims):
+        from omlx.request import MemoryVictim
+
+        engine = MagicMock()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        engine.abort_one_request_for_memory = AsyncMock(
+            side_effect=[
+                MemoryVictim(rid, 90_000, 6 * 1024**3, kept) for rid, kept in victims
+            ]
+            + [None]
+        )
+        return engine
+
+    @staticmethod
+    def _busy(enforcer, engine):
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        return entry
+
+    @staticmethod
+    async def _tick(enforcer, usage_gb):
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling([usage_gb * 1024**3])
+            await enforcer._check_and_enforce()
+
+    @pytest.mark.asyncio
+    async def test_hard_pressure_aborts_exactly_one_victim(
+        self, enforcer, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = self._engine([("req-big", 2)])
+        entry = self._busy(enforcer, engine)
+
+        with caplog.at_level("WARNING"):
+            await self._tick(enforcer, 97)
+
+        engine.abort_one_request_for_memory.assert_awaited_once_with(spare_parked=True)
+        engine.abort_all_requests.assert_not_awaited()
+        assert entry.engine is engine
+        assert entry.pending_unload_reason is None
+        assert "aborted 1 victim req-big (90000 tokens" in caplog.text
+        assert "2 request(s) kept" in caplog.text
+        assert "'big-model'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_persisting_pressure_aborts_one_more_victim_per_poll(
+        self, enforcer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = self._engine([("first", 2), ("second", 1)])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 1
+
+        await self._tick(enforcer, 97)
+        assert engine.abort_one_request_for_memory.await_count == 2
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovered_pressure_aborts_no_second_victim(
+        self, enforcer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = self._engine([("first", 2), ("second", 1)])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+        await self._tick(enforcer, 1)
+
+        assert engine.abort_one_request_for_memory.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_emergency_still_aborts_everything(self, enforcer, monkeypatch):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = self._engine([("req-big", 2)])
+        entry = self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 103)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=False)
+        engine.abort_one_request_for_memory.assert_not_awaited()
+        assert entry.pending_unload_reason == "hard memory pressure"
+
+    @pytest.mark.asyncio
+    async def test_flag_off_keeps_the_legacy_abort_all(self, enforcer, monkeypatch):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "false")
+        engine = self._engine([("req-big", 2)])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=True)
+        engine.abort_one_request_for_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flag_unset_keeps_the_legacy_abort_all(self, enforcer, monkeypatch):
+        monkeypatch.delenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", raising=False)
+        engine = self._engine([("req-big", 2)])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+
+        engine.abort_all_requests.assert_awaited_once()
+        engine.abort_one_request_for_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_victim_falls_back_to_abort_all_sparing_parked(
+        self, enforcer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = self._engine([])
+        self._busy(enforcer, engine)
+
+        await self._tick(enforcer, 97)
+
+        engine.abort_one_request_for_memory.assert_awaited_once()
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=True)
+
+    @pytest.mark.asyncio
+    async def test_engine_without_the_hook_falls_back_to_abort_all(
+        self, enforcer, monkeypatch
+    ):
+        monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
+        engine = _ParkedOnlyEngine()
+        self._busy(enforcer, engine)
+
+        with patch.object(
+            enforcer, "_current_usage_bytes", return_value=97 * 1024**3
+        ):
+            await enforcer._check_and_enforce()
+
+        assert engine.calls == [True]

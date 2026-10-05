@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -1593,6 +1594,43 @@ class ProcessMemoryEnforcer:
         except TypeError:
             return await engine.abort_all_requests()
 
+    @staticmethod
+    def _abort_single_victim_enabled() -> bool:
+        """Kill switch: ``OMLX_MEMORY_ABORT_SINGLE_VICTIM`` (default off).
+
+        Off keeps the legacy abort-all on the non-emergency hard path. The
+        fork's packaged app turns it on.
+        """
+        raw = os.getenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "")
+        return raw.strip().lower() in ("true", "1", "yes", "on")
+
+    async def _abort_single_victim(self, engine: Any, model_id: str) -> Any:
+        """Abort the one request freeing the most memory; None means fall back.
+
+        Returns None when the switch is off, the engine has no such hook, or
+        no live request can be chosen, so the caller aborts everything as
+        before. At most one victim per call, so the next poll re-measures
+        before another request is sacrificed.
+        """
+        if not self._abort_single_victim_enabled():
+            return None
+        abort_one = getattr(engine, "abort_one_request_for_memory", None)
+        if not callable(abort_one):
+            return None
+        victim = await abort_one(spare_parked=True)
+        if victim is None:
+            return None
+        logger.warning(
+            "Hard memory pressure: aborted 1 victim %s (%d tokens, ~%.1f GB) "
+            "on '%s'; %d request(s) kept",
+            victim.request_id,
+            victim.tokens,
+            victim.est_bytes / 1024**3,
+            model_id,
+            victim.kept,
+        )
+        return victim
+
     async def _abort_loaded_requests_for_memory_emergency(self) -> int:
         """Abort active requests on loaded models without unloading them."""
         aborted_total = 0
@@ -1968,6 +2006,20 @@ class ProcessMemoryEnforcer:
                             # loaded and lets parked requests resume; an
                             # emergency unload must abort them, or they keep
                             # the engine non-idle and the unload never drains.
+                            # Deliberate safety brake: only the non-emergency
+                            # hard path narrows to one victim. The emergency
+                            # path (beyond the ceiling) and model unload keep
+                            # abort-all, since a half-measure there risks the
+                            # process being killed for memory.
+                            single = (
+                                None
+                                if emergency
+                                else await self._abort_single_victim(
+                                    entry.engine, busy_victim
+                                )
+                            )
+                            if single is not None:
+                                break
                             aborted = await self._abort_all_requests(
                                 entry.engine, spare_parked=not emergency
                             )

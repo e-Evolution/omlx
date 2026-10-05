@@ -70,6 +70,9 @@ FORK_BATCHED_DECODE_HOLD_MAX_S = "120"
 FORK_ENV = {
     "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
     "OMLX_MEMORY_PRESSURE_PARK": "true",
+    # Hard pressure with nothing parkable aborts the one largest request
+    # instead of every in-flight one (emergency and unload still abort all).
+    "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
     "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
     "OMLX_BATCHED_DECODE_HOLD_MAX_S": FORK_BATCHED_DECODE_HOLD_MAX_S,

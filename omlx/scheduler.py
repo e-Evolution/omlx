@@ -81,7 +81,13 @@ from .prefill_boundaries import (
 )
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .request import (
+    MemoryVictim,
+    Request,
+    RequestOutput,
+    RequestStatus,
+    SamplingParams,
+)
 from .ttft_breakdown import TtftTracker
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
@@ -11844,6 +11850,42 @@ class Scheduler:
         if held_s >= PARK_MAX_HOLD_S and self._last_pressure_level != "hard":
             return self._polls_since_resume < need
         return True
+
+    def select_memory_victim(self, *, spare_parked: bool = True) -> MemoryVictim | None:
+        """Pick the one live request whose abort frees the most memory.
+
+        Largest live KV footprint first (a decoding request holds prompt plus
+        generated tokens, a chunked prefill what it has computed so far); the
+        most recent arrival breaks ties, since it has lost the least work.
+        Parked requests hold no live memory and are spared by default, as are
+        queued requests with no KV and requests already pending an abort.
+        Returns None when nothing live can be chosen. Read-only: the caller
+        aborts the victim.
+        """
+        pending = set(self._pending_abort_ids)
+        prefilling_ids = {r.request_id for r in self.prefilling}
+        live: list[tuple[int, float, str]] = []
+        for rid, request in list(self.requests.items()):
+            if rid in pending:
+                continue
+            if spare_parked and self.is_request_parked(rid):
+                continue
+            if rid in self.running:
+                tokens = request.num_tokens
+            elif rid in prefilling_ids or rid in self._prefill_states:
+                tokens = request.num_computed_tokens
+            else:
+                continue
+            if tokens > 0:
+                live.append((tokens, request.arrival_time, rid))
+        if not live:
+            return None
+        tokens, _, rid = max(live, key=lambda item: (item[0], item[1]))
+        monitor = self.memory_monitor
+        est_bytes = (
+            int(monitor.estimate_prompt_kv_bytes(tokens)) if monitor is not None else 0
+        )
+        return MemoryVictim(rid, tokens, est_bytes, kept=len(live) - 1)
 
     def is_request_parked(self, request_id: str) -> bool:
         """Whether the request is currently parked (holds no live memory)."""
