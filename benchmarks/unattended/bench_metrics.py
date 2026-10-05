@@ -415,13 +415,34 @@ def p7_default_ceiling_gb(
     return round(model_gb + frac * (peak_gb - model_gb), 1)
 
 
-def p7_settings_override(ceiling_gb: float) -> dict[str, Any]:
-    return {
-        "memory": {
-            "memory_guard_tier": "custom",
-            "memory_guard_custom_ceiling_gb": ceiling_gb,
-        }
+def p7_settings_override(
+    ceiling_gb: float,
+    hard_threshold: float | None = None,
+    soft_threshold: float | None = None,
+) -> dict[str, Any]:
+    """settings.json overlay: custom-tier ceiling, optionally a wider hard band.
+
+    Prefill chunk transients can jump straight from below the hard watermark
+    to beyond ``ceiling + 2 GB`` (the emergency brake, which never parks).
+    Lowering ``hard_threshold`` widens the band in which a park may fire. A
+    lone hard threshold drags the soft one 0.1 below it so the order holds.
+    """
+    mem: dict[str, Any] = {
+        "memory_guard_tier": "custom",
+        "memory_guard_custom_ceiling_gb": ceiling_gb,
     }
+    if hard_threshold is not None:
+        if not 0.0 < hard_threshold <= 1.0:
+            raise ValueError("hard_threshold must be in (0, 1]")
+        if soft_threshold is None:
+            soft_threshold = round(max(0.05, hard_threshold - 0.1), 2)
+        mem["hard_threshold"] = hard_threshold
+        mem["soft_threshold"] = soft_threshold
+    elif soft_threshold is not None:
+        mem["soft_threshold"] = soft_threshold
+    if "hard_threshold" in mem and not mem["soft_threshold"] < mem["hard_threshold"]:
+        raise ValueError("soft_threshold must be below hard_threshold")
+    return {"memory": mem}
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

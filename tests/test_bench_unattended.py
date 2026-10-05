@@ -1637,6 +1637,18 @@ class TestP7Ceiling:
             }
         }
 
+    def test_override_can_widen_the_hard_band(self):
+        o = bm.p7_settings_override(42.0, hard_threshold=0.8, soft_threshold=0.7)
+        assert o["memory"]["hard_threshold"] == 0.8
+        assert o["memory"]["soft_threshold"] == 0.7
+        assert o["memory"]["memory_guard_tier"] == "custom"
+
+    def test_thresholds_must_be_ordered(self):
+        with pytest.raises(ValueError):
+            bm.p7_settings_override(42.0, hard_threshold=0.7, soft_threshold=0.8)
+        with pytest.raises(ValueError):
+            bm.p7_settings_override(42.0, hard_threshold=1.2)
+
     def test_deep_merge_keeps_siblings_and_input(self):
         base = {"memory": {"memory_guard_tier": "aggressive", "x": 1}, "a": {"b": 1}}
         out = bm.deep_merge(base, bm.p7_settings_override(30.0))

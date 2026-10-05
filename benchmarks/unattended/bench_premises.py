@@ -1118,6 +1118,8 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
         "p7": {
             "mode": getattr(args, "p7_mode", None),
             "ceiling_gb": getattr(args, "p7_ceiling_gb", None),
+            "hard_threshold": getattr(args, "p7_hard_threshold", None),
+            "soft_threshold": getattr(args, "p7_soft_threshold", None),
             "requests": getattr(args, "p7_requests", None),
             "stagger_s": getattr(args, "p7_stagger_s", None),
             "max_tokens": getattr(args, "p7_max_tokens", None),
@@ -1141,7 +1143,11 @@ async def run_premise_async(
         args.keep_cache,
         args.batched_decode_limit,
         settings_override=(
-            bm.p7_settings_override(args.p7_ceiling_gb) if premise == "P7" else None
+            bm.p7_settings_override(
+                args.p7_ceiling_gb, args.p7_hard_threshold, args.p7_soft_threshold
+            )
+            if premise == "P7"
+            else None
         ),
     )
     srv.prepare()
@@ -1278,6 +1284,19 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="P7: custom memory-guard ceiling in GB (default: between the model "
         "and the unpressured peak, see bench_metrics.p7_default_ceiling_gb)",
+    )
+    ap.add_argument(
+        "--p7-hard-threshold",
+        type=float,
+        default=None,
+        help="P7: memory.hard_threshold (fraction of the ceiling); lower widens "
+        "the band where a park can fire before the emergency brake",
+    )
+    ap.add_argument(
+        "--p7-soft-threshold",
+        type=float,
+        default=None,
+        help="P7: memory.soft_threshold (default: hard - 0.1 when hard is set)",
     )
     ap.add_argument("--p7-requests", type=int, default=3, help="P7: 1-3 prompts")
     ap.add_argument(
