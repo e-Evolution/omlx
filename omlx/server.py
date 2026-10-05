@@ -53,7 +53,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, NamedTuple, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi import Request as FastAPIRequest
@@ -1820,6 +1820,25 @@ async def get_decision_engine(model: str, lease: _LLMEngineLease) -> DecisionEng
     return engine
 
 
+class ResolvedSampling(NamedTuple):
+    """Effective sampling parameters from ``get_sampling_params``.
+
+    A tuple in this field order, so positional unpacking keeps working; new
+    callers read fields by name.
+    """
+
+    temperature: float
+    top_p: float
+    top_k: int
+    repetition_penalty: float
+    min_p: float
+    presence_penalty: float
+    frequency_penalty: float
+    max_tokens: int
+    xtc_probability: float
+    xtc_threshold: float
+
+
 def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
@@ -1833,7 +1852,7 @@ def get_sampling_params(
     ocr_defaults: dict | None = None,
     req_xtc_probability: float | None = None,
     req_xtc_threshold: float | None = None,
-) -> tuple[float, float, int, float, float, float, float, int, float, float]:
+) -> ResolvedSampling:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -1845,7 +1864,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > ocr_defaults > global defaults.
 
     Returns:
-        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
+        ResolvedSampling (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
     """
     global_sampling = _server_state.sampling
 
@@ -1973,17 +1992,17 @@ def get_sampling_params(
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return (
-        temperature,
-        top_p,
-        top_k,
-        repetition_penalty,
-        min_p,
-        presence_penalty,
-        frequency_penalty,
-        max_tokens,
-        xtc_probability,
-        xtc_threshold,
+    return ResolvedSampling(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        min_p=min_p,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        max_tokens=max_tokens,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
     )
 
 
@@ -4269,7 +4288,7 @@ async def create_completion(
             request.top_p,
             request.model,
             req_max_tokens=request.max_tokens,
-        )[7]
+        ).max_tokens
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
             await engine.preflight_completion(
