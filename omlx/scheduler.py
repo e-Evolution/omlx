@@ -12493,11 +12493,79 @@ class Scheduler:
         scheduled: list[Request],
         rejected_outputs: list[RequestOutput],
     ) -> None:
-        """Re-admit a paused decoding row from its exact chain."""
-        record = self._decode_resumes.pop(request.request_id)
-        self._finish_park_resume(request, preserved_tokens=0, log=False)
-        self._finish_decode_resume_lost(
-            request, record, rejected_outputs, "exact resume is unavailable"
+        """Re-admit a paused decoding row from its exact chain.
+
+        No prefill and no preflight: the exact chain holds the KV of every
+        token but the kickoff, which the inserted row feeds first, exactly
+        as the uninterrupted row would have. The stashed sampler, logits
+        processors and stop machine continue; the RNG is not reseeded and
+        prompt usage is not counted again.
+        """
+        rid = request.request_id
+        record = self._decode_resumes.pop(rid)
+        restored = None
+        if self.block_aware_cache is not None:
+            with mx.stream(self._stream):
+                restored = self.block_aware_cache.restore_exact_prefix(
+                    record.storage_id,
+                    record.tokens,
+                    promote_to_hot_cache=not self._bypass_hot_cache_under_pressure(),
+                    domain_key=record.domain_key,
+                )
+        # The chain was reconstructed (or is gone): its pins are released.
+        self._finish_park_resume(
+            request,
+            preserved_tokens=len(record.tokens) if restored is not None else 0,
+            log=False,
+        )
+        if restored is None:
+            self._finish_decode_resume_lost(
+                request, record, rejected_outputs, "the exact prefix chain is gone"
+            )
+            return
+        restore_cache = getattr(self.model, "restore_cache", None)
+        cache = restore_cache(restored) if callable(restore_cache) else restored
+        offset = max((_cache_layer_token_count(c) for c in cache), default=0)
+        if offset != len(record.tokens):
+            self._finish_decode_resume_lost(
+                request,
+                record,
+                rejected_outputs,
+                f"restored {offset} tokens, expected {len(record.tokens)}",
+            )
+            return
+
+        with mx.stream(self._stream):
+            uids = self.batch_generator.insert(
+                [[record.kickoff]],
+                max_tokens=[record.remaining_max_tokens],
+                caches=[cache],
+                all_tokens=[list(record.tokens)],
+                samplers=[record.sampler],
+                logits_processors=[record.logits_processors],
+                stop_sequences=[record.stop_sequences],
+            )
+        uid = uids[0]
+        _register_uid_rows(
+            self.model, uids, [record.sampler], [record.logits_processors]
+        )
+        _mtp_priming.bind_uid(self.model, rid, uid)
+        self._dflash_bind_uid(rid, uid)
+        self.request_id_to_uid[rid] = uid
+        self.uid_to_request_id[uid] = rid
+        request.batch_uid = uid
+        request.status = RequestStatus.RUNNING
+        request.last_activity_at = time.monotonic()
+        self.running[rid] = request
+        scheduled.append(request)
+        if hasattr(self.model, "register_rope_delta"):
+            self.model.register_rope_delta(uid, request.rope_deltas)
+        _mark_text_positions(self.model, request, uid)
+        self._park_stats["decode_resumes"] += 1
+        logger.info(
+            "Resumed decoding request %s: restored %d tokens exactly",
+            rid,
+            len(record.tokens),
         )
 
     def _finish_decode_resume_lost(

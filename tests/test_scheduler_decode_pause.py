@@ -325,3 +325,130 @@ def test_a_lost_exact_chain_ends_the_request_with_a_structured_error(tmp_path):
         assert not park.waiting_ids(rig) and not scheduler.running
     finally:
         rig.close()
+
+
+# --- Resume: greedy identity and stream continuity -----------------------------
+
+RESUME_MAX_TOKENS = 300
+
+
+def baseline_outputs(tmp_path, max_tokens, *, second=False, split=False):
+    """Uninterrupted run: per-row token ids, streamed text and final output."""
+    rig = make_rig(tmp_path / "baseline", split=split, park_enabled=False)
+    try:
+        rows = [submit(rig, "a", PROMPT, max_tokens)]
+        if second:
+            rows.append(submit(rig, "b", OTHER, max_tokens))
+        outputs = park.run_to_completion(rig, rows, limit=4 * max_tokens)
+        return outputs, rows
+    finally:
+        rig.close()
+
+
+def paused_outputs(tmp_path, pause_at, max_tokens, *, second=False, split=False):
+    """The same run with row ``a`` paused after ``pause_at`` output tokens."""
+    rig = make_rig(tmp_path / "paused", split=split)
+    rows = [submit(rig, "a", PROMPT, max_tokens)]
+    if second:
+        rows.append(submit(rig, "b", OTHER, max_tokens))
+    outputs = []
+    step_until_outputs(rig, rows[0], pause_at, outputs)
+    assert rig.scheduler.request_decode_pause("a") is True
+    outputs.extend(park.step(rig))
+    assert rows[0].park_count == 1
+    park.finish_ok_polls(rig, 3)
+    outputs.extend(park.run_to_completion(rig, rows, limit=4 * max_tokens))
+    return rig, outputs, rows
+
+
+def _final(outputs, request_id):
+    (final,) = [o for o in outputs if o.request_id == request_id and o.finished]
+    return final
+
+
+def assert_identical_stream(base_outputs, base_row, outputs, row):
+    rid = row.request_id
+    expected = list(base_row.output_token_ids)
+    assert list(row.output_token_ids) == expected
+    # Every token reached the client exactly once, in order.
+    assert streamed_tokens(outputs, rid) == expected
+    streamed_text = "".join(o.new_text for o in outputs if o.request_id == rid)
+    base_text = "".join(o.new_text for o in base_outputs if o.request_id == rid)
+    assert streamed_text == base_text
+    final, base_final = _final(outputs, rid), _final(base_outputs, rid)
+    assert not final.error
+    assert final.finish_reason == base_final.finish_reason == "length"
+    assert final.output_text == base_final.output_text
+    # Usage is not double counted.
+    assert final.prompt_tokens == base_final.prompt_tokens == len(row.prompt)
+    assert final.completion_tokens == base_final.completion_tokens == len(expected)
+
+
+@pytest.mark.parametrize("pause_at", [1, 255, 256])
+@pytest.mark.parametrize("split", [False, True], ids=["inline-gdn", "split-gdn"])
+def test_greedy_output_after_a_decode_pause_equals_an_uninterrupted_run(
+    tmp_path, caplog, pause_at, split
+):
+    base_outputs, (base_row,) = baseline_outputs(
+        tmp_path, RESUME_MAX_TOKENS, split=split
+    )
+    with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+        rig, outputs, (row,) = paused_outputs(
+            tmp_path, pause_at, RESUME_MAX_TOKENS, split=split
+        )
+    try:
+        assert_identical_stream(base_outputs, base_row, outputs, row)
+        scheduler = rig.scheduler
+        restored = len(PROMPT) + pause_at
+        assert any(
+            f"Resumed decoding request a: restored {restored} tokens exactly"
+            in r.getMessage()
+            for r in caplog.records
+        )
+        stats = scheduler.get_park_stats()
+        assert stats["decode_pauses"] == stats["decode_resumes"] == 1
+        assert stats["decode_resume_lost"] == 0
+        assert rig.prefix.get_stats().exact_prefix_hits == 1
+        # No re-prefill: the prompt was admitted once.
+        assert scheduler.total_prompt_tokens == len(PROMPT)
+        assert scheduler.total_completion_tokens == RESUME_MAX_TOKENS
+        assert not scheduler._park_pins and rig.ssd.pinned_block_count == 0
+        assert not scheduler._decode_resumes
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize("pause_at", [1, 255, 256])
+def test_greedy_identity_holds_beside_a_second_decoding_row(tmp_path, pause_at):
+    base_outputs, base_rows = baseline_outputs(tmp_path, RESUME_MAX_TOKENS, second=True)
+    rig, outputs, rows = paused_outputs(
+        tmp_path, pause_at, RESUME_MAX_TOKENS, second=True
+    )
+    try:
+        for base_row, row in zip(base_rows, rows):
+            assert_identical_stream(base_outputs, base_row, outputs, row)
+        assert rig.scheduler.get_park_stats()["decode_resumes"] == 1
+    finally:
+        rig.close()
+
+
+def test_the_paused_row_waits_parked_while_others_decode(tmp_path):
+    """With another row admitted, the paused one is held until ok polls."""
+    rig = make_rig(tmp_path)
+    try:
+        scheduler = rig.scheduler
+        a = submit(rig, "a", PROMPT, 60)
+        b = submit(rig, "b", OTHER, 60)
+        step_until_outputs(rig, a, 5, [])
+        assert scheduler.request_decode_pause("a") is True
+        park.step(rig)
+        frozen = list(a.output_token_ids)
+        park.step(rig, 3)
+        assert park.waiting_ids(rig) == ["a"] and a.parked
+        assert list(a.output_token_ids) == frozen  # nothing decoded while parked
+        assert len(b.output_token_ids) > 5
+        park.finish_ok_polls(rig, 3)
+        park.step(rig)
+        assert "a" in scheduler.running and not a.parked
+    finally:
+        rig.close()
