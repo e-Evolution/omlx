@@ -401,6 +401,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float | None = None,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
+        abort_single_victim: bool = False,
     ):
         """
         Initialize the process memory enforcer.
@@ -430,6 +431,8 @@ class ProcessMemoryEnforcer:
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
+            abort_single_victim: On the non-emergency hard path with nothing
+                parkable, abort one victim instead of every request.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -454,6 +457,7 @@ class ProcessMemoryEnforcer:
         self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._single_victim_on = bool(abort_single_victim)
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
@@ -1586,6 +1590,40 @@ class ProcessMemoryEnforcer:
         except TypeError:
             return await engine.abort_all_requests()
 
+    def _abort_single_victim_enabled(self) -> bool:
+        """``memory.abort_single_victim`` (default off).
+
+        Off keeps the legacy abort-all on the non-emergency hard path.
+        """
+        return self._single_victim_on
+
+    async def _abort_single_victim(self, engine: Any, model_id: str) -> Any:
+        """Abort the one request freeing the most memory; None means fall back.
+
+        Returns None when the switch is off, the engine has no such hook, or
+        no live request can be chosen, so the caller aborts everything as
+        before. At most one victim per call, so the next poll re-measures
+        before another request is sacrificed.
+        """
+        if not self._abort_single_victim_enabled():
+            return None
+        abort_one = getattr(engine, "abort_one_request_for_memory", None)
+        if not callable(abort_one):
+            return None
+        victim = await abort_one(spare_parked=True)
+        if victim is None:
+            return None
+        logger.warning(
+            "Hard memory pressure: aborted 1 victim %s (%d tokens, ~%.1f GB) "
+            "on '%s'; %d request(s) kept",
+            victim.request_id,
+            victim.tokens,
+            victim.est_bytes / 1024**3,
+            model_id,
+            victim.kept,
+        )
+        return victim
+
     async def _abort_loaded_requests_for_memory_emergency(self) -> int:
         """Abort active requests on loaded models without unloading them."""
         aborted_total = 0
@@ -1961,6 +1999,20 @@ class ProcessMemoryEnforcer:
                             # loaded and lets parked requests resume; an
                             # emergency unload must abort them, or they keep
                             # the engine non-idle and the unload never drains.
+                            # Deliberate safety brake: only the non-emergency
+                            # hard path narrows to one victim. The emergency
+                            # path (beyond the ceiling) and model unload keep
+                            # abort-all, since a half-measure there risks the
+                            # process being killed for memory.
+                            single = (
+                                None
+                                if emergency
+                                else await self._abort_single_victim(
+                                    entry.engine, busy_victim
+                                )
+                            )
+                            if single is not None:
+                                break
                             aborted = await self._abort_all_requests(
                                 entry.engine, spare_parked=not emergency
                             )

@@ -44,7 +44,7 @@ from .exceptions import (
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .request import Request, RequestOutput, SamplingParams
+from .request import MemoryVictim, Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import (
     FATAL_TEARDOWN_TIMEOUT_S,
@@ -842,8 +842,6 @@ class EngineCore:
         every unload, eviction, emergency or shutdown path must abort them,
         or they are orphaned (or block the unload from ever draining).
         """
-        from .utils.proc_memory import get_phys_footprint
-
         # Only abort requests not already finished or pending abort. The
         # enforcer calls this once per poll (1s) while pressure persists; a
         # deferred abort can take many seconds to drain (it executes at the
@@ -869,6 +867,53 @@ class EngineCore:
             and rid not in pending_aborts
             and not (spare_parked and callable(is_parked) and is_parked(rid) is True)
         ]
+        ctx = self._memory_abort_context(reason)
+        for rid in request_ids:
+            self.scheduler.abort_request(rid)
+            self._emit_memory_abort(rid, ctx, reason, error_code)
+            self._mark_request_finished(rid)
+        if request_ids:
+            if reason is None:
+                logger.warning(
+                    f"Aborted {len(request_ids)} requests due to memory pressure"
+                )
+            else:
+                logger.warning("Aborted %d requests: %s", len(request_ids), reason)
+            self._wake_engine_loop()
+        return len(request_ids)
+
+    async def abort_one_request_for_memory(
+        self, *, spare_parked: bool = True
+    ) -> MemoryVictim | None:
+        """Abort the single live request that frees the most memory.
+
+        The victim is chosen by the scheduler (largest live KV, newest arrival
+        on ties) and receives the same error frame ``abort_all_requests``
+        sends under memory pressure; every other request keeps running.
+        Returns the victim, or None when nothing live can be aborted.
+        """
+        sched = self.scheduler
+        select = getattr(sched, "select_memory_victim", None)
+        if sched is None or not callable(select):
+            return None
+        victim = select(spare_parked=spare_parked)
+        if victim is None:
+            return None
+        rid = victim.request_id
+        # Only a request with a client attached (and not already finished) is
+        # worth aborting: otherwise the abort frees nothing observable.
+        if rid not in self._output_collectors or rid in self._finished_at:
+            return None
+        sched.abort_request(rid)
+        self._emit_memory_abort(rid, self._memory_abort_context(None), None, None)
+        self._mark_request_finished(rid)
+        self._wake_engine_loop()
+        return victim
+
+    def _memory_abort_context(self, reason: str | None) -> dict[str, Any]:
+        """Measured usage, limits and advice behind a memory-pressure abort."""
+        from .utils.proc_memory import get_phys_footprint
+
         ceiling = 0
         watermark = 0
         sched = self.scheduler
@@ -898,73 +943,84 @@ class EngineCore:
             )
             advice = f"{advice}."
         ceiling_label = f"{binding} ceiling" if binding != "effective" else "ceiling"
-        for rid in request_ids:
-            self.scheduler.abort_request(rid)
-            collector = self._output_collectors.get(rid)
-            if collector is not None:
-                # Name the watermark that actually tripped; printing only the
-                # ceiling reads as "usage below limit yet aborted" (#2321).
-                if reason is not None:
-                    error_msg = reason
-                elif watermark > 0 and ceiling > 0:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, abort threshold "
-                        f"(hard watermark) {watermark_gb:.1f} GB, "
-                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
-                        f"{advice}"
-                    )
-                elif ceiling > 0:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB, "
-                        f"{ceiling_label} {ceiling_gb:.1f} GB). "
-                        f"{advice}"
-                    )
-                else:
-                    error_msg = (
-                        f"Request aborted: process memory limit exceeded "
-                        f"(usage {usage_gb:.1f} GB). "
-                        f"{advice}"
-                    )
-                collector.put(
-                    RequestOutput(
-                        request_id=rid,
-                        finished=True,
-                        finish_reason="error",
-                        new_text=f"\n\n[Error: {error_msg}]",
-                        error=error_msg,
-                        # Without a code this surfaced as a bare RuntimeError:
-                        # the JSON keepalive wrapper never saw a memory error,
-                        # so the response generator died mid-body and the
-                        # client got a truncated read plus a 500 traceback
-                        # instead of the same actionable 400 the pre-flight
-                        # guard returns.
-                        error_code=error_code or "prefill_memory_aborted",
-                        error_metadata={
-                            "request_id": rid,
-                            # Only the limit is reported: the exception's
-                            # estimated_bytes means "predicted peak", and this
-                            # abort fires on measured usage, which the message
-                            # already states.
-                            "limit_bytes": (
-                                watermark or ceiling or None
-                                if reason is None
-                                else None
-                            ),
-                        },
-                    )
+        return {
+            "usage_gb": usage_gb,
+            "ceiling": ceiling,
+            "watermark": watermark,
+            "ceiling_gb": ceiling_gb,
+            "watermark_gb": watermark_gb,
+            "ceiling_label": ceiling_label,
+            "advice": advice,
+        }
+
+    def _emit_memory_abort(
+        self,
+        rid: str,
+        ctx: dict[str, Any],
+        reason: str | None,
+        error_code: str | None,
+    ) -> None:
+        """Send the memory-abort error frame to ``rid``'s consumer."""
+        usage_gb = ctx["usage_gb"]
+        ceiling = ctx["ceiling"]
+        watermark = ctx["watermark"]
+        ceiling_gb = ctx["ceiling_gb"]
+        watermark_gb = ctx["watermark_gb"]
+        ceiling_label = ctx["ceiling_label"]
+        advice = ctx["advice"]
+        collector = self._output_collectors.get(rid)
+        if collector is not None:
+            # Name the watermark that actually tripped; printing only the
+            # ceiling reads as "usage below limit yet aborted" (#2321).
+            if reason is not None:
+                error_msg = reason
+            elif watermark > 0 and ceiling > 0:
+                error_msg = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB, abort threshold "
+                    f"(hard watermark) {watermark_gb:.1f} GB, "
+                    f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                    f"{advice}"
                 )
-            self._mark_request_finished(rid)
-        if request_ids:
-            if reason is None:
-                logger.warning(
-                    f"Aborted {len(request_ids)} requests due to memory pressure"
+            elif ceiling > 0:
+                error_msg = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB, "
+                    f"{ceiling_label} {ceiling_gb:.1f} GB). "
+                    f"{advice}"
                 )
             else:
-                logger.warning("Aborted %d requests: %s", len(request_ids), reason)
-            self._wake_engine_loop()
-        return len(request_ids)
+                error_msg = (
+                    f"Request aborted: process memory limit exceeded "
+                    f"(usage {usage_gb:.1f} GB). "
+                    f"{advice}"
+                )
+            collector.put(
+                RequestOutput(
+                    request_id=rid,
+                    finished=True,
+                    finish_reason="error",
+                    new_text=f"\n\n[Error: {error_msg}]",
+                    error=error_msg,
+                    # Without a code this surfaced as a bare RuntimeError:
+                    # the JSON keepalive wrapper never saw a memory error,
+                    # so the response generator died mid-body and the
+                    # client got a truncated read plus a 500 traceback
+                    # instead of the same actionable 400 the pre-flight
+                    # guard returns.
+                    error_code=error_code or "prefill_memory_aborted",
+                    error_metadata={
+                        "request_id": rid,
+                        # Only the limit is reported: the exception's
+                        # estimated_bytes means "predicted peak", and this
+                        # abort fires on measured usage, which the message
+                        # already states.
+                        "limit_bytes": (
+                            watermark or ceiling or None if reason is None else None
+                        ),
+                    },
+                )
+            )
 
     def _mark_request_finished(self, request_id: str) -> None:
         """Signal the consumer a request finished and stamp the finish time.
@@ -1481,6 +1537,15 @@ class AsyncEngineCore:
             )
             return False
         return await engine.abort_request(request_id)
+
+    async def abort_one_request_for_memory(
+        self, *, spare_parked: bool = True
+    ) -> MemoryVictim | None:
+        """Abort the single request that frees the most memory."""
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return None
+        return await engine.abort_one_request_for_memory(spare_parked=spare_parked)
 
     async def abort_all_requests(
         self,

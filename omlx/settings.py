@@ -611,6 +611,9 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # On the non-emergency hard path with nothing parkable, abort only the
+    # live request holding the most KV instead of every request.
+    abort_single_victim: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -622,6 +625,7 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "abort_single_victim": self.abort_single_victim,
         }
 
     @classmethod
@@ -640,6 +644,7 @@ class MemorySettings:
             hard_threshold=float(data.get("hard_threshold", 0.95)),
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
+            abort_single_victim=data.get("abort_single_victim") is True,
         )
 
 
@@ -1299,6 +1304,8 @@ class GlobalSettings:
                     f"Invalid OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS value: "
                     f"{commit_blocks}"
                 )
+        if single := os.getenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM"):
+            self.memory.abort_single_victim = single.lower() in ("true", "1", "yes")
         if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
             self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
         for env_name, attr in (

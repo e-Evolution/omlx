@@ -3358,3 +3358,29 @@ def test_inference_opt_in_keeps_network_management_requirements(
         allow_unauthenticated_inference=True,
     )
     assert any("non-loopback" in error for error in settings.validate())
+
+
+class TestAbortSingleVictimSetting:
+    """memory.abort_single_victim: off by default, round-trips, env override."""
+
+    def test_defaults_off_and_round_trips(self):
+        assert MemorySettings.from_dict({}).abort_single_victim is False
+        on = MemorySettings.from_dict({"abort_single_victim": True})
+        assert on.abort_single_victim is True
+        assert on.to_dict()["abort_single_victim"] is True
+        junk = MemorySettings.from_dict({"abort_single_victim": "yes"})
+        assert junk.abort_single_victim is False
+
+    def test_env_override(self, tmp_path):
+        env = {"OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.memory.abort_single_victim is True
+
+    def test_reaches_the_enforcer(self):
+        from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+
+        default = ProcessMemoryEnforcer(engine_pool=MagicMock())
+        assert default._abort_single_victim_enabled() is False
+        on = ProcessMemoryEnforcer(engine_pool=MagicMock(), abort_single_victim=True)
+        assert on._abort_single_victim_enabled() is True

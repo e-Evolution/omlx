@@ -1573,6 +1573,14 @@ class BatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
+    async def abort_one_request_for_memory(self, *, spare_parked: bool = True):
+        """Abort the single request that frees the most memory, or None."""
+        if self._engine and self._engine.engine:
+            return await self._engine.engine.abort_one_request_for_memory(
+                spare_parked=spare_parked
+            )
+        return None
+
     async def abort_all_requests(
         self,
         *,
