@@ -4802,6 +4802,11 @@ class PagedSSDCacheManager(CacheManager):
         with self._pin_lock:
             return len(self._pinned_hashes)
 
+    def has_pending_writes(self, block_hashes: Iterable[bytes]) -> bool:
+        """Whether any block still waits in memory for the background writer."""
+        with self._pending_write_hashes_lock:
+            return any(bytes(h) in self._pending_write_hashes for h in block_hashes)
+
     def _pinned_snapshot(self) -> frozenset[bytes]:
         with self._pin_lock:
             return frozenset(self._pinned_hashes)
