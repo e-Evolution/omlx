@@ -31,10 +31,12 @@ def _tokenizer():
     return tokenizer
 
 
-def make_rig(tmp_path, *, split=False, exact_writer=True, park_enabled=True):
+def make_rig(
+    tmp_path, *, split=False, exact_writer=True, park_enabled=True, tokenizer=None
+):
     rig = park._Rig(
         tmp_path,
-        _tokenizer(),
+        tokenizer if tokenizer is not None else _tokenizer(),
         split=split,
         commit_blocks=1,
         max_blocks=MAX_BLOCKS,
