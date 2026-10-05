@@ -420,7 +420,7 @@ def test_exclusion_reasons_name_each_unparkable_case(tmp_path, mock_tokenizer, s
         )
         scheduler.running["dec"] = decoding
         assert scheduler._park_exclusion_reason(decoding) == (
-            "decoding, not in chunked prefill"
+            "decoding row is not in the generation batch"
         )
     finally:
         rig.close()
@@ -447,7 +447,9 @@ def test_no_parkable_victim_is_logged_once_per_request_with_its_reason(
             assert scheduler.request_park_prefill() is False
         lines = _info(caplog, "Park skipped for")
         assert len(lines) == 2
-        assert any("dec: decoding, not in chunked prefill" in m for m in lines)
+        assert any(
+            "dec: decoding row is not in the generation batch" in m for m in lines
+        )
         assert any("ext: prefill runs in the external loop" in m for m in lines)
     finally:
         rig.close()

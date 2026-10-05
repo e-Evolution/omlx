@@ -1812,6 +1812,21 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_stores += 1
         return stored_table
 
+    def exact_prefix_store_supported(self) -> bool:
+        """Whether ``store_exact_prefix`` can persist this model's layout.
+
+        False without a paged SSD tier, and for a split-GDN layout whose
+        terminal recurrent sidecar has no writer attached.
+        """
+        if self.paged_ssd_cache is None:
+            return False
+        expected_layer_types = getattr(
+            self.paged_ssd_cache, "_expected_layer_cache_types", None
+        )
+        return not self._gdn_split_layout_supported(expected_layer_types) or callable(
+            self._exact_gdn_checkpoint_writer
+        )
+
     def _exact_prefix_hashes(
         self,
         tokens: list[int],

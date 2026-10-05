@@ -60,6 +60,7 @@ class _Rig:
         split,
         commit_blocks,
         tq_bits=None,
+        max_blocks=64,
         **config_overrides,
     ):
         mx.random.seed(11)
@@ -77,7 +78,10 @@ class _Rig:
             ),
         )
         self.paged = PagedCacheManager(
-            block_size=BLOCK, max_blocks=64, initial_blocks=64, model_name="tiny"
+            block_size=BLOCK,
+            max_blocks=max_blocks,
+            initial_blocks=max_blocks,
+            model_name="tiny",
         )
         kv_type = "TurboQuantKVCache" if tq_bits else "KVCache"
         self.ssd = PagedSSDCacheManager(
