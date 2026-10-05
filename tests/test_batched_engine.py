@@ -20,7 +20,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
+from omlx.engine.base import (
+    ENGINE_DEFAULT_MAX_TOKENS,
+    BaseEngine,
+    BaseNonStreamingEngine,
+    GenerationOutput,
+)
 
 
 class FakeStreamingCore:
@@ -1262,6 +1267,7 @@ class TestBatchedEnginePreparedPrompt:
             engine._engine.engine.scheduler,
             num_prompt_tokens=3,
             request_id="prepared-request",
+            max_tokens=ENGINE_DEFAULT_MAX_TOKENS,
         )
         engine._tokenizer.apply_chat_template.assert_called_once()
         rendered_options = engine._tokenizer.apply_chat_template.call_args.kwargs

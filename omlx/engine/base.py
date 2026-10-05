@@ -19,8 +19,20 @@ from omlx.engine_core import get_mlx_executor
 logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
+# Output budget an engine call runs with when the caller omits max_tokens.
+# The route preflight prices the same value, so the never-fits gate and the
+# in-stream admission agree on a request's output tokens.
+ENGINE_DEFAULT_MAX_TOKENS = 256
+
 _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
 _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
+
+def preflight_max_tokens(kwargs: dict[str, Any]) -> int:
+    """The max_tokens a route preflight prices: the caller's resolved value,
+    else the engine default the request itself will run with."""
+    value = kwargs.get("max_tokens")
+    return ENGINE_DEFAULT_MAX_TOKENS if value is None else int(value)
+
 
 # Per-process record of (engine_class_name, method) pairs that have
 # already logged a "scheduler unreachable" warning. The warning marks a
@@ -345,7 +357,7 @@ class BaseEngine(ABC):
     async def generate(
         self,
         prompt: str | list[int],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -377,7 +389,7 @@ class BaseEngine(ABC):
     async def stream_generate(
         self,
         prompt: str | list[int],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -409,7 +421,7 @@ class BaseEngine(ABC):
     async def chat(
         self,
         messages: List[Dict[str, Any]],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -441,7 +453,7 @@ class BaseEngine(ABC):
     async def stream_chat(
         self,
         messages: List[Dict[str, Any]],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
