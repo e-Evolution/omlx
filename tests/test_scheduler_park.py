@@ -556,6 +556,80 @@ def test_pinned_blocks_are_not_evicted_from_the_ssd_index_by_lru(
         rig.close()
 
 
+def _stored_exact_chain(rig, request_id, tokens, domain):
+    """Prefill ``tokens`` for real and store the exact chain under ``domain``."""
+    source, state = rig.start(f"{request_id}-source", tokens)
+    while not rig.step(state, 1):
+        pass
+    cache_data, config = rig.scheduler._extract_cache_states(state.cache)
+    table = rig.prefix.store_exact_prefix(
+        request_id,
+        list(tokens[:-1]),
+        cache_data,
+        model_cache_config=config,
+        domain_key=domain,
+    )
+    assert table is not None and table.num_tokens == len(tokens) - 1
+    return table
+
+
+def test_an_exact_chain_stays_restorable_while_pinned_and_unpin_releases_it(
+    tmp_path, mock_tokenizer
+):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        scheduler = rig.scheduler
+        tokens = PROMPT_A
+        table = _stored_exact_chain(rig, "paused", tokens, ("paused",))
+
+        assert scheduler._pin_exact_chain("paused", table) is True
+        pins = scheduler._park_pins["paused"]
+        assert pins.block_ids == table.block_ids
+        assert len(pins.hashes) == len(table.block_ids)
+        assert rig.ssd.pinned_block_count == len(pins.hashes)
+        for block_id in pins.block_ids:
+            assert rig.paged.allocated_blocks[block_id].ref_count >= 1
+
+        # An unbounded size enforcement keeps the pinned chain on disk.
+        rig.ssd._evict_tracked_until_size(0)
+        restored = rig.prefix.restore_exact_prefix(
+            "probe",
+            list(tokens[:-1]),
+            promote_to_hot_cache=False,
+            domain_key=("paused",),
+        )
+        assert restored is not None
+
+        scheduler._unpin_parked("paused")
+        assert "paused" not in scheduler._park_pins
+        assert rig.ssd.pinned_block_count == 0
+        for block_id in pins.block_ids:
+            block = rig.paged.allocated_blocks.get(block_id)
+            assert block is None or block.ref_count == 0
+        rig.ssd._evict_tracked_until_size(0)
+        assert all(rig.ssd._index.get(h) is None for h in pins.hashes)
+    finally:
+        rig.close()
+
+
+def test_pinning_an_incomplete_exact_chain_takes_no_pins(tmp_path, mock_tokenizer):
+    """A chain whose block metadata is already gone cannot be held: fail closed."""
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        table = _stored_exact_chain(rig, "paused", PROMPT_A, ("paused",))
+        rig.paged.allocated_blocks.pop(table.block_ids[-1])
+        before = {
+            b: rig.paged.allocated_blocks[b].ref_count for b in table.block_ids[:-1]
+        }
+        assert rig.scheduler._pin_exact_chain("paused", table) is False
+        assert "paused" not in rig.scheduler._park_pins
+        assert rig.ssd.pinned_block_count == 0
+        for block_id, ref_count in before.items():
+            assert rig.paged.allocated_blocks[block_id].ref_count == ref_count
+    finally:
+        rig.close()
+
+
 # --- Teardown never blocks the MLX thread ------------------------------------------
 
 

@@ -196,6 +196,30 @@ def _wrap_cachelist_sub_marker(
 
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 _EXACT_PREFIX_SPLIT_BLOCK_KEY = "specprefill-static-exact-split-v1"
+# Exact chains stored under a caller domain (for example one request's paused
+# decode) carry the domain in every block hash, so two requests with identical
+# tokens never share or overwrite each other's chain, and none of its blocks
+# enter ordinary prefix matching.
+_EXACT_PREFIX_DOMAIN_KEY = "exact-prefix-domain-v1"
+
+
+def _exact_block_extra_keys(
+    *,
+    terminal: bool,
+    split_gdn_layout: bool,
+    domain_key: tuple[str, ...] | None,
+) -> tuple[Any, ...] | None:
+    """Hash extra keys of one exact-prefix block (store and fetch agree)."""
+    if domain_key is not None:
+        domain = (_EXACT_PREFIX_DOMAIN_KEY, *domain_key)
+        return (*domain, _EXACT_PREFIX_TERMINAL_KEY) if terminal else domain
+    if split_gdn_layout:
+        return (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+    if terminal:
+        return (_EXACT_PREFIX_TERMINAL_KEY,)
+    return None
+
+
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 # Sentinel: the CacheList restore chain carries no PoolingCacheDelta
 # markers, so the caller restores the boundary member last-block-wins.
@@ -900,6 +924,7 @@ class BlockAwarePrefixCache(CacheManager):
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
         cache_covers_suffix_only: bool = False,
+        _exact_domain_key: tuple[str, ...] | None = None,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -932,6 +957,8 @@ class BlockAwarePrefixCache(CacheManager):
                 commit during prefill), never the whole sequence. Without this
                 a window longer than the stored prefix is indistinguishable
                 from a full-sequence cache.
+            _exact_domain_key: Exact-prefix mode only: isolate the whole
+                chain under this caller domain (see store_exact_prefix).
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -1194,19 +1221,26 @@ class BlockAwarePrefixCache(CacheManager):
 
             is_exact_split_block = _store_exact_terminal and split_gdn_layout
             is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
+            # A domain-isolated exact chain is reachable only through
+            # fetch_exact_prefix(): no dedup, no ordinary prefix index.
+            is_exact_domain_block = (
+                _store_exact_terminal and _exact_domain_key is not None
+            )
             is_tail_terminal = (
                 _store_tail_terminal
                 and i == num_new_blocks - 1
                 and len(block_tokens) < self.block_size
             )
             block_extra_keys: tuple[Any, ...] | None
-            if is_exact_split_block:
-                # Isolate the whole chain. Intermediate split-GDN exact-prefix
-                # blocks carry structural recurrent placeholders and must never
-                # enter ordinary partial-prefix matching.
-                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
-            elif is_exact_terminal:
-                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            if is_exact_split_block or is_exact_terminal or is_exact_domain_block:
+                # Split-GDN exact chains are isolated as a whole: their
+                # intermediate blocks carry structural recurrent placeholders
+                # and must never enter ordinary partial-prefix matching.
+                block_extra_keys = _exact_block_extra_keys(
+                    terminal=is_exact_terminal,
+                    split_gdn_layout=split_gdn_layout,
+                    domain_key=_exact_domain_key,
+                )
             else:
                 block_extra_keys = resolve_block_extra_keys(
                     global_end,
@@ -1217,7 +1251,7 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Check if this block already exists (deduplication)
             if (len(block_tokens) == self.block_size or is_tail_terminal) and not (
-                is_exact_terminal or is_exact_split_block
+                is_exact_terminal or is_exact_split_block or is_exact_domain_block
             ):
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
@@ -1325,12 +1359,16 @@ class BlockAwarePrefixCache(CacheManager):
                 len(block_tokens) == self.block_size
                 and not is_exact_terminal
                 and not is_exact_split_block
+                and not is_exact_domain_block
             ):
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
                 )
             elif (
-                is_exact_terminal or is_exact_split_block or is_tail_terminal
+                is_exact_terminal
+                or is_exact_split_block
+                or is_exact_domain_block
+                or is_tail_terminal
             ) and block.block_hash is not None:
                 # Tail blocks join the parent-keyed tail index once saved.
                 self.paged_cache.cached_block_hash_to_block.insert(
@@ -1683,6 +1721,8 @@ class BlockAwarePrefixCache(CacheManager):
         tokens: list[int],
         cache_data: list[Any],
         model_cache_config: ModelCacheConfig | None = None,
+        *,
+        domain_key: tuple[str, ...] | None = None,
     ) -> BlockTable | None:
         """Persist a complete prefix, including its exact terminal boundary.
 
@@ -1691,6 +1731,12 @@ class BlockAwarePrefixCache(CacheManager):
         never the only durable copy. Split-GDN layouts domain-separate the whole
         chain and store one recurrent sidecar at the exact terminal; preceding
         blocks contain only KV slices and structural recurrent placeholders.
+
+        ``domain_key`` (strings) isolates the whole chain: only a fetch with
+        the same domain finds it, so requests with identical tokens (or
+        identical image placeholder tokens over different images) never
+        collide. The returned table's blocks are unreferenced; a caller that
+        must keep the chain takes its own block refs and SSD pins.
         """
         if not tokens or self.paged_ssd_cache is None:
             return None
@@ -1735,6 +1781,7 @@ class BlockAwarePrefixCache(CacheManager):
             model_cache_config=model_cache_config,
             hot_cache_write_back=False,
             _store_exact_terminal=True,
+            _exact_domain_key=domain_key,
         )
         if block_table is None or block_table.num_tokens != len(tokens):
             self.paged_cache.delete_block_table(request_id)
@@ -1751,7 +1798,11 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_stores += 1
         return stored_table
 
-    def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
+    def _exact_prefix_hashes(
+        self,
+        tokens: list[int],
+        domain_key: tuple[str, ...] | None = None,
+    ) -> list[tuple[BlockHash, int]]:
         """Return deterministic hashes for an exact prefix."""
         block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
         parent_hash: BlockHash | None = None
@@ -1763,12 +1814,11 @@ class BlockAwarePrefixCache(CacheManager):
 
         for block_start in range(0, len(tokens), self.block_size):
             block_tokens = tokens[block_start : block_start + self.block_size]
-            if split_gdn_layout:
-                extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
-            elif block_start == terminal_start:
-                extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
-            else:
-                extra_keys = None
+            extra_keys = _exact_block_extra_keys(
+                terminal=block_start == terminal_start,
+                split_gdn_layout=split_gdn_layout,
+                domain_key=domain_key,
+            )
             block_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
@@ -1784,13 +1834,14 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         request_id: str,
         tokens: list[int],
+        domain_key: tuple[str, ...] | None = None,
     ) -> BlockTable | None:
         """Acquire an all-or-nothing exact prefix chain from hot cache or SSD."""
         if not tokens or self.paged_ssd_cache is None:
             return None
 
         acquired_blocks: list[CacheBlock] = []
-        for block_hash, token_count in self._exact_prefix_hashes(tokens):
+        for block_hash, token_count in self._exact_prefix_hashes(tokens, domain_key):
             cached_block = self.paged_cache.cached_block_hash_to_block.get_block(
                 block_hash
             )
@@ -1837,9 +1888,10 @@ class BlockAwarePrefixCache(CacheManager):
         tokens: list[int],
         *,
         promote_to_hot_cache: bool,
+        domain_key: tuple[str, ...] | None = None,
     ) -> list[Any] | None:
         """Reconstruct a complete exact prefix and release temporary block refs."""
-        block_table = self.fetch_exact_prefix(request_id, tokens)
+        block_table = self.fetch_exact_prefix(request_id, tokens, domain_key)
         if block_table is None:
             self._exact_prefix_misses += 1
             return None

@@ -53,7 +53,7 @@ from mlx_vlm.models import cache as _vlm_cache
 
 from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
-from .cache.paged_cache import PagedCacheManager
+from .cache.paged_cache import BlockTable, PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.restore_outcome import RestoreOutcomeCounter, classify_restore_outcome
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
@@ -12098,23 +12098,50 @@ class Scheduler:
         table = manager.get_block_table(request_id)
         if not table or not table.block_ids:
             return
+        self._pin_blocks(request_id, table.block_ids)
+
+    def _pin_exact_chain(self, request_id: str, table: BlockTable) -> bool:
+        """Hold a stored exact-prefix chain (all blocks or none) for a resume.
+
+        ``store_exact_prefix`` leaves its blocks unreferenced and evictable;
+        a chain missing any block cannot be restored, so a partial pin would
+        only hold memory. Released by ``_unpin_parked``.
+        """
+        return self._pin_blocks(request_id, table.block_ids, require_all=True)
+
+    def _pin_blocks(
+        self, request_id: str, block_ids: list[int], *, require_all: bool = False
+    ) -> bool:
+        """Take one block ref per block and pin their hashes in the SSD index.
+
+        Replaces any pins ``request_id`` already holds. A block whose metadata
+        is gone is skipped, or, with ``require_all``, makes the whole pin fail
+        and give back the refs it took. Returns whether pins are now held.
+        """
+        manager = self.paged_cache_manager
+        if manager is None or not block_ids:
+            return False
         self._unpin_parked(request_id)
-        block_ids: list[int] = []
+        pinned_ids: list[int] = []
         hashes: list[bytes] = []
-        for block_id in table.block_ids:
+        for block_id in block_ids:
             if not manager.increment_ref(block_id):
+                if require_all:
+                    manager.release_for_eviction(pinned_ids)
+                    return False
                 continue
-            block_ids.append(block_id)
+            pinned_ids.append(block_id)
             block = manager.allocated_blocks.get(block_id)
             block_hash = getattr(block, "block_hash", None)
             if block_hash is not None:
                 hashes.append(bytes(block_hash))
-        if not block_ids:
-            return
-        self._park_pins[request_id] = _ParkPins(block_ids, hashes)
+        if not pinned_ids:
+            return False
+        self._park_pins[request_id] = _ParkPins(pinned_ids, hashes)
         ssd = self.paged_ssd_cache_manager
         if ssd is not None and hasattr(ssd, "pin_blocks"):
             ssd.pin_blocks(hashes)
+        return True
 
     def _unpin_parked(self, request_id: str) -> None:
         pins = self._park_pins.pop(request_id, None)
