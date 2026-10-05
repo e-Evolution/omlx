@@ -219,6 +219,45 @@ class TestGetSamplingParams:
         assert isinstance(result, tuple)
         assert len(result) == 10
 
+    def test_fields_are_named_in_tuple_order(self):
+        """The result is a named tuple: callers read fields by name, while
+        positional unpacking keeps its order."""
+        result = get_sampling_params(None, None, req_max_tokens=321)
+        assert result._fields == (
+            "temperature",
+            "top_p",
+            "top_k",
+            "repetition_penalty",
+            "min_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "max_tokens",
+            "xtc_probability",
+            "xtc_threshold",
+        )
+        assert result.max_tokens == 321
+        assert result.max_tokens == result[7]
+
+    def test_named_max_tokens_resolves_request_model_then_global(self):
+        """``.max_tokens`` follows request > model setting > global default."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ModelSettingsManager(Path(tmpdir))
+            manager.set_settings("test-model", ModelSettings(max_tokens=8192))
+            self._state.settings_manager = manager
+            self._state.sampling = SamplingDefaults(max_tokens=4096)
+
+            assert get_sampling_params(None, None, "test-model").max_tokens == 8192
+            assert (
+                get_sampling_params(
+                    None, None, "test-model", req_max_tokens=64
+                ).max_tokens
+                == 64
+            )
+            assert get_sampling_params(None, None, "other").max_tokens == 4096
+
     def test_defaults(self):
         """Test default values with no request or model params."""
         (

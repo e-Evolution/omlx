@@ -452,7 +452,7 @@ async def test_completion_route_preflights_with_the_resolved_max_tokens(monkeypa
     monkeypatch.setattr(server._server_state, "oq_manager", None)
     monkeypatch.setattr(server._server_state, "settings_manager", None)
     monkeypatch.setattr(server._server_state.sampling, "max_tokens", 777)
-    expected = server.get_sampling_params(None, None, "m")[7]
+    expected = server.get_sampling_params(None, None, "m").max_tokens
     assert expected == 777
     request = CompletionRequest(model="m", prompt="hi")
     with pytest.raises(_StopError):
