@@ -205,6 +205,36 @@ def _capture_vlm_position_state(lm: Any, extra_kwargs: dict[str, Any]) -> None:
         mx.eval(*lazy_state)
 
 
+_MEDIA_TOKEN_ID_ATTRS = (
+    "image_token_id",
+    "image_token_index",
+    "video_token_id",
+    "video_token_index",
+    "audio_token_id",
+    "audio_token_index",
+)
+
+
+def _vlm_media_end(token_ids: Any, config: Any) -> int | None:
+    """Token index just after the last image, video or audio placeholder.
+
+    Uses the same placeholder ids as the cache-boundary helpers. None when the
+    config names no media token or none appears in ``token_ids``: the
+    scheduler then keeps the external media prefill.
+    """
+    media_ids = set()
+    for attr in _MEDIA_TOKEN_ID_ATTRS:
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            media_ids.add(value)
+    if not media_ids or not isinstance(token_ids, (list, tuple)):
+        return None
+    for index in range(len(token_ids) - 1, -1, -1):
+        if token_ids[index] in media_ids:
+            return index + 1
+    return None
+
+
 def _apply_minimax_m3_thinking_mode(
     model_type: str | None,
     template_kwargs: dict[str, Any],
@@ -4745,6 +4775,14 @@ class VLMBatchedEngine(BaseEngine):
             except Exception as e:
                 logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
+    def _media_end_kwargs(self, prompt: Any, vlm_inputs_embeds: Any) -> dict[str, int]:
+        """``vlm_media_end`` for a media request's processor token ids, if known."""
+        if vlm_inputs_embeds is None:
+            return {}
+        config = getattr(self._vlm_model, "config", None)
+        media_end = _vlm_media_end(prompt, config) if config is not None else None
+        return {} if media_end is None else {"vlm_media_end": media_end}
+
     async def generate(
         self,
         prompt: str | list[int],
@@ -4837,6 +4875,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            **self._media_end_kwargs(prompt, vlm_inputs_embeds),
             tools=tools,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
@@ -4953,6 +4992,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            **self._media_end_kwargs(prompt, vlm_inputs_embeds),
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),

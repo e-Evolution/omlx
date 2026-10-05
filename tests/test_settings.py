@@ -396,6 +396,7 @@ class TestSchedulerSettings:
             "decode_fairness": True,
             "prefill_progress_commit_blocks": 0,
             "memory_pressure_park": False,
+            "media_text_suffix_chunked": False,
             "max_parks_per_request": 3,
             "park_resume_ok_polls": 3,
         }
@@ -3384,3 +3385,27 @@ class TestAbortSingleVictimSetting:
         assert default._abort_single_victim_enabled() is False
         on = ProcessMemoryEnforcer(engine_pool=MagicMock(), abort_single_victim=True)
         assert on._abort_single_victim_enabled() is True
+
+
+class TestMediaTextSuffixChunkedSetting:
+    """scheduler.media_text_suffix_chunked: off by default, reaches the config."""
+
+    def test_defaults_off_and_round_trips(self):
+        assert SchedulerSettings.from_dict({}).media_text_suffix_chunked is False
+        on = SchedulerSettings.from_dict({"media_text_suffix_chunked": True})
+        assert on.media_text_suffix_chunked is True
+        assert on.to_dict()["media_text_suffix_chunked"] is True
+        junk = SchedulerSettings.from_dict({"media_text_suffix_chunked": "yes"})
+        assert junk.media_text_suffix_chunked is False
+
+    def test_reaches_scheduler_config(self, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        assert settings.to_scheduler_config().media_text_suffix_chunked is False
+        settings.scheduler.media_text_suffix_chunked = True
+        assert settings.to_scheduler_config().media_text_suffix_chunked is True
+
+    def test_env_override(self, tmp_path):
+        env = {"OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            settings = GlobalSettings.load(base_path=tmp_path)
+        assert settings.scheduler.media_text_suffix_chunked is True
