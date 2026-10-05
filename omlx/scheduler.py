@@ -67,6 +67,9 @@ from .exceptions import (
 from . import debug_numerics as _debug_numerics
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import (
+    handoff_singleton_mtp_for_pause as _mtp_pause_handoff,
+)
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
@@ -1281,6 +1284,12 @@ class _DecodeResume:
     stop_matcher: Any = None
 
 
+# Step starts a decode pause waits for a Lightning MTP queue to drain to one
+# token (it drains by one per step, so this only bounds a stuck queue).
+_DECODE_PAUSE_MAX_DEFERRED_STEPS = 32
+_PAUSE_DEFERRED = "deferred"
+
+
 class _DecodePauseDeclinedError(Exception):
     """A decode pause cannot proceed; the row keeps decoding (message: why)."""
 
@@ -2228,6 +2237,8 @@ class Scheduler:
         # drained at step start) and the resume record of each paused row.
         self._pending_decode_pauses: set[str] = set()
         self._decode_resumes: dict[str, _DecodeResume] = {}
+        # Step starts each pending pause has waited for an MTP queue to drain.
+        self._decode_pause_deferrals: dict[str, int] = {}
         self._park_stats: dict[str, int] = {
             "parks": 0,
             "resumes": 0,
@@ -11421,11 +11432,10 @@ class Scheduler:
             return "decoding row is not in the generation batch"
         if _block_drafter_for(self.model) is not None:
             return "DFlash drafter state is not handed off on a decode pause"
-        if (
-            getattr(generation_batch, "_omlx_mtp_state", None) is not None
-            or getattr(generation_batch, "_omlx_mtp_batch_state", None) is not None
-        ):
-            return "MTP speculative decode is active (its queue is not handed off)"
+        # A singleton Lightning MTP row hands off to the standard step at the
+        # pause; the multi-row batch state has no such handoff (v1).
+        if getattr(generation_batch, "_omlx_mtp_batch_state", None) is not None:
+            return "batched Lightning MTP decode is active (no pause handoff)"
         prefix_cache = self.block_aware_cache
         if prefix_cache is None or self.paged_ssd_cache_manager is None:
             return "no paged SSD cache to hold the exact prefix"
@@ -11561,19 +11571,23 @@ class Scheduler:
 
     def _process_pending_decode_pauses(self, output: SchedulerOutput | None) -> bool:
         acted = False
-        while self._pending_decode_pauses:
-            # The id stays pending until its pause has run, so the enforcer's
-            # drain probe never sees a pause in progress as finished.
-            rid = next(iter(list(self._pending_decode_pauses)))
+        # An id stays pending until its pause has run (or waits for an MTP
+        # queue), so the enforcer's drain probe never sees it as finished.
+        for rid in list(self._pending_decode_pauses):
+            outcome = None
             try:
-                acted = self._process_one_decode_pause(rid, output) or acted
+                outcome = self._process_one_decode_pause(rid, output)
             finally:
-                self._pending_decode_pauses.discard(rid)
+                if outcome != _PAUSE_DEFERRED:
+                    self._pending_decode_pauses.discard(rid)
+                    self._decode_pause_deferrals.pop(rid, None)
+            acted = acted or outcome == "paused"
         return acted
 
     def _process_one_decode_pause(
         self, rid: str, output: SchedulerOutput | None
-    ) -> bool:
+    ) -> str | None:
+        """Run one requested pause: "paused", ``_PAUSE_DEFERRED`` or None."""
         request = self.requests.get(rid)
         if (
             request is None
@@ -11585,11 +11599,28 @@ class Scheduler:
         reason = self._park_exclusion_reason(request)
         if reason is not None:
             logger.info("Decode pause skipped for %s: %s", rid, reason)
-            return False
-        if not self._pause_decoding_request(request, output):
-            return False
+            return None
+        outcome = self._pause_decoding_request(request, output)
+        if outcome == _PAUSE_DEFERRED:
+            waited = self._decode_pause_deferrals.get(rid, 0) + 1
+            if waited <= _DECODE_PAUSE_MAX_DEFERRED_STEPS:
+                self._decode_pause_deferrals[rid] = waited
+                return _PAUSE_DEFERRED
+            self._decode_pause_failed(
+                request,
+                None,
+                _DecodePauseDeclinedError(
+                    "the Lightning MTP queue did not drain within "
+                    f"{_DECODE_PAUSE_MAX_DEFERRED_STEPS} steps"
+                ),
+                emitted=False,
+                out=output,
+            )
+            return None
+        if outcome is not True:
+            return None
         self._polls_since_park = 0
-        return True
+        return "paused"
 
     def select_decode_pause_victim(self) -> MemoryVictim | None:
         """Pick the decoding row whose pause frees the most memory.
@@ -11655,8 +11686,12 @@ class Scheduler:
 
     def _pause_decoding_request(
         self, request: Request, output: SchedulerOutput | None
-    ) -> bool:
+    ) -> bool | str:
         """Pause one decoding row exactly; True when it was paused.
+
+        A singleton Lightning MTP row first hands off to the standard step
+        (``_PAUSE_DEFERRED`` while more than one committed token is queued),
+        which defines the pending token and keeps the KV exact.
 
         After ``GenerationBatch.next()`` the row's KV holds every emitted
         token and ``_next_tokens[row]`` is sampled but not emitted. The
@@ -11679,6 +11714,13 @@ class Scheduler:
         try:
             uid = self.request_id_to_uid[rid]
             generation_batch = self._generation_batch()
+            handoff = _mtp_pause_handoff(generation_batch)
+            if handoff == "deferred":
+                return _PAUSE_DEFERRED
+            if handoff == "failed":
+                raise _DecodePauseDeclinedError(
+                    "the Lightning MTP row could not hand off to standard decode"
+                )
             _safe_sync_stream(self._stream)
             row = generation_batch.uids.index(uid)
             with mx.stream(self._stream):
@@ -12300,6 +12342,7 @@ class Scheduler:
         self._clear_request_admission_bookkeeping(request_id)
         self._unpin_parked(request_id)
         self._pending_decode_pauses.discard(request_id)
+        self._decode_pause_deferrals.pop(request_id, None)
         self._decode_resumes.pop(request_id, None)
         # A deferred pin step must not re-pin an aborted request's blocks.
         request.parked = False
@@ -15731,6 +15774,7 @@ class Scheduler:
             self._unpin_parked(parked_id)
         self._pending_decode_pauses.clear()
         self._decode_resumes.clear()
+        self._decode_pause_deferrals.clear()
         self._park_requested = False
         self._polls_since_park = None
         self._park_resumed_this_pass = False
