@@ -69,12 +69,14 @@ from ..utils.video import (
     write_video_data_uri,
 )
 from .base import (
+    ENGINE_DEFAULT_MAX_TOKENS,
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
     _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    preflight_max_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -4760,7 +4762,7 @@ class VLMBatchedEngine(BaseEngine):
     async def generate(
         self,
         prompt: str | list[int],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -4869,7 +4871,7 @@ class VLMBatchedEngine(BaseEngine):
     async def stream_generate(
         self,
         prompt: str | list[int],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -5021,7 +5023,7 @@ class VLMBatchedEngine(BaseEngine):
     async def chat(
         self,
         messages: list[dict[str, Any]],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
@@ -5229,7 +5231,7 @@ class VLMBatchedEngine(BaseEngine):
             num_prompt_tokens=num_tokens,
             request_id=request_id,
             text_only=image_tokens == 0 and video_tokens == 0,
-            max_tokens=kwargs.get("max_tokens"),
+            max_tokens=preflight_max_tokens(kwargs),
         )
 
     async def preflight_completion(
@@ -5266,13 +5268,13 @@ class VLMBatchedEngine(BaseEngine):
             num_prompt_tokens=num_tokens,
             request_id=request_id,
             text_only=True,
-            max_tokens=kwargs.get("max_tokens"),
+            max_tokens=preflight_max_tokens(kwargs),
         )
 
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
-        max_tokens: int = 256,
+        max_tokens: int = ENGINE_DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         top_k: int = 0,
