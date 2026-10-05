@@ -15,6 +15,7 @@ import pytest
 import test_scheduler_decode_pause as dp
 import test_scheduler_park as park
 
+import omlx.scheduler as scheduler_module
 from omlx.adapter.output_parser import (
     OutputParserFactory,
     OutputParserFinalizeResult,
@@ -365,5 +366,115 @@ def test_a_parser_stop_on_the_pending_token_deletes_the_chain_it_stored(
             assert not rig.ssd.has_block(block_hash)
         assert not scheduler._park_pins and rig.ssd.pinned_block_count == 0
         assert request.park_count == 0
+    finally:
+        rig.close()
+
+
+# --- Lightning MTP handoff -----------------------------------------------------------
+
+
+def test_a_singleton_mtp_row_is_pausable(tmp_path):
+    rig = dp.make_rig(tmp_path)
+    try:
+        (a,) = [submit(rig, "a", PROMPT, 80, arrival=1.0)]
+        step_until_decoding(rig, [a])
+        batch = rig.scheduler.batch_generator._generation_batch
+        batch._omlx_mtp_state = object()
+        try:
+            assert rig.scheduler._park_exclusion_reason(a) is None
+        finally:
+            del batch._omlx_mtp_state
+    finally:
+        rig.close()
+
+
+def _scripted_handoff(monkeypatch, script):
+    """Replace the MTP handoff with scripted answers; record each call."""
+    calls = []
+
+    def handoff(batch):
+        calls.append(batch)
+        return script[min(len(calls), len(script)) - 1]
+
+    monkeypatch.setattr(scheduler_module, "_mtp_pause_handoff", handoff)
+    return calls
+
+
+def test_the_pause_waits_for_the_mtp_queue_then_resumes_identically(
+    tmp_path, monkeypatch
+):
+    base_outputs, (base_row,) = dp.baseline_outputs(tmp_path, 60)
+    rig = dp.make_rig(tmp_path / "paused")
+    try:
+        scheduler = rig.scheduler
+        calls = _scripted_handoff(monkeypatch, ["deferred", "deferred", "handed_off"])
+        request = submit(rig, "a", PROMPT, 60, arrival=1.0)
+        outputs = []
+        dp.step_until_outputs(rig, request, 5, outputs)
+
+        assert scheduler.request_decode_pause("a") is True
+        for _ in range(2):  # queue still deep: the row keeps decoding
+            before = len(request.output_token_ids)
+            outputs.extend(park.step(rig))
+            assert "a" in scheduler.running and not request.parked
+            assert len(request.output_token_ids) == before + 1
+            assert scheduler.decode_pause_status("a") == "pending"
+        outputs.extend(park.step(rig))  # drained: handed off, then paused
+        assert len(calls) == 3
+        # Paused (and, with nothing else admitted, resumed in the same step).
+        assert request.park_count == 1
+        assert scheduler.get_park_stats()["decode_pauses"] == 1
+
+        park.finish_ok_polls(rig, 3)
+        outputs.extend(park.run_to_completion(rig, [request], limit=400))
+        dp.assert_identical_stream(base_outputs, base_row, outputs, request)
+    finally:
+        rig.close()
+
+
+def test_a_failed_mtp_handoff_declines_and_keeps_decoding(
+    tmp_path, monkeypatch, caplog
+):
+    (expected,) = dp.baseline(tmp_path, 40)
+    rig = dp.make_rig(tmp_path / "paused")
+    try:
+        scheduler = rig.scheduler
+        _scripted_handoff(monkeypatch, ["failed"])
+        request = submit(rig, "a", PROMPT, 40, arrival=1.0)
+        outputs = []
+        dp.step_until_outputs(rig, request, 5, outputs)
+        assert scheduler.request_decode_pause("a") is True
+        with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+            outputs.extend(park.step(rig))
+        assert "could not hand off to standard decode" in caplog.text
+        assert scheduler.decode_pause_status("a") == "declined"
+        assert not request.parked and rig.ssd.pinned_block_count == 0
+        outputs.extend(park.run_to_completion(rig, [request]))
+        assert list(request.output_token_ids) == expected
+        assert dp.streamed_tokens(outputs, "a") == expected
+    finally:
+        rig.close()
+
+
+def test_an_mtp_queue_that_never_drains_declines_after_a_bounded_wait(
+    tmp_path, monkeypatch, caplog
+):
+    rig = dp.make_rig(tmp_path)
+    try:
+        scheduler = rig.scheduler
+        calls = _scripted_handoff(monkeypatch, ["deferred"])
+        request = submit(rig, "a", PROMPT, 200, arrival=1.0)
+        dp.step_until_outputs(rig, request, 3, [])
+        assert scheduler.request_decode_pause("a") is True
+        bound = scheduler_module._DECODE_PAUSE_MAX_DEFERRED_STEPS
+        with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+            park.step(rig, bound)
+            assert scheduler.decode_pause_status("a") == "pending"
+            park.step(rig)
+        assert len(calls) == bound + 1
+        assert scheduler.decode_pause_status("a") == "declined"
+        assert "queue did not drain" in caplog.text
+        assert "a" in scheduler.running and not request.parked
+        assert not scheduler._pending_decode_pauses
     finally:
         rig.close()

@@ -206,7 +206,7 @@ def test_a_decoding_row_is_pausable_when_nothing_excludes_it(tmp_path):
     [
         ("specprefill", "SpecPrefill"),
         ("dflash", "DFlash"),
-        ("mtp", "MTP"),
+        ("mtp", "batched Lightning MTP"),
         ("vlm_mtp", "VLM-MTP"),
         ("no_ssd", "no paged SSD cache"),
         ("budget", "park budget spent"),
@@ -226,7 +226,8 @@ def test_v1_exclusions_name_why_a_decoding_row_cannot_pause(
                 scheduler_module, "_block_drafter_for", lambda model: object()
             )
         elif case == "mtp":
-            scheduler.batch_generator._generation_batch._omlx_mtp_state = object()
+            batch = scheduler.batch_generator._generation_batch
+            batch._omlx_mtp_batch_state = object()
         elif case == "vlm_mtp":
             uid = scheduler.request_id_to_uid["a"]
             scheduler.request_id_to_uid["a"] = -7
@@ -238,7 +239,7 @@ def test_v1_exclusions_name_why_a_decoding_row_cannot_pause(
         assert reason is not None and expected in reason
         assert scheduler.request_decode_pause("a") is False
         if case == "mtp":
-            del scheduler.batch_generator._generation_batch._omlx_mtp_state
+            del scheduler.batch_generator._generation_batch._omlx_mtp_batch_state
         if case == "vlm_mtp":
             scheduler.request_id_to_uid["a"] = uid
     finally:
