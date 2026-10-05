@@ -1822,3 +1822,534 @@ def test_collect_setup_records_p7_params_and_override():
     setup = bp.collect_setup(args, Srv())
     assert setup["p7"]["mode"] == "image"
     assert setup["settings_override"]["memory"]["memory_guard_tier"] == "custom"
+
+
+# --------------------------------------------------------------------------
+# C7: pause-resume cycle validation (decode pressure, images, never-fits)
+# --------------------------------------------------------------------------
+
+C7_LOG = """\
+2026-10-05 10:00:01,000 - omlx.process_memory_enforcer - INFO - [-] - Memory pressure level: soft -> hard (current=34.0GB, soft=33.6GB, hard=33.6GB, ceiling=42.0GB)
+2026-10-05 10:00:01,100 - omlx.process_memory_enforcer - WARNING - [-] - Hard memory pressure: pausing decoding victim rid-a instead of aborting (120000 tokens, ~9.5 GB) on 'm'; 2 request(s) kept
+2026-10-05 10:00:02,000 - omlx.scheduler - INFO - [-] - Paused decoding request rid-a at 120640 tokens (prompt 120000 + output 640), stored exact prefix
+2026-10-05 10:00:02,500 - omlx.process_memory_enforcer - INFO - [-] - Hard memory pressure: waiting for victim rid-a memory to drain on 'm' (poll 1/10, hard 34.0GB)
+2026-10-05 10:00:03,000 - omlx.scheduler - INFO - [-] - Parked request rid-a waiting: need 12.3 GB, free 4.1 GB
+2026-10-05 10:00:20,000 - omlx.scheduler - INFO - [-] - Resuming parked request rid-a: need 12.3 GB fits in free 13.0 GB
+2026-10-05 10:00:21,000 - omlx.scheduler - INFO - [-] - Resumed decoding request rid-a: restored 120640 tokens exactly
+2026-10-05 10:00:30,000 - omlx.process_memory_enforcer - WARNING - [-] - Hard memory pressure: aborted 1 victim rid-b (90000 tokens, ~7.0 GB) on 'm'; 1 request(s) kept
+2026-10-05 10:00:40,000 - omlx.process_memory_enforcer - WARNING - [-] - Hard memory pressure: aborted 3 request(s) on 'm' and kept model loaded
+2026-10-05 10:00:41,000 - omlx.scheduler - INFO - [-] - Parked request rid-c at 24576 tokens committed (park 1/3), reason: memory pressure
+2026-10-05 10:00:42,000 - omlx.scheduler - INFO - [-] - Resumed parked request rid-c: cached=24576
+"""
+
+
+class TestParseC7Events:
+    def test_each_new_line_becomes_one_event_in_order(self):
+        ev = bm.parse_c7_events(C7_LOG)
+        kinds = [e["kind"] for e in ev]
+        assert kinds == [
+            "pressure",
+            "victim_pause",
+            "decode_paused",
+            "drain_wait",
+            "park_wait",
+            "resume_fit",
+            "decode_resumed",
+            "victim_abort",
+            "abort_all",
+            "parked",
+            "resumed",
+        ]
+
+    def test_fields(self):
+        ev = {e["kind"]: e for e in bm.parse_c7_events(C7_LOG)}
+        assert ev["decode_paused"]["rid"] == "rid-a"
+        assert ev["decode_paused"]["tokens"] == 120640
+        assert ev["decode_paused"]["prompt"] == 120000
+        assert ev["decode_paused"]["output"] == 640
+        assert ev["decode_resumed"]["restored"] == 120640
+        assert ev["victim_pause"]["rid"] == "rid-a"
+        assert ev["victim_pause"]["tokens"] == 120000
+        assert ev["victim_abort"]["rid"] == "rid-b"
+        assert ev["abort_all"]["n"] == 3
+        assert ev["drain_wait"]["rid"] == "rid-a"
+        assert (ev["park_wait"]["need_gb"], ev["park_wait"]["free_gb"]) == (12.3, 4.1)
+        assert (ev["resume_fit"]["need_gb"], ev["resume_fit"]["free_gb"]) == (12.3, 13.0)
+        assert ev["decode_paused"]["ts"] is not None
+
+    def test_old_parser_ignores_new_lines(self):
+        assert [e["kind"] for e in bm.parse_park_events(C7_LOG)] == [
+            "pressure",
+            "parked",
+            "resumed",
+        ]
+
+    def test_waiting_line_is_not_a_prefill_park(self):
+        ev = bm.parse_c7_events(
+            "x - Parked request r1 waiting: need 1.0 GB, free 0.5 GB\n"
+        )
+        assert [e["kind"] for e in ev] == ["park_wait"]
+
+
+def _c7req(name, ptok, ok=True, text="a b c", times=None, **kw):
+    return {
+        "name": name,
+        "ok": ok,
+        "error": None if ok else "aborted",
+        "prompt_tokens": ptok,
+        "completion_tokens": 3,
+        "cached_tokens": 0,
+        "text": text,
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "ttft_s": 1.0,
+        "chunk_times": times if times is not None else [1.0, 1.1, 1.2],
+        **kw,
+    }
+
+
+class TestC7Attribution:
+    def test_decode_pause_matched_by_unique_prompt_tokens(self):
+        ev = bm.parse_c7_events(C7_LOG)
+        reqs = [_c7req("req0", 120000), _c7req("req1", 90000)]
+        got = bm.attribute_decode_pauses(ev, reqs)
+        assert got["req0"] == {"pauses": 1, "resumes": 1, "restored": [120640]}
+        assert "req1" not in got
+
+    def test_ambiguous_prompt_tokens_are_left_out(self):
+        ev = bm.parse_c7_events(C7_LOG)
+        reqs = [_c7req("req0", 120000), _c7req("req1", 120000)]
+        assert bm.attribute_decode_pauses(ev, reqs) == {}
+
+
+class TestMaxDecodeStall:
+    def test_largest_gap(self):
+        assert bm.max_decode_stall([1.0, 1.1, 4.1, 4.2]) == pytest.approx(3.0)
+
+    def test_none_when_fewer_than_two_chunks(self):
+        assert bm.max_decode_stall([]) is None
+        assert bm.max_decode_stall([1.0]) is None
+
+
+class TestIdentityVerdict:
+    def test_identical(self):
+        v = bm.identity_verdict(_c7req("a", 1, text="x y z"), _c7req("b", 1, text="x y z"))
+        assert v["identical"] is True
+        assert v["first_divergence_chars"] is None
+        assert v["classification"] is None
+
+    def test_divergence_without_logprobs_is_unclassified(self):
+        v = bm.identity_verdict(_c7req("a", 1, text="x y z"), _c7req("b", 1, text="x y q"))
+        assert v["identical"] is False
+        assert v["first_divergence_chars"] == 4
+        assert v["classification"] == "unclassified"
+
+    def test_near_tie_divergence_is_noise(self):
+        ref = [{"t": 1, "lp": -0.1, "top": [[1, -0.1], [2, -0.2]]}] * 3 + [
+            {"t": 5, "lp": -0.7, "top": [[5, -0.7], [6, -0.8]]}
+        ]
+        test = [dict(r) for r in ref]
+        test[3] = {"t": 6, "lp": -0.8, "top": [[5, -0.7], [6, -0.8]]}
+        v = bm.identity_verdict(
+            _c7req("a", 1, text="x y z"),
+            _c7req("b", 1, text="x y q"),
+            ref_lp=ref,
+            test_lp=test,
+        )
+        assert v["classification"] == "noise"
+        assert v["div_token"] == 3
+
+    def test_large_margin_divergence_is_bug(self):
+        ref = [{"t": 5, "lp": -0.1, "top": [[5, -0.1], [6, -4.0]]}]
+        test = [{"t": 6, "lp": -4.0, "top": [[5, -0.1], [6, -4.0]]}]
+        v = bm.identity_verdict(
+            _c7req("a", 1, text="x"), _c7req("b", 1, text="y"), ref_lp=ref, test_lp=test
+        )
+        assert v["classification"] == "bug"
+
+
+NF_FIELDS = {
+    "required_bytes": 90_000_000_000,
+    "capacity_bytes": 42_000_000_000,
+    "weights_bytes": 17_000_000_000,
+    "kv_bytes_per_token": 60_000,
+    "requested_context_tokens": 60_000,
+    "requested_max_tokens": 2_000_000,
+    "max_viable_context_tokens": 400_000,
+    "retryable": False,
+}
+
+
+def _nf_body(**over):
+    err = {"omlx_code": "context_exceeds_capacity", **NF_FIELDS, **over}
+    return {"type": "error", "error": err}
+
+
+class TestEvaluateNeverFits:
+    def test_structured_error_is_correct(self):
+        r = bm.evaluate_never_fits(400, _nf_body(), 1.2, [])
+        assert r["correct"] is True
+        assert r["reasons"] == []
+        assert r["fields"]["max_viable_context_tokens"] == 400_000
+
+    def test_wrong_status_or_code(self):
+        r = bm.evaluate_never_fits(500, _nf_body(), 1.0, [])
+        assert r["correct"] is False
+        assert any("status" in x for x in r["reasons"])
+        body = _nf_body()
+        body["error"]["omlx_code"] = "prefill_memory_exceeded"
+        r = bm.evaluate_never_fits(400, body, 1.0, [])
+        assert any("omlx_code" in x for x in r["reasons"])
+
+    def test_missing_field_and_retryable(self):
+        body = _nf_body(retryable=True)
+        del body["error"]["weights_bytes"]
+        r = bm.evaluate_never_fits(400, body, 1.0, [])
+        assert any("weights_bytes" in x for x in r["reasons"])
+        assert any("retryable" in x for x in r["reasons"])
+
+    def test_inconsistent_numbers(self):
+        r = bm.evaluate_never_fits(
+            400, _nf_body(required_bytes=1, capacity_bytes=2), 1.0, []
+        )
+        assert any("required_bytes" in x for x in r["reasons"])
+
+    def test_park_events_or_slow_answer_fail(self):
+        ev = bm.parse_c7_events(C7_LOG)
+        r = bm.evaluate_never_fits(400, _nf_body(), 1.0, ev)
+        assert any("park" in x or "pause" in x for x in r["reasons"])
+        r = bm.evaluate_never_fits(400, _nf_body(), 999.0, [])
+        assert any("admission" in x for x in r["reasons"])
+
+    def test_non_dict_body(self):
+        r = bm.evaluate_never_fits(None, None, 120.0, [])
+        assert r["correct"] is False
+
+
+def _c7sum(scenario, reqs, log=C7_LOG, **kw):
+    return bm.summarize_c7(scenario, reqs, bm.parse_c7_events(log), **kw)
+
+
+class TestSummarizeC7:
+    def test_counters(self):
+        reqs = [_c7req("req0", 120000), _c7req("req1", 90000, ok=False)]
+        s = _c7sum("decode", reqs, peak_gb=41.2, wall_s=300.0)
+        assert s["pauses_prefill"] == 1
+        assert s["pauses_decode"] == 1
+        assert s["resumes_prefill"] == 1
+        assert s["resumes_decode"] == 1
+        assert s["restored_tokens"] == 120640
+        assert s["aborts_single"] == 1
+        assert s["aborts_all"] == 3
+        assert s["completions"] == 1
+        assert s["aborted_requests"] == 1
+        assert s["peak_gb"] == 41.2
+        assert s["wall_s"] == 300.0
+        assert s["hard_pressure_seen"] is True
+
+    def test_rows_carry_pause_attribution_and_stall(self):
+        reqs = [_c7req("req0", 120000, times=[1.0, 1.1, 6.1])]
+        s = _c7sum("decode", reqs)
+        row = s["rows"][0]
+        assert row["decode_pauses"] == 1
+        assert row["max_decode_stall_s"] == pytest.approx(5.0)
+        assert s["max_decode_stall_s"] == pytest.approx(5.0)
+
+    def test_identity_rollup(self):
+        ident = {
+            "req0": {"identical": True, "paused": True, "classification": None},
+            "req1": {"identical": False, "paused": True, "classification": "noise"},
+            "req2": {"identical": False, "paused": False, "classification": "bug"},
+        }
+        s = _c7sum("decode", [_c7req("req0", 120000)], identity=ident)
+        assert s["identity"] == {
+            "checked": 3,
+            "paused_checked": 2,
+            "identical": 1,
+            "noise": 1,
+            "bug": 1,
+            "inconclusive": 0,
+            "unclassified": 0,
+        }
+
+    def test_never_fits_correctness_passthrough(self):
+        s = _c7sum("never-fits", [], log="", never_fits={"correct": True})
+        assert s["never_fits_correct"] is True
+        assert s["verdict"] == "never_fits_ok"
+
+
+class TestClassifyC7:
+    def _s(self, **kw):
+        base = {
+            "aborted_requests": 0,
+            "pauses_prefill": 0,
+            "pauses_decode": 0,
+            "resumes_prefill": 0,
+            "resumes_decode": 0,
+            "hard_pressure_seen": True,
+            "all_final_ok": True,
+            "identity": {"bug": 0},
+            "never_fits_correct": None,
+        }
+        base.update(kw)
+        return base
+
+    def test_decode_ok(self):
+        s = self._s(pauses_decode=2, resumes_decode=2)
+        assert bm.classify_c7("decode", s) == "decode_pause_ok"
+        assert bm.classify_c7("image-decode", s) == "decode_pause_ok"
+
+    def test_decode_failures(self):
+        assert bm.classify_c7("decode", self._s(aborted_requests=1, pauses_decode=1, resumes_decode=1)) == "aborts"
+        assert bm.classify_c7("decode", self._s(hard_pressure_seen=False)) == "no_pressure"
+        assert bm.classify_c7("decode", self._s()) == "no_decode_pause"
+        assert bm.classify_c7("decode", self._s(pauses_decode=2, resumes_decode=1)) == "paused_not_resumed"
+        assert bm.classify_c7("decode", self._s(pauses_decode=1, resumes_decode=1, identity={"bug": 1})) == "identity_bug"
+
+    def test_image_prefill(self):
+        assert bm.classify_c7("image-prefill", self._s(pauses_prefill=1, resumes_prefill=1)) == "prefill_park_ok"
+        assert bm.classify_c7("image-prefill", self._s()) == "no_park"
+        assert bm.classify_c7("image-prefill", self._s(pauses_prefill=2, resumes_prefill=1)) == "parked_not_resumed"
+        assert bm.classify_c7("image-prefill", self._s(aborted_requests=1, pauses_prefill=1, resumes_prefill=1)) == "aborts"
+
+    def test_never_fits(self):
+        assert bm.classify_c7("never-fits", self._s(never_fits_correct=True)) == "never_fits_ok"
+        assert bm.classify_c7("never-fits", self._s(never_fits_correct=False)) == "never_fits_wrong"
+
+    def test_unknown_scenario(self):
+        with pytest.raises(ValueError):
+            bm.classify_c7("nope", self._s())
+
+
+class TestC7Defaults:
+    def test_decode_defaults_match_the_p7_standard_config(self):
+        d = bm.c7_defaults("decode")
+        assert d["ceiling_gb"] == 42.0
+        assert d["hard_threshold"] == 0.8
+        assert d["max_tokens"] >= 1500
+        assert d["requests"] == 3
+
+    def test_unknown(self):
+        with pytest.raises(ValueError):
+            bm.c7_defaults("x")
+
+
+class _C7Resp:
+    def __init__(self, status, body, headers=None):
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+
+    async def aread(self):
+        import json as _json
+
+        return _json.dumps(self._body).encode()
+
+    def json(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class TestScenarioC7:
+    def _ctx(self, kind, fail=(), paused_log=C7_LOG, nf=None):
+        import argparse
+        import asyncio
+
+        calls = []
+        posts = []
+
+        class Srv:
+            base_url = "http://x"
+            dump_dir = None
+
+            def log_size(self):
+                return 0
+
+            def log_since(self, off):
+                return paused_log
+
+            def headers(self):
+                return {}
+
+        class Corpus:
+            def prompt(self, seed, n):
+                return f"PROMPT[{seed}:{n}]"
+
+        class Client:
+            def stream(self, method, url, json=None, headers=None):
+                posts.append(("stream", url, json))
+                return _C7Resp(
+                    nf[0] if nf else 400,
+                    nf[1] if nf else _nf_body(),
+                    {"X-oMLX-Max-Context-Tokens": "400000"},
+                )
+
+            async def post(self, url, json=None, headers=None, timeout=None):
+                posts.append(("post", url, json))
+                return _C7Resp(200, {}, {"X-oMLX-Max-Context-Tokens": "400000"})
+
+            async def get(self, url, headers=None, params=None, timeout=None):
+                posts.append(("get", url, params))
+                return _C7Resp(200, {"available": True, "max_viable_context_tokens": 400000})
+
+        class Ctx:
+            server = Srv()
+            corpus = Corpus()
+            client = Client()
+            args = argparse.Namespace(
+                c7_scenario=kind,
+                c7_requests=3,
+                c7_stagger_s=0.0,
+                c7_max_tokens=2000,
+                c7_warm_tokens=2000,
+                c7_never_prompt_tokens=60000,
+                c7_never_max_tokens=2_000_000,
+                c7_no_identity=False,
+                p7_ceiling_gb=42.0,
+                settle_s=0.0,
+                smoke=False,
+            )
+
+            def n(self, nominal):
+                return nominal
+
+            def mt(self, nominal):
+                return nominal
+
+            def seed(self, *parts):
+                return "|".join(map(str, parts))
+
+            async def chat(self, prompt, max_tokens, sampling=None, **kw):
+                name = kw["name"]
+                calls.append((name, prompt, max_tokens, sampling))
+                idx = int(name[3]) if name.startswith("req") else 0
+                ptok = {0: 120000, 1: 90000, 2: 100000}.get(idx, 1000)
+                return _c7req(
+                    name,
+                    ptok,
+                    ok=name not in fail,
+                    text="alpha beta gamma",
+                )
+
+        return Ctx(), calls, posts, asyncio
+
+    def test_decode_runs_pressure_phase_then_alone_references_greedy(self):
+        ctx, calls, _, asyncio = self._ctx("decode")
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        names = [c[0] for c in calls]
+        assert names[:3] == ["req0", "req1", "req2"]
+        assert names[3:] == ["req0-ref", "req1-ref", "req2-ref"]
+        assert all(c[3] == bp.SAMPLING_GREEDY for c in calls)
+        assert all(c[2] == 2000 for c in calls)
+        assert sc["summary"]["identity"]["checked"] == 3
+        assert sc["summary"]["pauses_decode"] == 1
+        assert sc["summary"]["rows"][0]["decode_pauses"] == 1
+        assert sc["identity"]["req0"]["paused"] is True
+        assert sc["identity"]["req1"]["paused"] is False
+        assert all("text" not in r and "chunk_times" not in r for r in sc["requests"])
+        assert bp.scenario_ok("C7", sc) is True
+
+    def test_no_identity_flag_skips_references(self):
+        ctx, calls, _, asyncio = self._ctx("decode")
+        ctx.args.c7_no_identity = True
+        asyncio.run(bp.scenario_c7(ctx))
+        assert not any(c[0].endswith("-ref") for c in calls)
+
+    def test_failed_request_is_not_reissued_and_fails_scenario(self):
+        ctx, calls, _, asyncio = self._ctx("decode", fail={"req1"})
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert not any("reissue" in c[0] for c in calls)
+        assert "req1-ref" not in [c[0] for c in calls]
+        assert sc["summary"]["aborted_requests"] == 1
+        assert bp.scenario_ok("C7", sc) is False
+
+    def test_image_decode_puts_an_image_in_every_prompt(self):
+        ctx, calls, _, asyncio = self._ctx("image-decode")
+        asyncio.run(bp.scenario_c7(ctx))
+        prompts = [c[1] for c in calls if c[0] in ("req0", "req1", "req2")]
+        assert all(p[1]["type"] == "image_url" for p in prompts)
+        assert len({p[1]["image_url"]["url"] for p in prompts}) == 3
+
+    def test_image_prefill_warms_each_image_prefix_first(self):
+        ctx, calls, _, asyncio = self._ctx("image-prefill")
+        ctx.args.c7_max_tokens = 32
+        asyncio.run(bp.scenario_c7(ctx))
+        names = [c[0] for c in calls]
+        assert names[:3] == ["warm0", "warm1", "warm2"]
+        assert names[3:6] == ["req0", "req1", "req2"]
+        assert not any(n.endswith("-ref") for n in names)
+        warm = calls[0][1]
+        long_ = calls[3][1]
+        assert warm[1] == long_[1]  # same image part
+        assert long_[2]["text"].startswith(warm[2]["text"])  # text suffix after it
+        assert len(long_[2]["text"]) > len(warm[2]["text"])
+
+    def test_never_fits_checks_status_body_capacity_and_header(self):
+        ctx, calls, posts, asyncio = self._ctx("never-fits", paused_log="")
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        body = next(p[2] for p in posts if p[0] == "stream")
+        assert body["max_tokens"] == 2_000_000
+        assert any(p[0] == "get" and "omlx/capacity" in p[1] for p in posts)
+        assert sc["never_fits"]["status"] == 400
+        assert sc["capacity"]["status"] == 200
+        assert sc["max_context_header"] == "400000"
+        assert sc["followup"]["ok"] is True
+        assert sc["summary"]["never_fits_correct"] is True
+        assert sc["summary"]["verdict"] == "never_fits_ok"
+        assert bp.scenario_ok("C7", sc) is True
+
+    def test_never_fits_wrong_status_fails_scenario(self):
+        ctx, _, _, asyncio = self._ctx("never-fits", nf=(500, {"error": {}}), paused_log="")
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert sc["summary"]["never_fits_correct"] is False
+        assert bp.scenario_ok("C7", sc) is False
+
+
+    def test_never_fits_with_park_events_in_the_window_is_wrong(self):
+        ctx, _, _, asyncio = self._ctx("never-fits")  # window holds park events
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert sc["summary"]["never_fits_correct"] is False
+
+
+class TestC7Wiring:
+    def test_registered_opt_in_with_concurrency_three(self):
+        assert "C7" in bp.SCENARIOS
+        assert bp.PREMISE_CONCURRENCY["C7"] == 3
+        assert "C7" not in bp.ALL_PREMISES
+
+    def test_logprob_dump_enabled_for_c7_on_non_upstream_only(self, tmp_path):
+        assert "OMLX_DEBUG_LOGPROB_DUMP" in bp.debug_env("fork", "C7", tmp_path)
+        assert bp.debug_env("upstream", "C7", tmp_path) == {}
+
+    def test_cli_defaults_fill_from_the_scenario(self):
+        a = bp.resolve_c7_args(
+            __import__("argparse").Namespace(
+                c7_scenario="decode",
+                p7_ceiling_gb=None,
+                p7_hard_threshold=None,
+                c7_stagger_s=None,
+                c7_max_tokens=None,
+                c7_requests=None,
+            )
+        )
+        assert (a.p7_ceiling_gb, a.p7_hard_threshold) == (42.0, 0.8)
+        assert a.c7_max_tokens >= 1500 and a.c7_requests == 3
+
+    def test_cli_overrides_win(self):
+        a = bp.resolve_c7_args(
+            __import__("argparse").Namespace(
+                c7_scenario="decode",
+                p7_ceiling_gb=30.0,
+                p7_hard_threshold=0.7,
+                c7_stagger_s=2.0,
+                c7_max_tokens=100,
+                c7_requests=2,
+            )
+        )
+        assert (a.p7_ceiling_gb, a.p7_hard_threshold, a.c7_max_tokens) == (30.0, 0.7, 100)
+

@@ -400,6 +400,388 @@ def summarize_p7(
     return summary
 
 
+# --------------------------------------------------------------------------
+# C7: pause-resume cycle validation (decode pressure, images, never-fits)
+# --------------------------------------------------------------------------
+# Log lines come from the feat/pause-resume-cycle branch:
+#   scheduler.py       "Paused decoding request", "Resumed decoding request",
+#                      "Parked request ... waiting", "Resuming parked request"
+#   process_memory_enforcer.py  "Hard memory pressure: pausing decoding victim",
+#                      "... aborted 1 victim", "... waiting for victim",
+#                      "... aborted N request(s)" (abort-all)
+
+_RE_EV_DEC_PAUSED = re.compile(
+    r"Paused decoding request (\S+) at (\d+) tokens "
+    r"\(prompt (\d+) \+ output (\d+)\), stored exact prefix"
+)
+_RE_EV_DEC_RESUMED = re.compile(
+    r"Resumed decoding request (\S+): restored (\d+) tokens exactly"
+)
+_RE_EV_VICTIM_PAUSE = re.compile(
+    r"Hard memory pressure: pausing decoding victim (\S+) instead of "
+    r"aborting \((\d+) tokens, ~([\d.]+) GB\)"
+)
+_RE_EV_VICTIM_ABORT = re.compile(
+    r"Hard memory pressure: aborted 1 victim (\S+) \((\d+) tokens, ~([\d.]+) GB\)"
+)
+_RE_EV_DRAIN = re.compile(
+    r"Hard memory pressure: waiting for victim (\S+) memory to drain"
+)
+_RE_EV_PARK_WAIT = re.compile(
+    r"Parked request (\S+) waiting: need ([\d.]+) GB, free ([\d.]+) GB"
+)
+_RE_EV_RESUME_FIT = re.compile(
+    r"Resuming parked request (\S+): need ([\d.]+) GB fits in free ([\d.]+) GB"
+)
+_RE_EV_ABORT_ALL = re.compile(r"Hard memory pressure: aborted (\d+) request\(s\) on")
+
+
+def parse_c7_events(text: str) -> list[dict[str, Any]]:
+    """Ordered pause/park/abort events: the P7 kinds plus the C7 log lines."""
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        ts = _log_ts(line)
+        m = _RE_EV_DEC_PAUSED.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "decode_paused",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "tokens": int(m.group(2)),
+                    "prompt": int(m.group(3)),
+                    "output": int(m.group(4)),
+                }
+            )
+            continue
+        m = _RE_EV_DEC_RESUMED.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "decode_resumed",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "restored": int(m.group(2)),
+                }
+            )
+            continue
+        m = _RE_EV_VICTIM_PAUSE.search(line) or _RE_EV_VICTIM_ABORT.search(line)
+        if m:
+            kind = "victim_pause" if "pausing" in line else "victim_abort"
+            events.append(
+                {
+                    "kind": kind,
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "tokens": int(m.group(2)),
+                    "est_gb": float(m.group(3)),
+                }
+            )
+            continue
+        m = _RE_EV_DRAIN.search(line)
+        if m:
+            events.append({"kind": "drain_wait", "ts": ts, "rid": m.group(1)})
+            continue
+        m = _RE_EV_PARK_WAIT.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "park_wait",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "need_gb": float(m.group(2)),
+                    "free_gb": float(m.group(3)),
+                }
+            )
+            continue
+        m = _RE_EV_RESUME_FIT.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "resume_fit",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "need_gb": float(m.group(2)),
+                    "free_gb": float(m.group(3)),
+                }
+            )
+            continue
+        m = _RE_EV_ABORT_ALL.search(line)
+        if m:
+            events.append({"kind": "abort_all", "ts": ts, "n": int(m.group(1))})
+            continue
+        events.extend(parse_park_events(line))
+    return events
+
+
+def attribute_decode_pauses(
+    events: list[dict[str, Any]], requests: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Client request name -> its decode pauses, matched by prompt tokens.
+
+    The log prints the server's prompt token count; it equals the client's
+    ``prompt_tokens`` usage. A count shared by two requests is ambiguous and
+    left out rather than guessed.
+    """
+    by_prompt: dict[int, list[str]] = {}
+    for r in requests:
+        if r.get("prompt_tokens"):
+            by_prompt.setdefault(r["prompt_tokens"], []).append(r["name"])
+    rid_name: dict[str, str] = {}
+    out: dict[str, dict[str, Any]] = {}
+    for e in events:
+        if e["kind"] != "decode_paused":
+            continue
+        names = by_prompt.get(e["prompt"], [])
+        if len(names) != 1:
+            continue
+        rid_name[e["rid"]] = names[0]
+        t = out.setdefault(names[0], {"pauses": 0, "resumes": 0, "restored": []})
+        t["pauses"] += 1
+    for e in events:
+        if e["kind"] == "decode_resumed" and e["rid"] in rid_name:
+            t = out[rid_name[e["rid"]]]
+            t["resumes"] += 1
+            t["restored"].append(e["restored"])
+    return out
+
+
+def max_decode_stall(chunk_times: list[float]) -> float | None:
+    """Largest gap between two streamed chunks of one request (seconds)."""
+    if len(chunk_times) < 2:
+        return None
+    return max(b - a for a, b in zip(chunk_times, chunk_times[1:], strict=False))
+
+
+def identity_verdict(
+    ref: dict[str, Any],
+    test: dict[str, Any],
+    ref_lp: list[dict] | None = None,
+    test_lp: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Greedy identity of a request against its uninterrupted run.
+
+    ``classification`` is None when identical; with logprob dumps it is the
+    near-tie verdict (noise / bug / inconclusive), otherwise ``unclassified``.
+    """
+    ref_text, test_text = ref.get("text") or "", test.get("text") or ""
+    div = first_divergence(ref_text, test_text)
+    out: dict[str, Any] = {
+        "identical": div is None,
+        "first_divergence_chars": div,
+        "ref_tokens": ref.get("completion_tokens"),
+        "test_tokens": test.get("completion_tokens"),
+        "classification": None,
+    }
+    if div is None:
+        return out
+    out["classification"] = "unclassified"
+    if ref_lp and test_lp:
+        cmp = compare_logprobs(ref_lp, test_lp)
+        out.update(
+            classification=classify_divergence(cmp) or "unclassified",
+            div_token=cmp["div_index"],
+            margin=cmp["margin"],
+            mean_abs_dlp=cmp["mean_abs_dlp"],
+        )
+    return out
+
+
+NEVER_FITS_FIELDS = (
+    "required_bytes",
+    "capacity_bytes",
+    "weights_bytes",
+    "kv_bytes_per_token",
+    "requested_context_tokens",
+    "requested_max_tokens",
+    "max_viable_context_tokens",
+)
+NEVER_FITS_MAX_S = 60.0  # "within one admission": the answer must be prompt
+_NEVER_FITS_FORBIDDEN = ("parked", "decode_paused", "park_wait", "victim_pause")
+
+
+def evaluate_never_fits(
+    status: int | None,
+    body: Any,
+    elapsed_s: float,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Did a never-fits request get the structured 400 in one admission?"""
+    reasons: list[str] = []
+    err = body.get("error") if isinstance(body, dict) else None
+    err = err if isinstance(err, dict) else {}
+    if status != 400:
+        reasons.append(f"status {status} != 400")
+    if err.get("omlx_code") != "context_exceeds_capacity":
+        reasons.append(f"omlx_code {err.get('omlx_code')!r} != context_exceeds_capacity")
+    for f in NEVER_FITS_FIELDS:
+        if not isinstance(err.get(f), int) or isinstance(err.get(f), bool):
+            reasons.append(f"missing or non-integer field {f}")
+    if err.get("retryable") is not False:
+        reasons.append("retryable is not false")
+    req, cap = err.get("required_bytes"), err.get("capacity_bytes")
+    if isinstance(req, int) and isinstance(cap, int) and req <= cap:
+        reasons.append("required_bytes <= capacity_bytes (it would fit)")
+    ctx_t, mt = err.get("requested_context_tokens"), err.get("requested_max_tokens")
+    viable = err.get("max_viable_context_tokens")
+    if all(isinstance(x, int) for x in (ctx_t, mt, viable)) and viable >= ctx_t + mt:
+        reasons.append("max_viable_context_tokens >= requested tokens")
+    if elapsed_s > NEVER_FITS_MAX_S:
+        reasons.append(f"answered after {elapsed_s:.1f}s, not within one admission")
+    bad = sorted({e["kind"] for e in events if e["kind"] in _NEVER_FITS_FORBIDDEN})
+    if bad:
+        reasons.append(f"park or pause events during a never-fits request: {bad}")
+    return {
+        "correct": not reasons,
+        "reasons": reasons,
+        "status": status,
+        "elapsed_s": round(elapsed_s, 2),
+        "fields": {f: err.get(f) for f in (*NEVER_FITS_FIELDS, "retryable")},
+    }
+
+
+C7_DEFAULTS: dict[str, dict[str, Any]] = {
+    # Standard P7 config that fired parks on the fork (status.log 2026-10-05):
+    # ceiling 42 GB, hard 0.8, pool reclaim disabled, 3 staggered long prompts.
+    "decode": {
+        "ceiling_gb": 42.0,
+        "hard_threshold": 0.8,
+        "stagger_s": 0.5,
+        "max_tokens": 2000,
+        "requests": 3,
+    },
+    "image-decode": {
+        "ceiling_gb": 42.0,
+        "hard_threshold": 0.8,
+        "stagger_s": 0.5,
+        "max_tokens": 2000,
+        "requests": 3,
+    },
+    "image-prefill": {
+        "ceiling_gb": 42.0,
+        "hard_threshold": 0.8,
+        "stagger_s": 0.5,
+        "max_tokens": 32,
+        "requests": 3,
+    },
+    "never-fits": {
+        "ceiling_gb": 42.0,
+        "hard_threshold": None,
+        "stagger_s": 0.0,
+        "max_tokens": 16,
+        "requests": 1,
+    },
+}
+
+
+def c7_defaults(scenario: str) -> dict[str, Any]:
+    if scenario not in C7_DEFAULTS:
+        raise ValueError(f"unknown C7 scenario: {scenario!r}")
+    return dict(C7_DEFAULTS[scenario])
+
+
+def classify_c7(scenario: str, s: dict[str, Any]) -> str:
+    """One-word outcome of a C7 scenario, from a summary's counters."""
+    if scenario == "never-fits":
+        return "never_fits_ok" if s.get("never_fits_correct") else "never_fits_wrong"
+    if scenario not in ("decode", "image-decode", "image-prefill"):
+        raise ValueError(f"unknown C7 scenario: {scenario!r}")
+    if s.get("aborted_requests", 0) > 0:
+        return "aborts"
+    if scenario == "image-prefill":
+        pauses, resumes = s.get("pauses_prefill", 0), s.get("resumes_prefill", 0)
+        if pauses == 0:
+            return "no_park"
+        return "parked_not_resumed" if resumes < pauses else "prefill_park_ok"
+    if not s.get("hard_pressure_seen"):
+        return "no_pressure"
+    pauses, resumes = s.get("pauses_decode", 0), s.get("resumes_decode", 0)
+    if pauses == 0:
+        return "no_decode_pause"
+    if resumes < pauses:
+        return "paused_not_resumed"
+    if (s.get("identity") or {}).get("bug", 0) > 0:
+        return "identity_bug"
+    return "decode_pause_ok"
+
+
+def summarize_c7(
+    scenario: str,
+    requests: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    identity: dict[str, dict[str, Any]] | None = None,
+    never_fits: dict[str, Any] | None = None,
+    peak_gb: float | None = None,
+    wall_s: float | None = None,
+) -> dict[str, Any]:
+    """Reduce a C7 scenario: per-request rows plus the run-level counters."""
+    paused = attribute_decode_pauses(events, requests)
+    rows = []
+    for r in requests:
+        p = paused.get(r["name"], {})
+        gap = max_decode_stall(r.get("chunk_times") or [])
+        wall = None
+        if r.get("end_s") is not None and r.get("start_s") is not None:
+            wall = round(r["end_s"] - r["start_s"], 2)
+        rows.append(
+            {
+                "name": r["name"],
+                "ok": bool(r.get("ok")),
+                "error": r.get("error"),
+                "prompt_tokens": r.get("prompt_tokens"),
+                "completion_tokens": r.get("completion_tokens"),
+                "ttft_s": r.get("ttft_s"),
+                "wall_s": wall,
+                "decode_pauses": p.get("pauses", 0),
+                "decode_resumes": p.get("resumes", 0),
+                "restored_tokens": p.get("restored", []),
+                "max_decode_stall_s": None if gap is None else round(gap, 3),
+            }
+        )
+    gaps = [row["max_decode_stall_s"] for row in rows if row["max_decode_stall_s"]]
+    ident = identity or {}
+    classes = [v.get("classification") for v in ident.values() if not v.get("identical")]
+    summary: dict[str, Any] = {
+        "scenario": scenario,
+        "rows": rows,
+        "pauses_prefill": sum(1 for e in events if e["kind"] == "parked"),
+        "pauses_decode": sum(1 for e in events if e["kind"] == "decode_paused"),
+        "resumes_prefill": sum(1 for e in events if e["kind"] == "resumed"),
+        "resumes_decode": sum(1 for e in events if e["kind"] == "decode_resumed"),
+        "restored_tokens": sum(
+            e["restored"] for e in events if e["kind"] == "decode_resumed"
+        ),
+        "aborts_single": sum(1 for e in events if e["kind"] == "victim_abort"),
+        "aborts_all": sum(e["n"] for e in events if e["kind"] == "abort_all"),
+        "victim_pauses": sum(1 for e in events if e["kind"] == "victim_pause"),
+        "drain_waits": sum(1 for e in events if e["kind"] == "drain_wait"),
+        "park_waits": sum(1 for e in events if e["kind"] == "park_wait"),
+        "resume_fits": sum(1 for e in events if e["kind"] == "resume_fit"),
+        "hard_pressure_seen": any(
+            e["kind"] == "pressure" and e["to"] == "hard" for e in events
+        ),
+        "completions": sum(1 for row in rows if row["ok"]),
+        "aborted_requests": sum(1 for row in rows if not row["ok"]),
+        "all_final_ok": all(row["ok"] for row in rows),
+        "max_decode_stall_s": max(gaps) if gaps else None,
+        "peak_gb": peak_gb,
+        "wall_s": wall_s,
+        "identity": {
+            "checked": len(ident),
+            "paused_checked": sum(1 for v in ident.values() if v.get("paused")),
+            "identical": sum(1 for v in ident.values() if v.get("identical")),
+            "noise": classes.count("noise"),
+            "bug": classes.count("bug"),
+            "inconclusive": classes.count("inconclusive"),
+            "unclassified": classes.count("unclassified"),
+        },
+        "never_fits_correct": None if never_fits is None else bool(never_fits.get("correct")),
+        "events": events,
+    }
+    summary["verdict"] = classify_c7(scenario, summary)
+    return summary
+
+
 def p7_default_ceiling_gb(
     model_gb: float = 16.8, peak_gb: float = 44.0, frac: float = 0.5
 ) -> float:

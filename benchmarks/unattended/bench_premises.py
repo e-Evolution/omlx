@@ -110,7 +110,7 @@ FORK_ONLY_SETTINGS = {
 SAMPLING_DEFAULT = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 SAMPLING_GREEDY = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
 
-PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3, "PL": 2, "P7": 3}
+PREMISE_CONCURRENCY = {"P6": 1, "P1": 1, "P2": 2, "P3": 3, "P4": 3, "PL": 2, "P7": 3, "C7": 3}
 ALL_PREMISES = ["P6", "P1", "P2", "P3", "P4"]
 
 _LIVE_SERVERS: list[Server] = []
@@ -177,7 +177,7 @@ def variant_model_settings(ms: dict[str, Any], variant: str) -> dict[str, Any]:
 
 def debug_env(variant: str, premise: str, base: Path) -> dict[str, str]:
     """Opt-in fork debug switches for P3 (logprob dump + forced ragged B=1)."""
-    if variant == "upstream" or premise != "P3":
+    if variant == "upstream" or premise not in ("P3", "C7"):
         return {}
     return {
         "OMLX_DEBUG_LOGPROB_DUMP": str(base / "logprob_dump"),
@@ -947,6 +947,7 @@ async def scenario_pl(ctx: Ctx) -> dict[str, Any]:
 
 
 P7_NOMINAL_TOKENS = (130_000, 115_000, 100_000)
+C7_NEVER_FITS_TIMEOUT_S = 120.0
 
 
 async def scenario_p7(ctx: Ctx) -> dict[str, Any]:
@@ -999,7 +1000,260 @@ async def scenario_p7(ctx: Ctx) -> dict[str, Any]:
     }
 
 
+C7_SCENARIOS = ("decode", "image-decode", "image-prefill", "never-fits")
+
+
+def resolve_c7_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill the C7 knobs the user left unset from the scenario's defaults."""
+    d = bm.c7_defaults(args.c7_scenario)
+    for attr, key in (
+        ("p7_ceiling_gb", "ceiling_gb"),
+        ("p7_hard_threshold", "hard_threshold"),
+        ("c7_stagger_s", "stagger_s"),
+        ("c7_max_tokens", "max_tokens"),
+        ("c7_requests", "requests"),
+    ):
+        if getattr(args, attr, None) is None:
+            setattr(args, attr, d[key])
+    return args
+
+
+def _c7_attach_lp(
+    ctx: Ctx, rows: dict[str, dict[str, Any]], before: set[str], results: list
+) -> None:
+    """Attach each request's logprob dump (matched by prompt tokens)."""
+    dump_dir = ctx.server.dump_dir
+    if dump_dir is None:
+        return
+    paths = bm.new_dumps(dump_dir, before)
+    for r in results:
+        path = bm.pick_dump(paths, r.get("prompt_tokens"))
+        if path is not None:
+            rows[r["name"]] = bm.load_logprob_dump(path)
+
+
+async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
+    a = ctx.args
+    mode = "image" if kind.startswith("image") else "text"
+    count = max(1, min(a.c7_requests, len(P7_NOMINAL_TOKENS)))
+    mt = ctx.mt(a.c7_max_tokens)
+    prompts: list[Any] = []
+    warm: list[dict[str, Any]] = []
+    for i in range(count):
+        seed = ctx.seed("C7", kind, i)
+        text = ctx.corpus.prompt(seed, ctx.n(P7_NOMINAL_TOKENS[i]))
+        if kind == "image-prefill":
+            # Short turn with the image first, so its prefix is cached; the long
+            # turn then extends that exact text: only a text suffix is left.
+            head = ctx.corpus.prompt(seed + "|warm", ctx.n(a.c7_warm_tokens))
+            img_seed = ctx.seed("C7", kind, i, "img")
+            warm.append(
+                await ctx.chat(
+                    bm.p7_content(head, "image", img_seed),
+                    8,
+                    SAMPLING_GREEDY,
+                    name=f"warm{i}",
+                )
+            )
+            text = head + "\n\n" + text
+            prompts.append(bm.p7_content(text, "image", img_seed))
+        else:
+            prompts.append(bm.p7_content(text, mode, ctx.seed("C7", kind, i, "img")))
+    dump_dir = ctx.server.dump_dir
+    before = bm.dump_listing(dump_dir) if dump_dir else set()
+    off = ctx.server.log_size()
+
+    async def one(i: int) -> dict[str, Any]:
+        await asyncio.sleep(i * a.c7_stagger_s)
+        return await ctx.chat(
+            prompts[i],
+            mt,
+            SAMPLING_GREEDY,
+            name=f"req{i}",
+            keep_text=True,
+            keep_chunks=True,
+        )
+
+    t = time.time()
+    results = list(await asyncio.gather(*[one(i) for i in range(count)]))
+    wall = round(time.time() - t, 2)
+    events = bm.parse_c7_events(ctx.server.log_since(off))
+    lps: dict[str, list[dict]] = {}
+    _c7_attach_lp(ctx, lps, before, results)
+    identity: dict[str, dict[str, Any]] = {}
+    refs: list[dict[str, Any]] = []
+    if kind in ("decode", "image-decode") and not a.c7_no_identity:
+        paused = bm.attribute_decode_pauses(events, results)
+        for i, r in enumerate(results):
+            if not r.get("ok"):
+                continue
+            await asyncio.sleep(a.settle_s)
+            ref_off = ctx.server.log_size()
+            ref_before = bm.dump_listing(dump_dir) if dump_dir else set()
+            ref = await ctx.chat(
+                prompts[i],
+                mt,
+                SAMPLING_GREEDY,
+                name=f"req{i}-ref",
+                keep_text=True,
+                keep_chunks=True,
+            )
+            ref_events = bm.parse_c7_events(ctx.server.log_since(ref_off))
+            ref_lps: dict[str, list[dict]] = {}
+            _c7_attach_lp(ctx, ref_lps, ref_before, [ref])
+            refs.append(ref)
+            v = bm.identity_verdict(
+                ref,
+                r,
+                ref_lp=ref_lps.get(ref["name"]),
+                test_lp=lps.get(r["name"]),
+            )
+            v["paused"] = r["name"] in paused
+            v["ref_ok"] = bool(ref.get("ok"))
+            v["ref_clean"] = not any(
+                e["kind"]
+                in ("decode_paused", "parked", "victim_abort", "abort_all", "abort")
+                or (e["kind"] == "pressure" and e["to"] == "hard")
+                for e in ref_events
+            )
+            identity[r["name"]] = v
+    summary = bm.summarize_c7(kind, results, events, identity=identity, wall_s=wall)
+    for r in [*warm, *results, *refs]:
+        for k in ("text", "chunk_times", "chunk_chars"):
+            r.pop(k, None)
+    return {
+        "scenario": kind,
+        "ceiling_gb": a.p7_ceiling_gb,
+        "stagger_s": a.c7_stagger_s,
+        "max_tokens": mt,
+        "warm": warm,
+        "requests": results,
+        "references": refs,
+        "identity": identity,
+        "wall_s": wall,
+        "summary": summary,
+    }
+
+
+async def _c7_never_fits(ctx: Ctx) -> dict[str, Any]:
+    """One request that cannot fit alone: expect the structured 400, no park."""
+    a = ctx.args
+    text = ctx.corpus.prompt(ctx.seed("C7", "never-fits"), ctx.n(a.c7_never_prompt_tokens))
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": a.c7_never_max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        **SAMPLING_GREEDY,
+    }
+    off = ctx.server.log_size()
+    t = time.time()
+    status: int | None = None
+    payload: Any = None
+    error: str | None = None
+    try:
+
+        async def go() -> None:
+            nonlocal status, payload
+            async with ctx.client.stream(
+                "POST",
+                f"{ctx.server.base_url}/v1/chat/completions",
+                json=body,
+                headers=ctx.server.headers(),
+            ) as resp:
+                status = resp.status_code
+                if status != 200:
+                    raw = (await resp.aread()).decode("utf-8", "replace")
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError:
+                        payload = {"raw": raw[:500]}
+
+        await asyncio.wait_for(go(), timeout=C7_NEVER_FITS_TIMEOUT_S)
+    except TimeoutError:
+        error = f"no answer within {C7_NEVER_FITS_TIMEOUT_S}s (request disconnected)"
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+    elapsed = time.time() - t
+    events = bm.parse_c7_events(ctx.server.log_since(off))
+    nf = bm.evaluate_never_fits(status, payload, elapsed, events)
+    if error:
+        nf["reasons"].append(error)
+        nf["correct"] = False
+    capacity: dict[str, Any] = {}
+    try:
+        cap = await ctx.client.get(
+            f"{ctx.server.base_url}/v1/omlx/capacity",
+            headers=ctx.server.headers(),
+            params={
+                "model": MODEL,
+                "context_tokens": a.c7_never_prompt_tokens,
+                "max_tokens": a.c7_never_max_tokens,
+            },
+            timeout=30.0,
+        )
+        capacity = {"status": cap.status_code}
+        try:
+            capacity["body"] = cap.json()
+        except ValueError:
+            capacity["body"] = None
+    except Exception as exc:  # noqa: BLE001
+        capacity = {"status": None, "error": f"{type(exc).__name__}: {exc}"}
+    header = None
+    try:
+        ok = await ctx.client.post(
+            f"{ctx.server.base_url}/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "max_tokens": 4,
+                **SAMPLING_GREEDY,
+            },
+            headers=ctx.server.headers(),
+            timeout=120.0,
+        )
+        header = ok.headers.get("X-oMLX-Max-Context-Tokens")
+    except Exception:  # noqa: BLE001
+        header = None
+    follow = await ctx.chat("Say ok.", 4, SAMPLING_GREEDY, name="followup")
+    follow.pop("text", None)
+    summary = bm.summarize_c7("never-fits", [], events, never_fits=nf)
+    summary["followup_ok"] = bool(follow.get("ok"))
+    return {
+        "scenario": "never-fits",
+        "ceiling_gb": a.p7_ceiling_gb,
+        "request": {
+            "prompt_tokens_nominal": a.c7_never_prompt_tokens,
+            "max_tokens": a.c7_never_max_tokens,
+        },
+        "never_fits": nf,
+        "capacity": capacity,
+        "max_context_header": header,
+        "followup": follow,
+        "summary": summary,
+    }
+
+
+async def scenario_c7(ctx: Ctx) -> dict[str, Any]:
+    """C7: pause-resume cycle validation (see the C7 run plan in the field report).
+
+    decode / image-decode: 3 long greedy prompts with a long max_tokens under
+    forced hard pressure (the P7 settings), then each completed request is
+    re-run alone for the greedy identity check. image-prefill: image prefix
+    cached by a short turn, then long text-suffix turns under pressure.
+    never-fits: one request that cannot fit alone.
+    """
+    kind = ctx.args.c7_scenario
+    if kind == "never-fits":
+        return await _c7_never_fits(ctx)
+    if kind in C7_SCENARIOS:
+        return await _c7_pressure(ctx, kind)
+    raise ValueError(f"unknown C7 scenario: {kind!r}")
+
+
 SCENARIOS = {
+    "C7": scenario_c7,
     "P7": scenario_p7,
     "PL": scenario_pl,
     "P6": scenario_p6,
@@ -1032,6 +1286,11 @@ def scenario_ok(premise: str, sc: dict[str, Any]) -> bool:
         )
     if premise == "P7":
         return bool(sc["summary"]["all_final_ok"])
+    if premise == "C7":
+        sm = sc["summary"]
+        if sm["scenario"] == "never-fits":
+            return bool(sm["never_fits_correct"]) and bool(sm.get("followup_ok", True))
+        return bool(sm["all_final_ok"])
     return False
 
 
@@ -1124,7 +1383,22 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
             "stagger_s": getattr(args, "p7_stagger_s", None),
             "max_tokens": getattr(args, "p7_max_tokens", None),
         }
-        if server.premise == "P7"
+        if server.premise in ("P7", "C7")
+        else None,
+        "c7": {
+            k: getattr(args, k, None)
+            for k in (
+                "c7_scenario",
+                "c7_requests",
+                "c7_stagger_s",
+                "c7_max_tokens",
+                "c7_warm_tokens",
+                "c7_never_prompt_tokens",
+                "c7_never_max_tokens",
+                "c7_no_identity",
+            )
+        }
+        if server.premise == "C7"
         else None,
         "p3_flow": "cold B=1 (cache populate) -> B=1 restored -> B=3 restored (started together, "
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=0 in fork variants, max_concurrent_requests=3)",
@@ -1146,7 +1420,7 @@ async def run_premise_async(
             bm.p7_settings_override(
                 args.p7_ceiling_gb, args.p7_hard_threshold, args.p7_soft_threshold
             )
-            if premise == "P7"
+            if premise in ("P7", "C7")
             else None
         ),
     )
@@ -1190,6 +1464,10 @@ async def run_premise_async(
                 finally:
                     samples = sampler.stop()
                 log = bm.parse_server_log(srv.log_since(off))
+                if premise == "C7" and isinstance(scenario.get("summary"), dict):
+                    sm = scenario["summary"]
+                    sm["peak_gb"] = bm.summarize_samples(samples)["footprint_peak_gb"]
+                    sm["wall_s"] = sm.get("wall_s") or round(time.time() - t_run, 2)
                 ok = scenario_ok(premise, scenario)
                 run = {
                     "schema": 1,
@@ -1270,7 +1548,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--variant", choices=VARIANTS, required=True)
     ap.add_argument(
-        "--premise", choices=[*ALL_PREMISES, "PL", "P7", "all"], default="all"
+        "--premise", choices=[*ALL_PREMISES, "PL", "P7", "C7", "all"], default="all"
+    )
+    ap.add_argument(
+        "--c7-scenario",
+        choices=C7_SCENARIOS,
+        default="decode",
+        help="C7: which pause-resume scenario to run (--premise C7). Ceiling, hard "
+        "threshold, stagger and max_tokens default per scenario (bench_metrics.C7_DEFAULTS)",
+    )
+    ap.add_argument("--c7-requests", type=int, default=None, help="C7: 1-3 prompts")
+    ap.add_argument("--c7-stagger-s", type=float, default=None)
+    ap.add_argument("--c7-max-tokens", type=int, default=None)
+    ap.add_argument(
+        "--c7-warm-tokens",
+        type=int,
+        default=2000,
+        help="C7 image-prefill: tokens of the short turn that caches the image prefix",
+    )
+    ap.add_argument("--c7-never-prompt-tokens", type=int, default=60_000)
+    ap.add_argument("--c7-never-max-tokens", type=int, default=2_000_000)
+    ap.add_argument(
+        "--c7-no-identity",
+        action="store_true",
+        help="C7 decode: skip the alone-run greedy identity references",
     )
     ap.add_argument(
         "--p7-mode",
@@ -1381,9 +1682,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"missing {FORK_BIN}", file=sys.stderr)
         return 2
     CACHE_ROOT = args.cache_root
+    if args.premise == "C7":
+        resolve_c7_args(args)
     if args.p7_ceiling_gb is None:
         args.p7_ceiling_gb = bm.p7_default_ceiling_gb()
-    if args.premise == "P7":
+    if args.premise in ("P7", "C7"):
         print(f"[P7] custom memory-guard ceiling = {args.p7_ceiling_gb} GB", flush=True)
     out = Path(args.out)
     (out / "logs").mkdir(parents=True, exist_ok=True)
