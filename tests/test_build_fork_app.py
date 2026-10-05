@@ -290,6 +290,7 @@ def test_default_env_enables_d1_and_park(bfa):
     assert bfa.FORK_ENV == {
         "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
         "OMLX_MEMORY_PRESSURE_PARK": "true",
+        "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
         "OMLX_MLX_CACHE_LIMIT_GB": "16",
         "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000",
         "OMLX_BATCHED_DECODE_HOLD_MAX_S": "120",
