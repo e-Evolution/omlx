@@ -270,6 +270,13 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/systemone` | Typed decisions with decision models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+| `GET /v1/omlx/capacity?model=<id>` | Memory capacity of a loaded model (see below) |
+
+#### Memory capacity
+
+A request that cannot fit even with nothing else running (model weights + KV for the prompt plus `max_tokens` + the prefill transient, over the memory guard's capacity line) is rejected up front with HTTP 400 and `omlx_code: "context_exceeds_capacity"`. The usual error envelope stays (`message`, `type`, `code`, `estimated_bytes`, `limit_bytes`) and adds `required_bytes`, `capacity_bytes`, `weights_bytes`, `kv_bytes_per_token`, `requested_context_tokens`, `requested_max_tokens`, `max_viable_context_tokens` and `retryable: false`: compact or shorten the context, or lower `max_tokens`, before retrying. A request that fits alone but not right now is not rejected; it waits until running requests free memory.
+
+`GET /v1/omlx/capacity?model=<id>&context_tokens=<n>&max_tokens=<m>` (API key like the other `/v1` routes) returns the same numbers for a request of that size plus `free_bytes_now`, without loading the model (an unloaded model is a 409; `available: false` when no estimate exists). Chat completions also carry an `X-oMLX-Max-Context-Tokens` header: the largest prompt plus `max_tokens` that fits alone.
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
 

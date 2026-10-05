@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationBatch,
@@ -59,6 +60,7 @@ from .cache.restore_outcome import RestoreOutcomeCounter, classify_restore_outco
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
 from .exceptions import (
+    ContextExceedsCapacityError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
@@ -214,6 +216,55 @@ class _PreflightRejection:
     message: str
     estimated_bytes: int
     limit_bytes: int
+    # Set when the request cannot fit even alone (never-fits gate).
+    capacity: "_CapacityEstimate | None" = None
+
+
+@dataclass(frozen=True)
+class _CapacityEstimate:
+    """Whether a request fits this model's memory with nothing else running.
+
+    ``required_bytes`` is weights + exact KV of context plus max_tokens +
+    the prefill transient, compared against ``capacity_bytes`` (the tighter
+    of the admission line and the prefill safety cap).
+    ``max_viable_context_tokens`` is the largest context plus max_tokens
+    that fits alone.
+    """
+
+    required_bytes: int
+    capacity_bytes: int
+    weights_bytes: int
+    kv_bytes_per_token: int
+    requested_context_tokens: int
+    requested_max_tokens: int
+    max_viable_context_tokens: int
+
+    @property
+    def fits_alone(self) -> bool:
+        return self.required_bytes <= self.capacity_bytes
+
+    def fields(self) -> dict[str, int]:
+        return {
+            "required_bytes": self.required_bytes,
+            "capacity_bytes": self.capacity_bytes,
+            "weights_bytes": self.weights_bytes,
+            "kv_bytes_per_token": self.kv_bytes_per_token,
+            "requested_context_tokens": self.requested_context_tokens,
+            "requested_max_tokens": self.requested_max_tokens,
+            "max_viable_context_tokens": self.max_viable_context_tokens,
+        }
+
+
+class _PreflightDeferredError(Exception):
+    """The request fits alone but not now: it waits at the head of the queue."""
+
+
+# Upper bound of the max-viable-context search (tokens).
+_MAX_VIABLE_CONTEXT_SEARCH_CAP = 1 << 24
+# Seconds a computed max viable context stays cached for the response header.
+_MAX_VIABLE_CONTEXT_CACHE_TTL_S = 30.0
+# Seconds between "fits later" log lines for the same waiting request.
+_FITS_LATER_LOG_INTERVAL_S = 30.0
 
 
 @dataclass
@@ -501,6 +552,21 @@ def _prefill_memory_error_output(
         finish_reason="error",
         error=message,
         error_code="prefill_memory_exceeded",
+        error_metadata=metadata,
+    )
+
+
+def _context_capacity_error_output(
+    request_id: str, message: str, capacity: "_CapacityEstimate"
+) -> RequestOutput:
+    metadata: dict[str, int | str] = {"request_id": request_id}
+    metadata.update(capacity.fields())
+    return RequestOutput(
+        request_id=request_id,
+        finished=True,
+        finish_reason="error",
+        error=message,
+        error_code="context_exceeds_capacity",
         error_metadata=metadata,
     )
 
@@ -2309,6 +2375,13 @@ class Scheduler:
             "running_by_id": {},
             "waiting": [],
         }
+
+        # Never-fits gate: model weight bytes (None until first measured),
+        # the cached max viable context (key, value, computed_at) and the
+        # last "fits later" log line (request id, monotonic).
+        self._weights_bytes: int | None = None
+        self._max_viable_cache: tuple[tuple, int, float] | None = None
+        self._fits_later_logged: tuple[str, float] | None = None
 
         # Memory limits for inline prefill checking.
         # Set by ProcessMemoryEnforcer; propagated to BatchGenerator.
@@ -11036,6 +11109,7 @@ class Scheduler:
                     num_prompt_tokens=request.num_prompt_tokens,
                     cached_tokens=request.cached_tokens or 0,
                     request_id=request.request_id,
+                    max_tokens=getattr(request.sampling_params, "max_tokens", None),
                 )
             except Exception:
                 self._release_paged_cache_for_request(request.request_id)
@@ -13560,6 +13634,21 @@ class Scheduler:
             if request.prompt_cache is not None:
                 return None
 
+        capacity = self._capacity_estimate(
+            context_tokens=prompt_tokens,
+            max_tokens=getattr(request.sampling_params, "max_tokens", 0),
+        )
+        if capacity is not None and not capacity.fits_alone:
+            return _PreflightRejection(
+                message=self._never_fits_message(capacity),
+                estimated_bytes=capacity.required_bytes,
+                limit_bytes=capacity.capacity_bytes,
+                capacity=capacity,
+            )
+        # Fits alone: while rows are admitted, their memory comes back when
+        # they finish, so the request waits at the head instead of failing.
+        fits_later = capacity is not None and self._num_admitted_requests() > 0
+
         # A request resumed after an eviction pause keeps its prompt cache.
         # Capacity reserved there already holds part of the KV priced below.
         current = max(
@@ -13593,6 +13682,9 @@ class Scheduler:
                 requested_tokens=est.floor_chunk,
                 reason="prefill_preflight",
             )
+            if fits_later:
+                self._log_fits_later(request.request_id, est.estimated, hard_limit)
+                raise _PreflightDeferredError()
 
             message = self._format_rejection_message(
                 estimated=est.estimated,
@@ -13620,6 +13712,13 @@ class Scheduler:
                 requested_tokens=est.floor_chunk,
                 reason="prefill_safety_cap",
             )
+            if fits_later:
+                self._log_fits_later(
+                    request.request_id,
+                    safety_rejection.estimated_bytes,
+                    safety_rejection.limit_bytes,
+                )
+                raise _PreflightDeferredError()
             return safety_rejection
         return None
 
@@ -13754,12 +13853,223 @@ class Scheduler:
             f"({' - '.join(parts)}). {advice}."
         )
 
+    # ------------------------------------------------------------------
+    # Never-fits gate and capacity hint.
+    # ------------------------------------------------------------------
+
+    def _model_weights_bytes(self) -> int:
+        """Resident bytes of this model's weights; 0 when unknown.
+
+        Summed once from the model's parameter arrays (shape metadata only,
+        nothing is evaluated); a measured monitor baseline is the fallback.
+        """
+        cached = self._weights_bytes
+        if cached is not None:
+            return cached
+        total = 0
+        try:
+            total = sum(
+                int(value.nbytes)
+                for _, value in tree_flatten(self.model.parameters())
+                if isinstance(value, mx.array)
+            )
+        except Exception:  # noqa: BLE001 - unknown model shape: no estimate
+            total = 0
+        if total <= 0 and self.memory_monitor is not None:
+            baseline = getattr(self.memory_monitor, "_baseline_memory", 0)
+            if isinstance(baseline, int) and not isinstance(baseline, bool):
+                total = baseline
+        if total > 0:
+            self._weights_bytes = total
+        return total
+
+    def _capacity_limit_bytes(self) -> int:
+        """The line a request must fit under alone: the tighter of the
+        admission line and the prefill safety cap (0 when no limit)."""
+        limits = [
+            v
+            for v in (self._admission_limit_bytes(), self._prefill_abort_cap())
+            if v > 0
+        ]
+        return min(limits) if limits else 0
+
+    def _required_alone_bytes(self, tokens: int, weights: int) -> int:
+        """Weights + exact KV of ``tokens`` + the prefill transient.
+
+        The transient is priced by the shared admission estimate, so it
+        follows the same execution-route predicate as admission (#3482).
+        """
+        est = self._admission_estimate(
+            num_prompt_tokens=tokens,
+            cached_tokens=0,
+            current=weights,
+        )
+        return int(est.estimated) if est is not None else int(weights)
+
+    def _capacity_estimate(
+        self,
+        *,
+        context_tokens: int,
+        max_tokens: int | None,
+    ) -> _CapacityEstimate | None:
+        """Whether ``context_tokens + max_tokens`` fits with nothing else running.
+
+        None when it cannot be estimated: no monitor, no memory limit, model
+        weights or KV dimensions unknown.
+        """
+        monitor = self.memory_monitor
+        if monitor is None:
+            return None
+        capacity = self._capacity_limit_bytes()
+        weights = self._model_weights_bytes()
+        if capacity <= 0 or weights <= 0:
+            return None
+        if (
+            self._admission_estimate(
+                num_prompt_tokens=4096,
+                cached_tokens=0,
+                current=0,
+            )
+            is None
+        ):
+            return None
+        context = max(0, int(context_tokens or 0))
+        output = max(0, int(max_tokens or 0))
+        return _CapacityEstimate(
+            required_bytes=self._required_alone_bytes(
+                context + output, weights
+            ),
+            capacity_bytes=capacity,
+            weights_bytes=weights,
+            kv_bytes_per_token=int(
+                round(float(monitor.estimate_prompt_kv_bytes(1024)) / 1024)
+            ),
+            requested_context_tokens=context,
+            requested_max_tokens=output,
+            max_viable_context_tokens=self._max_viable_context(
+                capacity, weights
+            ),
+        )
+
+    def _max_viable_context(self, capacity: int, weights: int) -> int:
+        """Largest context plus max_tokens that fits alone (cached briefly)."""
+        key = (int(capacity), int(weights))
+        now = time.monotonic()
+        cached = self._max_viable_cache
+        if (
+            cached is not None
+            and cached[0] == key
+            and now - cached[2] < _MAX_VIABLE_CONTEXT_CACHE_TTL_S
+        ):
+            return cached[1]
+
+        def fits(tokens: int) -> bool:
+            return self._required_alone_bytes(tokens, weights) <= capacity
+
+        cap = _MAX_VIABLE_CONTEXT_SEARCH_CAP
+        if not fits(0):
+            best = 0
+        else:
+            lo, hi = 0, 4096
+            while hi < cap and fits(hi):
+                lo, hi = hi, hi * 2
+            if hi >= cap and fits(cap):
+                best = cap
+            else:
+                hi = min(hi, cap)
+                while hi - lo > 1:  # invariant: fits(lo), not fits(hi)
+                    mid = (lo + hi) // 2
+                    if fits(mid):
+                        lo = mid
+                    else:
+                        hi = mid
+                best = lo
+        self._max_viable_cache = (key, best, now)
+        return best
+
+    def max_viable_context_tokens(self) -> int | None:
+        """Cached capacity hint: the largest text context plus max_tokens
+        that fits with nothing else running, or None when unknown."""
+        capacity = self._capacity_limit_bytes()
+        weights = self._model_weights_bytes()
+        if capacity <= 0 or weights <= 0:
+            return None
+        cached = self._max_viable_cache
+        if (
+            cached is not None
+            and cached[0] == (capacity, weights)
+            and time.monotonic() - cached[2] < _MAX_VIABLE_CONTEXT_CACHE_TTL_S
+        ):
+            return cached[1]
+        estimate = self._capacity_estimate(context_tokens=0, max_tokens=0)
+        return estimate.max_viable_context_tokens if estimate is not None else None
+
+    def capacity_snapshot(
+        self, *, context_tokens: int = 0, max_tokens: int = 0
+    ) -> dict[str, int] | None:
+        """Capacity numbers for a text request plus the free bytes right now.
+
+        Safe off the MLX thread (uses the cached MLX sample). None when the
+        capacity cannot be estimated.
+        """
+        estimate = self._capacity_estimate(
+            context_tokens=context_tokens, max_tokens=max_tokens
+        )
+        if estimate is None:
+            return None
+        snapshot = estimate.fields()
+        snapshot["free_bytes_now"] = int(estimate.capacity_bytes) - int(
+            self._current_usage_bytes(refresh_mlx_active=False)
+        )
+        return snapshot
+
+    def _never_fits_message(self, capacity: _CapacityEstimate) -> str:
+        binding_str, advice = describe_ceiling_binding(
+            static=self._memory_static_ceiling_bytes,
+            dynamic=self._memory_dynamic_ceiling_bytes,
+            metal_cap=self._memory_metal_cap_bytes,
+            metal_cap_raw=getattr(self, "_memory_metal_cap_raw_bytes", 0),
+            tier=self._memory_guard_tier,
+            current=capacity.weights_bytes,
+            fmt=format_bytes,
+            tail=["compact or shorten the context", "lower max_tokens"],
+        )
+        return (
+            f"Request needs ~{format_bytes(capacity.required_bytes)} "
+            f"(weights {format_bytes(capacity.weights_bytes)} + KV and "
+            f"transient for {capacity.requested_context_tokens} context + "
+            f"{capacity.requested_max_tokens} max tokens) but this model's "
+            f"memory capacity under the {binding_str} ceiling is "
+            f"{format_bytes(capacity.capacity_bytes)} even with nothing else "
+            f"running; at most {capacity.max_viable_context_tokens} tokens of "
+            f"context plus max_tokens fit. {advice}."
+        )
+
+    def _log_fits_later(self, request_id: str, estimated: int, limit: int) -> None:
+        now = time.monotonic()
+        last = self._fits_later_logged
+        if (
+            last is not None
+            and last[0] == request_id
+            and now - last[1] < _FITS_LATER_LOG_INTERVAL_S
+        ):
+            return
+        self._fits_later_logged = (request_id, now)
+        logger.info(
+            "Request %s fits alone but not now (needs %.1f GB, line %.1f GB); "
+            "waiting for running requests to finish",
+            request_id,
+            estimated / 1024**3,
+            limit / 1024**3,
+        )
+
     def preflight_or_raise(
         self,
         *,
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
 
@@ -13772,6 +14082,12 @@ class Scheduler:
         directly (no Request object) and raises instead of returning a
         message — the in-stream re-check inside ``_schedule_waiting``
         remains as defense-in-depth.
+
+        A request that cannot fit even alone (weights + KV of prompt plus
+        ``max_tokens`` + transient over the capacity line) raises
+        ``ContextExceedsCapacityError`` whatever the current usage. One that
+        fits alone but not now passes while other work is admitted or
+        queued: it waits for that work to finish instead of being rejected.
         """
         if not self._prefill_memory_guard:
             return
@@ -13779,6 +14095,31 @@ class Scheduler:
             return
         if self.memory_monitor is None:
             return
+
+        if not request_id:
+            import uuid as _uuid
+
+            request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+
+        capacity = self._capacity_estimate(
+            context_tokens=num_prompt_tokens,
+            max_tokens=max_tokens,
+        )
+        if capacity is not None and not capacity.fits_alone:
+            message = self._never_fits_message(capacity)
+            logger.warning(
+                "Preflight rejected, never fits (%d tokens, max_tokens=%d, "
+                "request_id=%s): %s",
+                num_prompt_tokens,
+                capacity.requested_max_tokens,
+                request_id,
+                message,
+            )
+            raise ContextExceedsCapacityError(
+                message=message,
+                request_id=request_id,
+                capacity_fields=capacity.fields(),
+            )
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
         est = self._admission_estimate(
@@ -13789,14 +14130,17 @@ class Scheduler:
         if est is None:
             return
 
-        if not request_id:
-            import uuid as _uuid
-
-            request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
-
+        # Fits alone (checked above) and something running or queued will
+        # free memory: wait instead of rejecting.
+        fits_later = capacity is not None and (
+            self._num_admitted_requests() > 0 or len(self.waiting) > 0
+        )
         hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
+            if fits_later:
+                self._log_fits_later(request_id, est.estimated, admission_limit)
+                return
             message = self._format_rejection_message(
                 estimated=est.estimated,
                 current=current,
@@ -13825,6 +14169,13 @@ class Scheduler:
         )
         if safety_rejection is None:
             return
+        if fits_later:
+            self._log_fits_later(
+                request_id,
+                safety_rejection.estimated_bytes,
+                safety_rejection.limit_bytes,
+            )
+            return
 
         logger.warning(
             "Preflight safety-cap rejected (%d tokens, cached=%d, "
@@ -13847,6 +14198,7 @@ class Scheduler:
         num_prompt_tokens: int,
         cached_tokens: int = 0,
         request_id: str | None = None,
+        max_tokens: int | None = None,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
 
@@ -13862,6 +14214,13 @@ class Scheduler:
             return None
         if self.memory_monitor is None:
             return None
+
+        capacity = self._capacity_estimate(
+            context_tokens=num_prompt_tokens,
+            max_tokens=max_tokens,
+        )
+        if capacity is not None and not capacity.fits_alone:
+            return None  # evicting cannot help; preflight_or_raise rejects it
 
         current = self._current_usage_bytes(refresh_mlx_active=False)
         request_id = request_id or "preflight"
@@ -14305,6 +14664,11 @@ class Scheduler:
             except _PrefillEvictionNeeded as e:
                 self._pause_for_prefill_eviction(request, e.request)
                 break
+            except _PreflightDeferredError:
+                # Fits alone but not now: it keeps its place at the head and
+                # nothing behind it overtakes it while the admitted rows run.
+                self.waiting.appendleft(request)
+                break
             if preflight_rejection is not None:
                 logger.warning(
                     f"Request {request.request_id} rejected by prefill "
@@ -14313,6 +14677,15 @@ class Scheduler:
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
                 self._clear_request_admission_bookkeeping(request.request_id)
+                if preflight_rejection.capacity is not None:
+                    rejected_outputs.append(
+                        _context_capacity_error_output(
+                            request.request_id,
+                            preflight_rejection.message,
+                            preflight_rejection.capacity,
+                        )
+                    )
+                    continue
                 rejected_outputs.append(
                     _prefill_memory_error_output(
                         request.request_id,

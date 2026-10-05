@@ -1872,6 +1872,7 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
+        max_tokens: int | None = None,
     ) -> None:
         await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
@@ -1883,6 +1884,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            max_tokens=max_tokens,
         )
 
     @property
@@ -5215,6 +5217,7 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
+            max_tokens=kwargs.get("max_tokens"),
         )
 
     async def preflight_completion(
@@ -5250,6 +5253,7 @@ class VLMBatchedEngine(BaseEngine):
             scheduler,
             num_prompt_tokens=num_tokens,
             request_id=request_id,
+            max_tokens=kwargs.get("max_tokens"),
         )
 
     async def stream_chat(
