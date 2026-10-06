@@ -1000,7 +1000,39 @@ async def scenario_p7(ctx: Ctx) -> dict[str, Any]:
     }
 
 
-C7_SCENARIOS = ("decode", "image-decode", "image-prefill", "never-fits")
+C7_SCENARIOS = ("decode", "image-decode", "image-prefill", "never-fits", "identity")
+FORCE_DECODE_PAUSE_ENV = "OMLX_DEBUG_FORCE_DECODE_PAUSE_AT"
+
+
+def c7_force_env(args: argparse.Namespace, premise: str) -> dict[str, str]:
+    """Server env for the C7-identity forced pass (test-only fork knob).
+
+    ``--c7-force-pause-at auto`` derives the offsets from the reference
+    prompts (``--c7-refs-from``): an early one plus each prompt's next
+    2048-token block edge. A comma list is used as given (sorted, unique).
+    """
+    raw = getattr(args, "c7_force_pause_at", None)
+    if premise != "C7" or not raw:
+        return {}
+    if args.c7_scenario != "identity":
+        raise ValueError("--c7-force-pause-at is only for --c7-scenario identity")
+    if raw.strip() == "auto":
+        if not getattr(args, "c7_refs_from", None):
+            raise ValueError("--c7-force-pause-at auto needs --c7-refs-from")
+        data = bm.load_c7_refs(Path(args.c7_refs_from) / "references.json")
+        ptoks = [v["result"]["prompt_tokens"] for v in data["refs"].values()]
+        offsets = bm.c7_force_pause_offsets(ptoks, args.c7_max_tokens)
+    else:
+        try:
+            offsets = sorted({int(x) for x in raw.split(",")})
+        except ValueError:
+            raise ValueError(
+                f"--c7-force-pause-at: not a comma list of ints: {raw!r}"
+            ) from None
+        if not offsets or offsets[0] < 1:
+            raise ValueError(f"--c7-force-pause-at: offsets must be >= 1: {raw!r}")
+    args.c7_force_offsets = offsets
+    return {FORCE_DECODE_PAUSE_ENV: ",".join(str(o) for o in offsets)}
 
 
 def resolve_c7_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -1093,6 +1125,60 @@ async def _c7_refs_only(
     }
 
 
+async def _c7_identity(ctx: Ctx, prompts: list[Any], mt: int) -> dict[str, Any]:
+    """D6 forced pass: every decode prompt ALONE (B=1, greedy, logprob dump) on
+    a server with OMLX_DEBUG_FORCE_DECODE_PAUSE_AT, compared with the no-pause
+    references of the same prompts (``--c7-refs-from``)."""
+    a = ctx.args
+    if not getattr(a, "c7_refs_from", None):
+        raise ValueError("C7 identity with forced pauses needs --c7-refs-from")
+    data = bm.load_c7_refs(Path(a.c7_refs_from) / "references.json")
+    dump_dir = ctx.server.dump_dir
+    before = bm.dump_listing(dump_dir) if dump_dir else set()
+    off = ctx.server.log_size()
+    t = time.time()
+    results: list[dict[str, Any]] = []
+    for i, prompt in enumerate(prompts):
+        if i:
+            await asyncio.sleep(a.settle_s)
+        results.append(
+            await ctx.chat(
+                prompt,
+                mt,
+                SAMPLING_GREEDY,
+                name=f"req{i}",
+                keep_text=True,
+                keep_chunks=True,
+            )
+        )
+    wall = round(time.time() - t, 2)
+    events = bm.parse_c7_events(ctx.server.log_since(off))
+    lps: dict[str, list[dict]] = {}
+    _c7_attach_lp(ctx, lps, before, results)
+    identity = bm.c7_identity_rows(data["refs"], results, lps, events)
+    for v in identity.values():
+        v["ref_ceiling_gb"] = data.get("ceiling_gb")
+    summary = bm.summarize_c7(
+        "identity", results, events, identity=identity, wall_s=wall
+    )
+    summary["verdict"] = bm.classify_c7_identity(identity, len(results))
+    for r in results:
+        for k in ("text", "chunk_times", "chunk_chars"):
+            r.pop(k, None)
+    return {
+        "scenario": "identity",
+        "ceiling_gb": a.p7_ceiling_gb,
+        "max_tokens": mt,
+        "force_pause_offsets": getattr(a, "c7_force_offsets", None),
+        "warm": [],
+        "requests": results,
+        "references": [],
+        "identity": identity,
+        "wall_s": wall,
+        "summary": summary,
+    }
+
+
 async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
     a = ctx.args
     mode = "image" if kind.startswith("image") else "text"
@@ -1100,8 +1186,10 @@ async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
     mt = ctx.mt(a.c7_max_tokens)
     prompts: list[Any] = []
     warm: list[dict[str, Any]] = []
+    # The identity scenario reuses the decode prompts.
+    src = "decode" if kind == "identity" else kind
     for i in range(count):
-        seed = ctx.seed("C7", kind, i)
+        seed = ctx.seed("C7", src, i)
         text = ctx.corpus.prompt(seed, ctx.n(P7_NOMINAL_TOKENS[i]))
         if kind == "image-prefill":
             # Short turn with the image first, so its prefix is cached; the long
@@ -1119,10 +1207,12 @@ async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
             text = head + "\n\n" + text
             prompts.append(bm.p7_content(text, "image", img_seed))
         else:
-            prompts.append(bm.p7_content(text, mode, ctx.seed("C7", kind, i, "img")))
+            prompts.append(bm.p7_content(text, mode, ctx.seed("C7", src, i, "img")))
     dump_dir = ctx.server.dump_dir
     if getattr(a, "c7_refs_only", False):
         return await _c7_refs_only(ctx, kind, prompts, warm, mt)
+    if kind == "identity":
+        return await _c7_identity(ctx, prompts, mt)
     before = bm.dump_listing(dump_dir) if dump_dir else set()
     off = ctx.server.log_size()
 
@@ -1473,6 +1563,8 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
                 "c7_no_identity",
                 "c7_refs_only",
                 "c7_refs_from",
+                "c7_force_pause_at",
+                "c7_force_offsets",
             )
         }
         if server.premise == "C7"
@@ -1501,6 +1593,8 @@ async def run_premise_async(
             else None
         ),
     )
+    if variant != "upstream":
+        srv.env.update(c7_force_env(args, premise))
     srv.prepare()
     srv.start()
     code = 0
@@ -1662,6 +1756,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="C7 D4: compare each pressured request with DIR/references.json "
         "instead of running alone references on the pressured server",
+    )
+    ap.add_argument(
+        "--c7-force-pause-at",
+        default=None,
+        metavar="auto|N,M",
+        help="C7 identity (D6): start the fork server with the test-only knob "
+        "OMLX_DEBUG_FORCE_DECODE_PAUSE_AT; 'auto' = an early offset plus each "
+        "reference prompt's next 2048-token block edge (needs --c7-refs-from)",
     )
     ap.add_argument(
         "--p7-mode",

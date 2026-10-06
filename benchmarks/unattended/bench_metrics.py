@@ -766,6 +766,15 @@ C7_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_tokens": 16,
         "requests": 1,
     },
+    # D6: the decode prompts, each alone (B=1) at a ceiling with headroom,
+    # once without and once with forced decode pauses.
+    "identity": {
+        "ceiling_gb": 56.0,
+        "hard_threshold": 0.8,
+        "stagger_s": 0.0,
+        "max_tokens": 2000,
+        "requests": 3,
+    },
 }
 
 
@@ -779,6 +788,9 @@ def classify_c7(scenario: str, s: dict[str, Any]) -> str:
     """One-word outcome of a C7 scenario, from a summary's counters."""
     if scenario == "never-fits":
         return "never_fits_ok" if s.get("never_fits_correct") else "never_fits_wrong"
+    if scenario == "identity":
+        # Set by the scenario from classify_c7_identity (or the refs verdict).
+        return "identity_pending"
     if scenario not in ("decode", "image-decode", "image-prefill"):
         raise ValueError(f"unknown C7 scenario: {scenario!r}")
     if s.get("aborted_requests", 0) > 0:
@@ -883,6 +895,100 @@ def summarize_c7(
     }
     summary["verdict"] = classify_c7(scenario, summary)
     return summary
+
+
+C7_BLOCK_TOKENS = 2048  # paged SSD block size of the hybrid model (log line)
+C7_FORCE_EARLY_OFFSET = 100
+C7_EDGE_NEAR_TOKENS = 16  # MTP emits a few tokens per step: "near" an edge
+
+
+def c7_force_pause_offsets(
+    prompt_tokens: list[int],
+    max_tokens: int,
+    *,
+    early: int = C7_FORCE_EARLY_OFFSET,
+    block: int = C7_BLOCK_TOKENS,
+) -> list[int]:
+    """Output offsets for OMLX_DEBUG_FORCE_DECODE_PAUSE_AT.
+
+    An early offset plus, for each prompt, the output offset whose KV reaches
+    the next ``block`` edge (prompt + offset = k * block). The knob applies
+    every offset to every request, so each request also pauses at the other
+    prompts' edges. Offsets need at least one token after them.
+    """
+    cands = {early}
+    for p in prompt_tokens:
+        cands.add((-int(p)) % block or block)
+    return sorted(o for o in cands if 1 <= o < max_tokens - 1)
+
+
+def c7_identity_rows(
+    refs: dict[str, dict[str, Any]],
+    results: list[dict[str, Any]],
+    lps: dict[str, list[dict]],
+    events: list[dict[str, Any]],
+    block: int = C7_BLOCK_TOKENS,
+) -> dict[str, dict[str, Any]]:
+    """Identity of each forced-pause request against its no-pause reference.
+
+    Adds where each pause happened: ``pause_outputs`` (output tokens at the
+    pause, the pending token included), ``kv_tokens_at_pauses`` (prompt +
+    output - 1, the cached length), the distance of each to the nearest
+    ``block`` edge, and whether the first divergence comes after the first
+    pause (None without logprob dumps).
+    """
+    by_prompt: dict[int, list[str]] = {}
+    for r in results:
+        if r.get("prompt_tokens"):
+            by_prompt.setdefault(r["prompt_tokens"], []).append(r["name"])
+    pauses: dict[str, list[dict[str, Any]]] = {}
+    for e in events:
+        names = (
+            by_prompt.get(e.get("prompt", -1), [])
+            if e["kind"] == "decode_paused"
+            else []
+        )
+        if len(names) == 1:
+            pauses.setdefault(names[0], []).append(e)
+    rows = identity_against_refs(refs, results, lps, paused=set(pauses))
+    for name, row in rows.items():
+        own = pauses.get(name, [])
+        kv = [e["tokens"] - 1 for e in own]
+        dist = [min(k % block, block - k % block) for k in kv]
+        row["pause_outputs"] = [e["output"] for e in own]
+        row["kv_tokens_at_pauses"] = kv
+        row["edge_distances"] = dist
+        row["near_edge_pause"] = any(d <= C7_EDGE_NEAR_TOKENS for d in dist)
+        after = None
+        if not row["identical"] and row.get("div_token") is not None and own:
+            after = row["div_token"] >= own[0]["output"]
+        row["divergence_after_pause"] = after
+    return rows
+
+
+def classify_c7_identity(rows: dict[str, dict[str, Any]], expected: int) -> str:
+    """One-word verdict of a forced-pause identity run.
+
+    B=1 against B=1, everything equal but the pauses: any divergence after a
+    pause is the pause's (classified by the near-tie margin); one before the
+    first pause means the setup itself is not deterministic.
+    """
+    if expected <= 0 or len(rows) < expected:
+        return "identity_run_failed"
+    if any(not row.get("pause_outputs") for row in rows.values()):
+        return "forced_pause_missing"
+    diverged = [row for row in rows.values() if not row.get("identical")]
+    if not diverged:
+        return "identity_ok"
+    after = [row for row in diverged if row.get("divergence_after_pause") is True]
+    classes = [row.get("classification") for row in after]
+    if "bug" in classes:
+        return "identity_bug"
+    if any(row.get("divergence_after_pause") is False for row in diverged):
+        return "nondeterministic"
+    if after and all(c == "noise" for c in classes) and len(after) == len(diverged):
+        return "identity_noise"
+    return "identity_inconclusive"
 
 
 def p7_default_ceiling_gb(

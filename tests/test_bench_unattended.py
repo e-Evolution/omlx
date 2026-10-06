@@ -2511,3 +2511,281 @@ class TestC7RefClean:
     def test_pause_park_or_abort_is_not_clean(self):
         for kind in ("decode_paused", "parked", "victim_abort", "abort_all", "abort"):
             assert bm.c7_ref_clean([{"kind": kind}]) is False
+
+
+# --------------------------------------------------------------------------
+# C7-identity (D6): B=1 alone with forced decode pauses vs B=1 alone without
+# --------------------------------------------------------------------------
+
+
+class TestC7ForcePauseOffsets:
+    def test_an_early_offset_plus_each_prompts_next_block_edge(self):
+        # 130028 -> 131072 (+1044), 115030 -> 116736 (+1706), 100028 -> 100352 (+324)
+        got = bm.c7_force_pause_offsets([130028, 115030, 100028], 2000)
+        assert got == [100, 324, 1044, 1706]
+
+    def test_edges_past_the_last_token_are_left_out(self):
+        # 2048 * 10 = 20480: the next edge is 2048 tokens away, past max_tokens.
+        assert bm.c7_force_pause_offsets([20480, 20000], 600) == [100, 480]
+        assert bm.c7_force_pause_offsets([1000], 1048) == [100]  # needs a token after
+
+    def test_duplicates_and_early_beyond_max_tokens(self):
+        assert bm.c7_force_pause_offsets([2048 - 100], 2000) == [100]
+        assert bm.c7_force_pause_offsets([2040], 50) == [8]
+
+    def test_block_and_early_are_configurable(self):
+        assert bm.c7_force_pause_offsets([1000], 200, early=10, block=256) == [10, 24]
+
+
+IDENT_LOG = """\
+2026-10-07 10:00:01,000 - omlx.scheduler - INFO - [-] - Paused decoding request rid-0 at 120101 tokens (prompt 120000 + output 101), stored exact prefix
+2026-10-07 10:00:01,500 - omlx.scheduler - INFO - [-] - Resumed decoding request rid-0: restored 120100 tokens exactly
+2026-10-07 10:00:05,000 - omlx.scheduler - INFO - [-] - Paused decoding request rid-0 at 120881 tokens (prompt 120000 + output 881), stored exact prefix
+2026-10-07 10:00:05,500 - omlx.scheduler - INFO - [-] - Resumed decoding request rid-0: restored 120880 tokens exactly
+2026-10-07 10:01:01,000 - omlx.scheduler - INFO - [-] - Paused decoding request rid-1 at 90103 tokens (prompt 90000 + output 103), stored exact prefix
+2026-10-07 10:01:01,500 - omlx.scheduler - INFO - [-] - Resumed decoding request rid-1: restored 90102 tokens exactly
+"""
+
+
+def _lp(tokens, margin=0.1):
+    return [
+        {"t": t, "lp": -0.1, "top": [[t, -0.1], [t + 1, -0.1 - margin]]} for t in tokens
+    ]
+
+
+def _ident_refs(ptoks, text="alpha beta gamma", lp=None):
+    return {
+        f"req{i}": {
+            "result": {**_c7req(f"req{i}", p, text=text), "completion_tokens": 3},
+            "lp": lp,
+            "clean": True,
+        }
+        for i, p in enumerate(ptoks)
+    }
+
+
+class TestC7IdentityRows:
+    def test_pauses_are_attributed_with_their_block_edge_distance(self):
+        refs = _ident_refs((120000, 90000))
+        reqs = [
+            _c7req("req0", 120000, text="alpha beta gamma"),
+            _c7req("req1", 90000, text="alpha beta gamma"),
+        ]
+        rows = bm.c7_identity_rows(
+            refs, reqs, {}, bm.parse_c7_events(IDENT_LOG), block=2048
+        )
+        r0 = rows["req0"]
+        assert r0["identical"] is True
+        assert r0["pause_outputs"] == [101, 881]
+        # KV at the pause = prompt + output - 1: 120100 and 120880; 120880 = 59 * 2048 + 48
+        assert r0["kv_tokens_at_pauses"] == [120100, 120880]
+        assert r0["edge_distances"] == [(-120100) % 2048, 48]
+        assert r0["near_edge_pause"] is False
+        assert rows["req1"]["pause_outputs"] == [103]
+
+    def test_a_pause_on_the_edge_is_near(self):
+        log = (
+            "x - Paused decoding request rid-0 at 2059 tokens (prompt 2000 + output 59), "
+            "stored exact prefix\n"
+        )
+        rows = bm.c7_identity_rows(
+            _ident_refs((2000,)),
+            [_c7req("req0", 2000, text="alpha beta gamma")],
+            {},
+            bm.parse_c7_events(log),
+            block=2048,
+        )
+        assert rows["req0"]["kv_tokens_at_pauses"] == [2058]
+        assert rows["req0"]["edge_distances"] == [10]
+        assert rows["req0"]["near_edge_pause"] is True
+
+    def test_divergence_after_the_first_pause(self):
+        ref_lp = _lp(range(200))
+        test_lp = [dict(r) for r in ref_lp]
+        test_lp[150] = {**test_lp[150], "t": 999}
+        refs = _ident_refs((120000,), lp=ref_lp)
+        reqs = [_c7req("req0", 120000, text="alpha beta delta")]
+        rows = bm.c7_identity_rows(
+            refs, reqs, {"req0": test_lp}, bm.parse_c7_events(IDENT_LOG), block=2048
+        )
+        assert rows["req0"]["div_token"] == 150
+        assert rows["req0"]["divergence_after_pause"] is True
+
+    def test_divergence_before_any_pause(self):
+        ref_lp = _lp(range(200))
+        test_lp = [dict(r) for r in ref_lp]
+        test_lp[40] = {**test_lp[40], "t": 999}
+        rows = bm.c7_identity_rows(
+            _ident_refs((120000,), lp=ref_lp),
+            [_c7req("req0", 120000, text="alpha beta delta")],
+            {"req0": test_lp},
+            bm.parse_c7_events(IDENT_LOG),
+        )
+        assert rows["req0"]["divergence_after_pause"] is False
+
+    def test_without_logprobs_the_side_is_unknown(self):
+        rows = bm.c7_identity_rows(
+            _ident_refs((120000,)),
+            [_c7req("req0", 120000, text="alpha beta delta")],
+            {},
+            bm.parse_c7_events(IDENT_LOG),
+        )
+        assert rows["req0"]["divergence_after_pause"] is None
+
+
+class TestClassifyC7Identity:
+    def _row(self, **kw):
+        base = {
+            "identical": True,
+            "pause_outputs": [101],
+            "classification": None,
+            "divergence_after_pause": None,
+        }
+        return {**base, **kw}
+
+    def test_all_identical_and_paused_is_ok(self):
+        assert (
+            bm.classify_c7_identity({"req0": self._row(), "req1": self._row()}, 2)
+            == "identity_ok"
+        )
+
+    def test_missing_or_failed_requests(self):
+        assert (
+            bm.classify_c7_identity({"req0": self._row()}, 2) == "identity_run_failed"
+        )
+        assert bm.classify_c7_identity({}, 0) == "identity_run_failed"
+
+    def test_a_request_without_a_forced_pause(self):
+        rows = {"req0": self._row(), "req1": self._row(pause_outputs=[])}
+        assert bm.classify_c7_identity(rows, 2) == "forced_pause_missing"
+
+    def test_divergence_classes(self):
+        after = dict(identical=False, divergence_after_pause=True)
+        assert (
+            bm.classify_c7_identity({"r": self._row(classification="bug", **after)}, 1)
+            == "identity_bug"
+        )
+        assert (
+            bm.classify_c7_identity(
+                {"r": self._row(classification="noise", **after)}, 1
+            )
+            == "identity_noise"
+        )
+        assert (
+            bm.classify_c7_identity(
+                {"r": self._row(classification="inconclusive", **after)}, 1
+            )
+            == "identity_inconclusive"
+        )
+        before = self._row(
+            identical=False, classification="bug", divergence_after_pause=False
+        )
+        assert bm.classify_c7_identity({"r": before}, 1) == "nondeterministic"
+        unknown = self._row(identical=False, classification="unclassified")
+        assert bm.classify_c7_identity({"r": unknown}, 1) == "identity_inconclusive"
+
+    def test_a_bug_after_a_pause_wins_over_nondeterminism(self):
+        rows = {
+            "a": self._row(
+                identical=False, classification="noise", divergence_after_pause=False
+            ),
+            "b": self._row(
+                identical=False, classification="bug", divergence_after_pause=True
+            ),
+        }
+        assert bm.classify_c7_identity(rows, 2) == "identity_bug"
+
+    def test_identity_scenario_defaults_to_headroom(self):
+        d = bm.c7_defaults("identity")
+        assert (
+            d["ceiling_gb"] == 56.0 and d["requests"] == 3 and d["max_tokens"] == 2000
+        )
+        assert bm.classify_c7("identity", {}) == "identity_pending"
+
+
+class TestC7ForceEnv:
+    def _args(self, tmp_path, raw, scenario="identity", refs=True):
+        import argparse
+
+        if refs:
+            bm.save_c7_refs(
+                tmp_path / "references.json",
+                {
+                    f"req{i}": {"result": {"prompt_tokens": p}}
+                    for i, p in enumerate((130028, 115030, 100028))
+                },
+                56.0,
+            )
+        return argparse.Namespace(
+            c7_scenario=scenario,
+            c7_force_pause_at=raw,
+            c7_refs_from=str(tmp_path) if refs else None,
+            c7_max_tokens=2000,
+        )
+
+    def test_unset_is_empty(self, tmp_path):
+        assert bp.c7_force_env(self._args(tmp_path, None), "C7") == {}
+        assert bp.c7_force_env(self._args(tmp_path, "auto"), "P7") == {}
+
+    def test_auto_derives_offsets_from_the_references(self, tmp_path):
+        env = bp.c7_force_env(self._args(tmp_path, "auto"), "C7")
+        assert env == {"OMLX_DEBUG_FORCE_DECODE_PAUSE_AT": "100,324,1044,1706"}
+
+    def test_explicit_offsets(self, tmp_path):
+        env = bp.c7_force_env(self._args(tmp_path, " 500,100 "), "C7")
+        assert env == {"OMLX_DEBUG_FORCE_DECODE_PAUSE_AT": "100,500"}
+
+    def test_misuse_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError):
+            bp.c7_force_env(self._args(tmp_path, "auto", scenario="decode"), "C7")
+        with pytest.raises(ValueError):
+            bp.c7_force_env(self._args(tmp_path, "auto", refs=False), "C7")
+        with pytest.raises(ValueError):
+            bp.c7_force_env(self._args(tmp_path, "10,x"), "C7")
+
+
+class TestScenarioC7Identity(TestScenarioC7):
+    def test_reference_pass_runs_the_decode_prompts_alone(self, tmp_path):
+        ctx, calls, _, asyncio = self._ctx("identity", paused_log="")
+        ctx.server.out = tmp_path
+        ctx.args.c7_refs_only = True
+        ctx.args.p7_ceiling_gb = 56.0
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert [c[0] for c in calls] == ["req0", "req1", "req2"]
+        assert [c[1] for c in calls] == [
+            f"PROMPT[C7|decode|{i}:{n}]" for i, n in enumerate(bp.P7_NOMINAL_TOKENS)
+        ]
+        assert all(c[3] == bp.SAMPLING_GREEDY for c in calls)
+        assert set(bm.load_c7_refs(tmp_path / "references.json")["refs"]) == {
+            "req0",
+            "req1",
+            "req2",
+        }
+        assert sc["summary"]["verdict"] == "refs_ok"
+
+    def test_forced_pass_runs_alone_and_compares_with_the_references(self, tmp_path):
+        log = IDENT_LOG + (
+            "x - Paused decoding request rid-2 at 100101 tokens (prompt 100000 + output 101), "
+            "stored exact prefix\n"
+        )
+        ctx, calls, _, asyncio = self._ctx("identity", paused_log=log)
+        bm.save_c7_refs(
+            tmp_path / "references.json", _ident_refs((120000, 90000, 100000)), 56.0
+        )
+        ctx.args.c7_refs_from = str(tmp_path)
+        ctx.args.c7_force_pause_at = "auto"
+        ctx.args.c7_force_offsets = [100, 324]
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert [c[0] for c in calls] == ["req0", "req1", "req2"]
+        assert all(c[3] == bp.SAMPLING_GREEDY for c in calls)
+        assert sc["force_pause_offsets"] == [100, 324]
+        assert sc["identity"]["req0"]["pause_outputs"] == [101, 881]
+        assert sc["summary"]["identity"]["identical"] == 3
+        assert sc["summary"]["verdict"] == "identity_ok"
+        assert bp.scenario_ok("C7", sc) is True
+
+    def test_forced_pass_needs_references(self):
+        ctx, _, _, asyncio = self._ctx("identity", paused_log="")
+        ctx.args.c7_force_pause_at = "auto"
+        with pytest.raises(ValueError):
+            asyncio.run(bp.scenario_c7(ctx))
