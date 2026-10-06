@@ -48,7 +48,7 @@ from test_scheduler_park_resume_priority import _parked_request
 from test_scheduler_prefill_memory_guard import _make_scheduler
 
 import omlx.scheduler as scheduler_module
-from omlx.request import Request, SamplingParams
+from omlx.request import MemoryVictim, Request, SamplingParams
 from omlx.settings import GlobalSettings, SchedulerSettings
 
 GB = 1024**3
@@ -274,10 +274,11 @@ class TestEnforcerLeavesTheSoloRequestAlone:
 
     @pytest.mark.asyncio
     async def test_the_emergency_brake_still_aborts_it(self, enforcer):
+        # Pausing ~1 GB cannot get 103 GB under the ceiling: no pause-first.
         # The emergency brake measures against the physical cap (#4312); here
         # it is the ceiling.
         enforcer._get_abort_limit_bytes = lambda: 100 * GB
-        scheduler = _SoloScheduler([_victim("a", kept=0)], solo="a")
+        scheduler = _SoloScheduler([MemoryVictim("a", 9_000, GB, 0)], solo="a")
         engine = _engine(scheduler)
         _busy(enforcer, engine)
 

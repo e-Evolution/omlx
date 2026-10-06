@@ -228,7 +228,9 @@ class TestEnforcerPausesDecodingVictims:
 
     @pytest.mark.asyncio
     async def test_emergency_aborts_everything_without_pausing(self, enforcer):
-        scheduler = _ScriptedScheduler([_victim("big")])
+        # A pause of ~1 GB cannot bring 103 GB under the 100 GB ceiling, so
+        # the emergency pause-first does not apply.
+        scheduler = _ScriptedScheduler([MemoryVictim("big", 9_000, GB, 2)])
         engine = _engine(scheduler)
         _busy(enforcer, engine)
 

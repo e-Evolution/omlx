@@ -274,6 +274,17 @@ def test_off_rejects_a_fits_later_request_with_the_old_error(gated):
     assert rejection.message.startswith("Prefill would require")
 
 
+def test_off_does_not_exempt_an_external_prefill_from_the_enforcer():
+    """An external-loop prefill with nothing admitted is not reported as solo
+    off, so the enforcer's hard-pressure path stays upstream's."""
+    scheduler = _make_scheduler()
+    scheduler._external_prefill_request_id = "ext"
+    scheduler._memory_scheduling = True
+    assert scheduler.memory_pressure_solo_request() == "ext"
+    scheduler._memory_scheduling = False
+    assert scheduler.memory_pressure_solo_request() is None
+
+
 def test_off_endpoint_says_why_capacity_is_unavailable(
     capacity_env,
     monkeypatch,
