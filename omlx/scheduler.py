@@ -269,6 +269,38 @@ DEFERRED_ADMISSION_RETRY_BASE_S = 0.25
 DEFERRED_ADMISSION_RETRY_MAX_S = 4.0
 
 
+def _weights_parameter_root(model: Any) -> Any:
+    """The module whose ``parameters()`` hold a scheduler model's weights.
+
+    ``nn.Module.parameters()`` skips attributes whose name starts with an
+    underscore. ``VLMModelAdapter`` keeps the mlx-vlm model (vision tower,
+    language model, MTP head) in ``_vlm_model``, and the VLM-MTP proxy keeps
+    the adapter in ``_adapter``, so their own parameters are empty. Unwrap
+    both; any other model is its own root.
+    """
+
+    def own(node: Any, attr: str) -> Any:
+        # Own attributes only: proxies and mocks answer any getattr.
+        if isinstance(node, dict):  # nn.Module stores children as items
+            return node.get(attr)
+        try:
+            return vars(node).get(attr)
+        except TypeError:
+            return None
+
+    seen: set[int] = set()
+    node = model
+    while id(node) not in seen:
+        seen.add(id(node))
+        inner = own(node, "_adapter")
+        if inner is None:
+            inner = own(node, "_vlm_model")
+        if inner is None:
+            break
+        node = inner
+    return node
+
+
 def _deferred_admission_backoff_s(attempts: int) -> float:
     """Seconds a head waits after its ``attempts``-th consecutive deferral."""
     exponent = min(max(int(attempts), 1) - 1, 32)
@@ -13433,11 +13465,16 @@ class Scheduler:
             return cached
         total = 0
         try:
-            total = sum(
-                int(value.nbytes)
-                for _, value in tree_flatten(self.model.parameters())
+            # Each array once: a wrapper may reach the same arrays twice (the
+            # VLM adapter holds the model and its language model).
+            arrays = {
+                id(value): int(value.nbytes)
+                for _, value in tree_flatten(
+                    _weights_parameter_root(self.model).parameters()
+                )
                 if isinstance(value, mx.array)
-            )
+            }
+            total = sum(arrays.values())
         except Exception:  # noqa: BLE001 - unknown model shape: no estimate
             total = 0
         if total > 0:
