@@ -397,6 +397,7 @@ class TestSchedulerSettings:
             "prefill_progress_commit_blocks": 0,
             "memory_pressure_park": False,
             "max_parks_per_request": 3,
+            "max_decode_pauses_per_request": 8,
             "park_resume_ok_polls": 3,
             "max_batched_decode_context_tokens": 0,
             "batched_decode_hold_max_s": 120.0,

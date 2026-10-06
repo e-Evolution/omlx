@@ -508,6 +508,8 @@ class ProcessMemoryEnforcer:
         # settled yet; no other victim is chosen meanwhile. See
         # _abort_single_victim.
         self._draining_victim: _DrainingVictim | None = None
+        # The solo request last logged as exempt (one line per request).
+        self._solo_logged: str | None = None
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1724,6 +1726,57 @@ class ProcessMemoryEnforcer:
             return 1
         return 0
 
+    def _solo_exempt_request(self) -> tuple[str, str] | None:
+        """(model id, request id) of a request running alone, else None.
+
+        A scheduler reports its solo request (``memory_pressure_solo_request``)
+        only while it is that scheduler's only admitted request. It is exempt
+        from hard-pressure pauses and aborts only when nothing else runs in
+        the process either: every other loaded engine is idle. Pausing it
+        would resume it at once (nothing else is admitted while it waits),
+        so below the emergency threshold the enforcer leaves it running; the
+        emergency brake beyond the ceiling still aborts it.
+        """
+        solo: tuple[str, str] | None = None
+        for model_id, entry in self._engine_pool._entries.items():
+            engine = getattr(entry, "engine", None)
+            if engine is None:
+                continue
+            scheduler = self._resolve_scheduler(entry)
+            probe = getattr(scheduler, "memory_pressure_solo_request", None)
+            rid = None
+            if callable(probe):
+                try:
+                    rid = probe()
+                except Exception:  # noqa: BLE001 - no exemption on a failing probe
+                    return None
+            if isinstance(rid, str):
+                if solo is not None:
+                    return None
+                solo = (model_id, rid)
+                continue
+            active = getattr(engine, "has_active_requests", None)
+            try:
+                busy = bool(active()) if callable(active) else True
+            except Exception:  # noqa: BLE001
+                busy = True
+            if busy:
+                return None
+        return solo
+
+    def _log_solo_exempt(self, solo: tuple[str, str], ceiling: int) -> None:
+        model_id, rid = solo
+        if self._solo_logged == rid:
+            return
+        self._solo_logged = rid
+        logger.warning(
+            "Hard memory pressure: %s runs alone (solo) on '%s'; it is not "
+            "paused or aborted below the emergency threshold (ceiling %s)",
+            rid,
+            model_id,
+            _format_gb(ceiling),
+        )
+
     @staticmethod
     def _victim_abort_pending(engine: Any, request_id: str) -> bool:
         """Whether the engine still holds the victim (abort not run yet).
@@ -2027,6 +2080,16 @@ class ProcessMemoryEnforcer:
             self._walk_store_cache_caps()
             return
 
+        # A request running alone is neither paused nor aborted below the
+        # emergency threshold: nothing else could use the memory it frees.
+        solo = (
+            self._solo_exempt_request()
+            if new_level == "hard" and not emergency
+            else None
+        )
+        if solo is not None:
+            self._log_solo_exempt(solo, ceiling)
+
         # Park before abort: a scheduler with a parkable prefill victim pauses
         # it (work already done survives in the prefix cache) and the abort
         # below only runs when nothing is left to park, the deferral budget is
@@ -2034,6 +2097,7 @@ class ProcessMemoryEnforcer:
         if (
             new_level == "hard"
             and not emergency
+            and solo is None
             and self._park_deferred_polls < self._PARK_DEFER_POLLS_MAX
         ):
             parked_on = self._request_scheduler_park()
@@ -2104,6 +2168,8 @@ class ProcessMemoryEnforcer:
                 # No non-pinned victim. Loaded models are pinned or no loaded
                 # engines exist at all.
                 if new_level == "hard":
+                    if solo is not None:
+                        break
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
                         entry = self._engine_pool._entries.get(busy_victim)
