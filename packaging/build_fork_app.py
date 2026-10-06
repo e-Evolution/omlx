@@ -88,6 +88,10 @@ FORK_ENV = {
     # Retained thinking is capped at about this many tokens (the unbounded
     # preserve_thinking=true corrupted output at about 50k).
     "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
+    # The fork app serves unattended agents on a known machine where memory
+    # pressure is expected, so memory scheduling (never-fits 400, fits-later
+    # wait, progress-based stall clock) is on whatever the guard tier is.
+    "OMLX_MEMORY_SCHEDULING": "on",
 }
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap
