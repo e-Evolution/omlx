@@ -2070,6 +2070,7 @@ class TestSummarizeC7:
             "bug": 1,
             "inconclusive": 0,
             "unclassified": 0,
+            "text_only": 0,
         }
 
     def test_never_fits_correctness_passthrough(self):
@@ -2789,3 +2790,68 @@ class TestScenarioC7Identity(TestScenarioC7):
         ctx.args.c7_force_pause_at = "auto"
         with pytest.raises(ValueError):
             asyncio.run(bp.scenario_c7(ctx))
+
+
+class TestC7TextOnlyDivergence:
+    """C7e: tokens and logprobs equal, streamed text differs (MTP off, req2)."""
+
+    def test_equal_tokens_with_different_text_is_text_only(self):
+        lp = _lp(range(50))
+        v = bm.identity_verdict(
+            _c7req("a", 1, text="x /y z"),
+            _c7req("b", 1, text="x/ y z"),
+            ref_lp=lp,
+            test_lp=[dict(r) for r in lp],
+        )
+        assert v["identical"] is False
+        assert v["tokens_identical"] is True
+        assert v["classification"] == "text_only"
+
+    def test_a_token_divergence_is_not_text_only(self):
+        ref_lp = _lp(range(50))
+        test_lp = [dict(r) for r in ref_lp]
+        test_lp[10] = {**test_lp[10], "t": 999}
+        v = bm.identity_verdict(
+            _c7req("a", 1, text="x y"), _c7req("b", 1, text="x q"),
+            ref_lp=ref_lp, test_lp=test_lp,
+        )
+        assert v["tokens_identical"] is False
+        assert v["classification"] != "text_only"
+
+    def test_a_shorter_test_dump_is_not_text_only(self):
+        lp = _lp(range(50))
+        v = bm.identity_verdict(
+            _c7req("a", 1, text="x y"), _c7req("b", 1, text="x q"),
+            ref_lp=lp, test_lp=lp[:40],
+        )
+        assert v["tokens_identical"] is False
+
+    def test_the_text_context_shows_both_windows_and_chunks(self):
+        ref = _c7req("a", 1, text="abc /def", chunk_chars=[3, 1, 1, 3])
+        test = _c7req("b", 1, text="abc/ def", chunk_chars=[3, 2, 3])
+        v = bm.identity_verdict(ref, test)
+        ctx = v["text_context"]
+        assert v["first_divergence_chars"] == 3
+        assert ctx["ref"] == "abc /def" and ctx["test"] == "abc/ def"
+        assert ctx["ref_chunks"] == ["abc", " ", "/", "def"]
+        assert ctx["test_chunks"] == ["abc", "/ ", "def"]
+
+    def test_identity_rollup_counts_text_only(self):
+        ident = {
+            "req0": {"identical": True, "paused": True, "classification": None},
+            "req1": {"identical": False, "paused": True, "classification": "text_only"},
+        }
+        s = _c7sum("decode", [_c7req("req0", 120000)], identity=ident)
+        assert s["identity"]["text_only"] == 1
+
+    def test_text_only_rows_give_the_tokens_ok_verdict(self):
+        rows = {
+            "req0": {"identical": True, "pause_outputs": [101]},
+            "req1": {
+                "identical": False,
+                "pause_outputs": [101],
+                "classification": "text_only",
+                "divergence_after_pause": None,
+            },
+        }
+        assert bm.classify_c7_identity(rows, 2) == "identity_tokens_ok"

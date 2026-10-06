@@ -605,7 +605,10 @@ def identity_verdict(
     """Greedy identity of a request against its uninterrupted run.
 
     ``classification`` is None when identical; with logprob dumps it is the
-    near-tie verdict (noise / bug / inconclusive), otherwise ``unclassified``.
+    near-tie verdict (noise / bug / inconclusive), ``text_only`` when both
+    dumps hold the same tokens (the streamed text differs, the model did
+    not), otherwise ``unclassified``. ``text_context`` shows both texts
+    around the divergence and the SSE chunks that carried them.
     """
     ref_text, test_text = ref.get("text") or "", test.get("text") or ""
     div = first_divergence(ref_text, test_text)
@@ -619,15 +622,47 @@ def identity_verdict(
     if div is None:
         return out
     out["classification"] = "unclassified"
+    out["text_context"] = text_divergence_context(ref, test, div)
     if ref_lp and test_lp:
         cmp = compare_logprobs(ref_lp, test_lp)
+        same = cmp["div_index"] is None and cmp["n_ref"] == cmp["n_test"]
         out.update(
-            classification=classify_divergence(cmp) or "unclassified",
+            classification=(
+                "text_only" if same else classify_divergence(cmp) or "unclassified"
+            ),
+            tokens_identical=same,
             div_token=cmp["div_index"],
             margin=cmp["margin"],
             mean_abs_dlp=cmp["mean_abs_dlp"],
         )
     return out
+
+
+def _chunks_in_window(text: str, chunk_chars: Any, lo: int, hi: int) -> list[str]:
+    """The SSE chunk pieces of ``text`` overlapping [lo, hi)."""
+    out: list[str] = []
+    pos = 0
+    for n in chunk_chars or []:
+        end = pos + int(n)
+        if end > lo and pos < hi:
+            out.append(text[pos:end])
+        pos = end
+    return out
+
+
+def text_divergence_context(
+    ref: dict[str, Any], test: dict[str, Any], div: int, window: int = 60
+) -> dict[str, Any]:
+    """Both texts around the first divergence, with their SSE chunks."""
+    lo, hi = max(0, div - window), div + window
+    ref_text, test_text = ref.get("text") or "", test.get("text") or ""
+    return {
+        "start": lo,
+        "ref": ref_text[lo:hi],
+        "test": test_text[lo:hi],
+        "ref_chunks": _chunks_in_window(ref_text, ref.get("chunk_chars"), lo, hi),
+        "test_chunks": _chunks_in_window(test_text, test.get("chunk_chars"), lo, hi),
+    }
 
 
 def c7_ref_clean(events: list[dict[str, Any]]) -> bool:
@@ -889,6 +924,7 @@ def summarize_c7(
             "bug": classes.count("bug"),
             "inconclusive": classes.count("inconclusive"),
             "unclassified": classes.count("unclassified"),
+            "text_only": classes.count("text_only"),
         },
         "never_fits_correct": None if never_fits is None else bool(never_fits.get("correct")),
         "events": events,
@@ -980,6 +1016,8 @@ def classify_c7_identity(rows: dict[str, dict[str, Any]], expected: int) -> str:
     diverged = [row for row in rows.values() if not row.get("identical")]
     if not diverged:
         return "identity_ok"
+    if all(row.get("classification") == "text_only" for row in diverged):
+        return "identity_tokens_ok"  # same tokens; only the streamed text differs
     after = [row for row in diverged if row.get("divergence_after_pause") is True]
     classes = [row.get("classification") for row in after]
     if "bug" in classes:
