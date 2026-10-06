@@ -2476,6 +2476,12 @@ class Scheduler:
         # (see memory_pressure_solo_request). Read by the enforcer thread.
         self._solo_request_id: str | None = None
         self._solo_logged: tuple[str, int] | None = None
+        # The request running the external (non-chunked) prefill loop, set for
+        # the duration of that loop. It cannot be parked; the enforcer reads
+        # it through memory_pressure_solo_request.
+        self._external_prefill_request_id: str | None = None
+        # Last "media prefill deferred" log line (request id, park count).
+        self._media_reservation_logged: str | None = None
         # Decode pause: ids asked for by request_decode_pause (thread-safe set,
         # drained at step start) and the resume record of each paused row.
         self._pending_decode_pauses: set[str] = set()
@@ -12359,13 +12365,18 @@ class Scheduler:
         return solo is not None and solo is not head
 
     def memory_pressure_solo_request(self) -> str | None:
-        """The solo request when it is the only admitted request, else None.
+        """The request running alone, for the memory enforcer, else None.
 
-        Thread-safe read for the memory enforcer: at hard pressure below
-        the emergency threshold it neither pauses nor aborts this request,
-        because nothing else runs and pausing it would only resume it again.
+        The solo request when it is the only admitted request, or a request
+        in the external prefill loop with nothing else admitted (it cannot
+        be parked, and with nothing else running aborting it frees memory
+        for nobody). Thread-safe read: at hard pressure below the emergency
+        threshold the enforcer neither pauses nor aborts it.
         """
         try:
+            external = self._external_prefill_request_id
+            if external is not None and not self._admitted_request_ids():
+                return external
             solo = self._solo_request()
             if solo is None or self._admitted_request_ids() != {solo.request_id}:
                 return None
@@ -14125,7 +14136,58 @@ class Scheduler:
                 )
                 raise _PreflightDeferredError()
             return safety_rejection
+        if self._external_media_reservation_short(request, est):
+            raise _PreflightDeferredError()
         return None
+
+    def _external_media_reservation_short(
+        self, request: "Request", est: "_AdmissionEstimate"
+    ) -> bool:
+        """Whether a media prefill must wait for room under the hard line.
+
+        A media prompt whose images are not all cached prefills in the
+        external loop: it cannot be parked, and its KV plus chunk working set
+        lands at once. Beside admitted work its estimated peak (current
+        usage, exact KV and transient; the embeddings are already in current)
+        is reserved against the resume line, the hard watermark minus the
+        hysteresis margin, so its spike cannot push the process past the
+        watermark into an abort. When it does not fit it waits at the head
+        (deferred, nothing overtakes it) until an admitted row leaves or
+        memory frees. It does not pause a decoding row to make room: the
+        paused row would be parked ahead of it (parked requests resume in
+        arrival order) and take the room back first. With nothing admitted
+        it runs: alone, the enforcer leaves its external loop to the
+        emergency brake (see memory_pressure_solo_request). Only with the
+        park feature on.
+        """
+        if not self._park_enabled():
+            return False
+        if getattr(request, "vlm_inputs_embeds", None) is None:
+            return False
+        media_end = getattr(request, "vlm_media_end", None)
+        if (
+            isinstance(media_end, int)
+            and media_end > 0
+            and int(request.cached_tokens or 0) >= media_end
+            and _media_text_suffix_chunked_enabled()
+        ):
+            return False  # every image cached: the chunked text-suffix route
+        if not self._num_admitted_requests():
+            return False
+        lines = self._park_resume_lines()
+        if lines is None or est.estimated <= lines[0]:
+            return False
+        if self._media_reservation_logged != request.request_id:
+            self._media_reservation_logged = request.request_id
+            logger.info(
+                "Deferring media prefill %s: its external-loop peak ~%.1f GB "
+                "would cross the hard watermark line %.1f GB beside admitted "
+                "work; it waits for admitted requests to finish",
+                request.request_id,
+                est.estimated / 1024**3,
+                lines[0] / 1024**3,
+            )
+        return True
 
     def _admission_estimate(
         self,
@@ -15535,6 +15597,7 @@ class Scheduler:
                 self.request_id_to_uid[request.request_id] = temp_uid
                 self.uid_to_request_id[temp_uid] = request.request_id
 
+                self._external_prefill_request_id = request.request_id
                 try:
                     prefilled_cache, last_token = self._do_external_prefill(
                         request,
@@ -15598,6 +15661,8 @@ class Scheduler:
                         )
                     )
                     continue
+                finally:
+                    self._external_prefill_request_id = None
 
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]

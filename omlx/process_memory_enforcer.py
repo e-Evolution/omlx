@@ -133,6 +133,10 @@ _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
 # Longest a prefill waits for released dirty hot-cache blocks to reach SSD.
 _HOT_CACHE_WRITE_WAIT_S = 5.0
 
+# ``_abort_single_victim`` result when the engine found no live request to
+# abort: queued requests hold no memory, so aborting them frees nothing.
+_NO_LIVE_VICTIM = object()
+
 
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
@@ -517,6 +521,9 @@ class ProcessMemoryEnforcer:
         self._draining_victim: _DrainingVictim | None = None
         # The solo request last logged as exempt (one line per request).
         self._solo_logged: str | None = None
+        # Emergency pause-first in flight: (model id, request id, polls, the
+        # usage it started at, the status probe). See _emergency_pause_first.
+        self._emergency_pause: tuple[str, str, int, int, Any] | None = None
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1310,6 +1317,11 @@ class ProcessMemoryEnforcer:
     # run and its memory to settle. A prefill chunk can hold the scheduler
     # step for ~5 one-second polls, so this covers two chunk boundaries.
     _SINGLE_VICTIM_SETTLE_MAX_POLLS = 10
+    # Emergency pause-first: polls the abort-all waits for one decode pause
+    # that brings usage under the ceiling. The pause runs at the next step and
+    # its exact store must reach the SSD, so one poll is often not enough;
+    # two bound the extra exposure beyond the ceiling.
+    _EMERGENCY_PAUSE_MAX_POLLS = 2
 
     def _pool_bytes(self) -> int:
         """MLX buffer-pool size, 0 when unreadable (mocked mx in tests)."""
@@ -1632,9 +1644,10 @@ class ProcessMemoryEnforcer:
         """Abort the one request freeing the most memory; None means fall back.
 
         Returns None when the switch is off, the engine has no such hook, the
-        hook fails, no live request can be chosen, or the chosen one could
-        not be aborted (``skipped``), so the caller aborts everything as
-        before for this poll. The abort itself is deferred to the scheduler
+        hook fails, or the chosen one could not be aborted (``skipped``), so
+        the caller aborts everything as before for this poll. Returns
+        ``_NO_LIVE_VICTIM`` when no live request can be chosen: what is left
+        is queued requests holding no memory, and the caller aborts nothing. The abort itself is deferred to the scheduler
         step, so while the previous victim's abort is pending or its memory
         has not settled (abort seen to have run, then one more poll) the
         same victim is returned and nobody else is sacrificed, for at most
@@ -1660,7 +1673,7 @@ class ProcessMemoryEnforcer:
             )
             return None
         if victim is None:
-            return None
+            return _NO_LIVE_VICTIM
         skipped = getattr(victim, "skipped", None)
         if skipped:
             logger.warning(
@@ -1787,6 +1800,102 @@ class ProcessMemoryEnforcer:
             )
             return 1
         return 0
+
+    def _emergency_pause_first(self, current: int, ceiling: int) -> bool:
+        """At emergency pressure, pause one decoding row before abort-all.
+
+        Asks every scheduler for its largest pausable decoding row
+        (``select_decode_pause_victim``) and pauses the largest one only when
+        freeing its estimated bytes brings usage under the ceiling. While
+        that pause is pending (not run yet, or its exact chain still on its
+        way to the SSD) the abort-all waits, for at most
+        ``_EMERGENCY_PAUSE_MAX_POLLS`` polls and only while usage does not
+        grow past where it started. Returns True when the abort-all is
+        deferred this poll. Nothing pausable, a pause that would not get
+        under the ceiling, a declined or exhausted one: False, and the
+        emergency abort-all runs as the last resort.
+        """
+        pending = self._emergency_pause
+        if pending is not None:
+            model_id, rid, polls, started_at, status = pending
+            try:
+                state = status()
+            except Exception:  # noqa: BLE001
+                state = "declined"
+            if (
+                state == "pending"
+                and polls < self._EMERGENCY_PAUSE_MAX_POLLS
+                and current <= started_at
+            ):
+                self._emergency_pause = (model_id, rid, polls + 1, started_at, status)
+                logger.warning(
+                    "Emergency memory pressure: waiting for the decode pause of "
+                    "%s on '%s' before aborting (poll %d/%d)",
+                    rid,
+                    model_id,
+                    polls + 1,
+                    self._EMERGENCY_PAUSE_MAX_POLLS,
+                )
+                return True
+            self._emergency_pause = None
+            # A pause that ran (done) and still left an emergency, or one that
+            # was declined or ran out of polls: abort-all, the last resort.
+            return False
+        best = None
+        for model_id, entry in self._engine_pool._entries.items():
+            scheduler = self._resolve_scheduler(entry)
+            select = getattr(scheduler, "select_decode_pause_victim", None)
+            pause = getattr(scheduler, "request_decode_pause", None)
+            status = getattr(scheduler, "decode_pause_status", None)
+            if not (callable(select) and callable(pause) and callable(status)):
+                continue
+            try:
+                victim = select()
+            except Exception:  # noqa: BLE001
+                continue
+            est = int(getattr(victim, "est_bytes", 0) or 0)
+            rid = getattr(victim, "request_id", None)
+            if not isinstance(rid, str) or est <= 0:
+                continue
+            if best is None or est > best[0]:
+                best = (est, model_id, rid, pause, status)
+        if best is None:
+            return False
+        est, model_id, rid, pause, status = best
+        if current - est >= ceiling:
+            logger.warning(
+                "Emergency memory pressure: pausing %s (~%s) would not bring "
+                "usage %s under the ceiling %s; aborting instead",
+                rid,
+                _format_gb(est),
+                _format_gb(current),
+                _format_gb(ceiling),
+            )
+            return False
+        try:
+            accepted = pause(rid) is True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Emergency decode pause of %s failed: %s", rid, exc)
+            return False
+        if not accepted:
+            return False
+        self._emergency_pause = (
+            model_id,
+            rid,
+            0,
+            current,
+            lambda rid=rid, probe=status: probe(rid),
+        )
+        logger.warning(
+            "Emergency memory pressure: pausing decoding request %s (~%s) on "
+            "'%s' before aborting everything (current=%s, ceiling=%s)",
+            rid,
+            _format_gb(est),
+            model_id,
+            _format_gb(current),
+            _format_gb(ceiling),
+        )
+        return True
 
     def _solo_exempt_request(self) -> tuple[str, str] | None:
         """(model id, request id) of a request running alone, else None.
@@ -2178,6 +2287,15 @@ class ProcessMemoryEnforcer:
                 self._walk_store_cache_caps()
                 return
 
+        # Emergency pause-first: beyond the ceiling, one decode pause that
+        # frees enough to get back under it comes before aborting everything.
+        if new_level == "hard" and emergency:
+            if self._emergency_pause_first(current, ceiling):
+                self._walk_store_cache_caps()
+                return
+        else:
+            self._emergency_pause = None
+
         # Recover below soft regardless of level — prevents oscillation
         # at the boundary.
         target = soft
@@ -2254,6 +2372,15 @@ class ProcessMemoryEnforcer:
                                     entry.engine, busy_victim
                                 )
                             )
+                            if single is _NO_LIVE_VICTIM:
+                                logger.warning(
+                                    "Hard memory pressure on '%s': no live "
+                                    "request holds memory to free (queued "
+                                    "requests hold none); nothing aborted, the "
+                                    "emergency brake stays armed",
+                                    busy_victim,
+                                )
+                                break
                             if single is not None:
                                 break
                             # Only the non-emergency path keeps the model
