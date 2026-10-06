@@ -207,6 +207,77 @@ async def test_three_requests_that_fit_one_at_a_time_complete_without_a_stall(
 
 
 @pytest.mark.asyncio
+async def test_a_head_behind_a_parked_solo_waits_with_memory_scheduling_off(
+    tmp_path, mock_engine_pool, clock, monkeypatch, caplog  # noqa: F811
+):
+    """Park on, memory scheduling off (no explicit ceiling). A request paused
+    twice while alone resumes as the solo request (D1, park only). The head
+    queued behind it must wait while the solo request emits tokens: the
+    fixed 60 s clock failed it, as in C7, although the server progressed."""
+    prompts = {"a": dp.PROMPT, "b": dp.OTHER}
+    expected = _baseline(tmp_path, prompts)
+    enforcer = _make_enforcer(
+        mock_engine_pool,
+        ceiling=100 * GB,
+        soft_threshold=0.85,
+        hard_threshold=0.95,
+        memory_scheduling="off",
+    )
+    rig = park._Rig(
+        tmp_path / "solo-off",
+        dp._tokenizer(),
+        split=False,
+        commit_blocks=1,
+        max_blocks=dp.MAX_BLOCKS,
+        memory_pressure_park=True,
+    )
+    try:
+        scheduler = rig.scheduler
+        scheduler.note_pressure_poll("soft")
+        engine = _rig_engine(rig)
+        _busy(enforcer, engine)
+        rows = [_submit(rig, "a", dp.PROMPT, 1.0)]
+        outputs = []
+
+        async def advance(gb=90):
+            await tick(enforcer, gb)
+            outputs.extend(park.step(rig))
+            clock.advance(STEP_S)
+
+        async def until(predicate, limit=60):
+            for _ in range(limit):
+                if predicate():
+                    return
+                await advance()
+            raise AssertionError("condition not reached")
+
+        # a decodes; two pauses while it is alone make it the solo request.
+        await until(lambda: "a" in scheduler.running and rows[0].output_token_ids)
+        for pauses in (1, 2):
+            assert scheduler.request_decode_pause("a") is True
+            await until(lambda n=pauses: rows[0].park_count == n)
+            await until(lambda: "a" in scheduler.running)
+        assert scheduler._memory_scheduling is False
+        assert scheduler._solo_request_id == "a"
+        assert len(rows[0].output_token_ids) < MAX_TOKENS - 35  # > 70 s left
+
+        rows.append(_submit(rig, "b", dp.OTHER, 2.0))
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            await until(lambda: _finished(rows, outputs), limit=12 * MAX_TOKENS)
+
+        assert [o for o in outputs if o.error] == []
+        engine.abort_one_request_for_memory.assert_not_awaited()
+        engine.abort_all_requests.assert_not_awaited()
+        for row in rows:
+            rid = row.request_id
+            assert list(row.output_token_ids) == expected[rid]
+            assert dp.streamed_tokens(outputs, rid) == expected[rid]
+        assert "Admission waiting for memory: solo_hold" in caplog.text
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_a_queued_request_still_fails_when_nothing_progresses(
     tmp_path, enforcer, clock, monkeypatch
 ):
