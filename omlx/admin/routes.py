@@ -676,6 +676,7 @@ class GlobalSettingsRequest(BaseModel):
     memory_guard_custom_ceiling_gb: float | None = (
         None  # only used when tier == "custom"
     )
+    memory_scheduling: str | None = None  # "auto" / "on" / "off"
 
     # Scheduler settings
     max_concurrent_requests: int | None = None
@@ -4599,6 +4600,7 @@ def _global_settings_response(global_settings):
             "prefill_memory_guard": global_settings.memory.prefill_memory_guard,
             "memory_guard_tier": global_settings.memory.memory_guard_tier,
             "memory_guard_custom_ceiling_gb": global_settings.memory.memory_guard_custom_ceiling_gb,
+            "memory_scheduling": global_settings.memory.memory_scheduling,
         },
         "scheduler": {
             "max_concurrent_requests": global_settings.scheduler.max_concurrent_requests,
@@ -5028,6 +5030,30 @@ async def update_global_settings(
             f"Prefill memory guard "
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
+
+    # Apply memory scheduling mode (Live): the enforcer re-resolves it
+    # against the guard and ceiling and propagates it to every scheduler.
+    if request.memory_scheduling is not None:
+        from ..settings import (
+            VALID_MEMORY_SCHEDULING_MODES,
+            normalize_memory_scheduling,
+        )
+
+        mode = normalize_memory_scheduling(request.memory_scheduling)
+        if mode is None:
+            raise HTTPException(
+                status_code=400,
+                detail=[
+                    f"Invalid memory_scheduling: {request.memory_scheduling!r} "
+                    f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
+                ],
+            )
+        global_settings.memory.memory_scheduling = mode
+        from ..server import _server_state
+
+        if _server_state.process_memory_enforcer is not None:
+            _server_state.process_memory_enforcer.memory_scheduling = mode
+        runtime_applied.append("memory_scheduling")
 
     # Apply scheduler settings
     if request.max_concurrent_requests is not None:

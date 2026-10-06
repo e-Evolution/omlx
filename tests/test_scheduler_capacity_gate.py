@@ -44,6 +44,7 @@ def gated(monkeypatch):
     ``admitted[0]`` are the current usage and admitted rows it reads."""
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
+    scheduler._memory_scheduling = True  # memory.memory_scheduling resolved on
     scheduler._memory_hard_limit_bytes = 100 * GB
     scheduler._weights_bytes = 20 * GB
     usage = [0]
@@ -286,6 +287,7 @@ def test_engine_core_maps_the_output_to_the_typed_error():
 def _guarded_rig(tmp_path, tokenizer, monkeypatch, *, weights_gb, free_gb):
     rig = make_rig(tmp_path, tokenizer)
     scheduler = rig.scheduler
+    scheduler._memory_scheduling = True  # memory.memory_scheduling resolved on
     scheduler._memory_hard_limit_bytes = 100 * GB
     scheduler._weights_bytes = weights_gb * GB
     usage = [scheduler._admission_limit_bytes() - free_gb * GB]

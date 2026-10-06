@@ -650,6 +650,15 @@ class CacheSettings:
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
 VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"}
+# memory.memory_scheduling: "auto" turns memory scheduling on only with an
+# explicit ceiling (custom tier); "on" and "off" force it.
+VALID_MEMORY_SCHEDULING_MODES: tuple[str, ...] = ("auto", "on", "off")
+
+
+def normalize_memory_scheduling(value: Any) -> str | None:
+    """Lower-cased mode, or None when ``value`` is not a known mode."""
+    mode = str(value).strip().lower()
+    return mode if mode in VALID_MEMORY_SCHEDULING_MODES else None
 
 
 @dataclass
@@ -680,6 +689,13 @@ class MemorySettings:
     # the enforcer reports as the "pool". 0 = unset: leave MLX's own limit
     # (the CLI sets it to total RAM, i.e. effectively unbounded).
     mlx_cache_limit_gb: float = 0.0
+    # Memory scheduling: the never-fits 400 and capacity hint, the fits-later
+    # wait (with the solo admission) and the progress-based admission-stall
+    # clock. They plan against a fixed memory budget, so "auto" turns them on
+    # only when the guard is on and an explicit ceiling is set (custom tier).
+    # "on" forces them on (still needs the guard), "off" keeps upstream
+    # admission. Resolved by the ProcessMemoryEnforcer.
+    memory_scheduling: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -692,6 +708,7 @@ class MemorySettings:
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
             "mlx_cache_limit_gb": self.mlx_cache_limit_gb,
+            "memory_scheduling": self.memory_scheduling,
         }
 
     @classmethod
@@ -715,6 +732,10 @@ class MemorySettings:
             hard_threshold=float(data.get("hard_threshold", 0.95)),
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
+            memory_scheduling=normalize_memory_scheduling(
+                data.get("memory_scheduling", "auto")
+            )
+            or "auto",
         )
 
 
@@ -1377,6 +1398,15 @@ class GlobalSettings:
                 self.memory.mlx_cache_limit_gb = float(cache_gb)
             except ValueError:
                 logger.warning(f"Invalid OMLX_MLX_CACHE_LIMIT_GB value: {cache_gb}")
+        if raw := os.getenv("OMLX_MEMORY_SCHEDULING"):
+            mode = normalize_memory_scheduling(raw)
+            if mode is not None:
+                self.memory.memory_scheduling = mode
+            else:
+                logger.warning(
+                    f"Invalid OMLX_MEMORY_SCHEDULING value: {raw} "
+                    f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
+                )
         if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
             self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
         for env_name, attr in (
@@ -1907,6 +1937,12 @@ class GlobalSettings:
             errors.append(
                 "memory_guard_custom_ceiling_gb must be > 0 when "
                 "memory_guard_tier is 'custom'"
+            )
+
+        if normalize_memory_scheduling(self.memory.memory_scheduling) is None:
+            errors.append(
+                f"Invalid memory_scheduling: {self.memory.memory_scheduling!r} "
+                f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
             )
 
         if not 0.5 <= self.memory.prefill_safe_zone_ratio <= 0.99:

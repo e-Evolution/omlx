@@ -84,6 +84,7 @@ def enforcer(mock_engine_pool):  # noqa: F811
         ceiling=100 * GB,
         soft_threshold=0.85,
         hard_threshold=0.95,
+        memory_scheduling="on",
     )
 
 
@@ -275,6 +276,7 @@ def pressured(monkeypatch, clock):
     scheduler.requests[head.request_id] = head
     scheduler._admission_paused = True
     scheduler._ensure_batch_generator = MagicMock()
+    scheduler._memory_scheduling = True  # memory.memory_scheduling resolved on
     return scheduler, head, running
 
 
