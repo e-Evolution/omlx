@@ -1437,6 +1437,35 @@ PARK_THRASH_FREE_DELTA_FRACTION = 0.05
 _PARK_WAIT_LOG_INTERVAL_S = 30.0
 # Seconds between "Admission waiting for memory" lines for the same head.
 _ADMISSION_WAIT_LOG_INTERVAL_S = 30.0
+# TEST-ONLY knob, off by default: comma-separated output-token offsets at
+# which every decoding request is paused through the normal decode-pause path
+# (exact prefix stored, row removed, re-queued parked) and resumed as soon as
+# possible, skipping the memory hold. It isolates the pause from batch-size
+# numerics on a real model (a B=1 run with forced pauses against a B=1 run
+# without). Never set it in production.
+_FORCE_DECODE_PAUSE_ENV = "OMLX_DEBUG_FORCE_DECODE_PAUSE_AT"
+
+
+def _parse_forced_decode_pause_offsets(raw: str | None) -> tuple[int, ...]:
+    """Sorted unique positive offsets from ``OMLX_DEBUG_FORCE_DECODE_PAUSE_AT``;
+    empty (knob off) when unset, blank or invalid (with a warning)."""
+    if raw is None or not raw.strip():
+        return ()
+    try:
+        offsets = {int(part) for part in raw.split(",")}
+    except ValueError:
+        offsets = set()
+    if not offsets or min(offsets) < 1:
+        logger.warning(
+            "Ignoring %s=%r: expected comma-separated positive output-token "
+            "offsets (test-only knob, now off)",
+            _FORCE_DECODE_PAUSE_ENV,
+            raw,
+        )
+        return ()
+    return tuple(sorted(offsets))
+
+
 # Saturation value of ``_polls_since_resume``: "long enough since the last
 # resume that the hysteresis gate is open". It is the initial value (no resume
 # has happened yet) and the cap that keeps the counter from growing without
@@ -2496,6 +2525,21 @@ class Scheduler:
         self._decode_resumes: dict[str, _DecodeResume] = {}
         # Step starts each pending pause has waited for an MTP queue to drain.
         self._decode_pause_deferrals: dict[str, int] = {}
+        # Test-only forced decode pauses (_FORCE_DECODE_PAUSE_ENV): the
+        # offsets, the next offset index per request, and the paused requests
+        # whose resume skips the memory hold.
+        self._forced_pause_offsets = _parse_forced_decode_pause_offsets(
+            os.environ.get(_FORCE_DECODE_PAUSE_ENV)
+        )
+        self._forced_pause_next: dict[str, int] = {}
+        self._forced_pause_resume: set[str] = set()
+        if self._forced_pause_offsets:
+            logger.warning(
+                "DEBUG: %s forces decode pauses at output offsets %s "
+                "(test-only; never set it in production)",
+                _FORCE_DECODE_PAUSE_ENV,
+                ",".join(str(o) for o in self._forced_pause_offsets),
+            )
         self._park_stats: dict[str, int] = {
             "parks": 0,
             "resumes": 0,
@@ -12869,6 +12913,49 @@ class Scheduler:
         self._pending_decode_pauses.add(request_id)
         return True
 
+    def _request_forced_decode_pauses(self) -> None:
+        """Test-only: ask for a decode pause of every decoding row whose
+        output reached its next ``_FORCE_DECODE_PAUSE_ENV`` offset (MLX
+        thread, step start, before the pending pauses run).
+
+        The pause emits the pending token first, so a row asked at offset N
+        holds N + 1 output tokens when it leaves the batch. Offsets the row
+        passed in one step (MTP) collapse into one pause.
+        """
+        offsets = self._forced_pause_offsets
+        if not offsets:
+            return
+        for rid in [r for r in self._forced_pause_next if r not in self.requests]:
+            del self._forced_pause_next[rid]
+        self._forced_pause_resume = {
+            r.request_id
+            for r in self.waiting
+            if r.parked and r.request_id in self._forced_pause_resume
+        }
+        for rid, request in list(self.running.items()):
+            index = self._forced_pause_next.get(rid, 0)
+            produced = len(request.output_token_ids)
+            if index >= len(offsets) or produced < offsets[index]:
+                continue
+            while index < len(offsets) and produced >= offsets[index]:
+                index += 1
+            self._forced_pause_next[rid] = index
+            if self.request_decode_pause(rid):
+                self._forced_pause_resume.add(rid)
+                logger.info(
+                    "DEBUG: forcing a decode pause of %s at output token %d (%s)",
+                    rid,
+                    produced,
+                    _FORCE_DECODE_PAUSE_ENV,
+                )
+            else:
+                logger.info(
+                    "DEBUG: forced decode pause of %s at output token %d declined "
+                    "(park disabled or the row cannot pause)",
+                    rid,
+                    produced,
+                )
+
     def _process_pending_park(self, output: SchedulerOutput | None = None) -> bool:
         """Pause or park requested victims (MLX thread, step start).
 
@@ -15040,7 +15127,12 @@ class Scheduler:
             # Parked requests sit at the front in arrival order and resume
             # only after enough consecutive ok pressure polls; nothing newer
             # overtakes them while they wait.
-            if self.waiting[0].parked and self._park_hold_applies(self.waiting[0]):
+            # A test-only forced pause resumes at once (no memory hold).
+            if (
+                self.waiting[0].parked
+                and self.waiting[0].request_id not in self._forced_pause_resume
+                and self._park_hold_applies(self.waiting[0])
+            ):
                 break
             # A solo request runs alone: nothing is admitted beside it. The
             # head waits while it progresses (the long no-progress bound).
@@ -17231,6 +17323,7 @@ class Scheduler:
         # Park a prefill victim or pause a decoding row requested by the
         # memory enforcer. Runs before any chunk or decode step so a parked
         # request never has a forward in flight.
+        self._request_forced_decode_pauses()
         if self._process_pending_park(output):
             output.has_work = True
 
