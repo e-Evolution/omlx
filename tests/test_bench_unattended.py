@@ -2498,3 +2498,16 @@ class TestScenarioC7Refs(TestScenarioC7):
         sc = asyncio.run(bp.scenario_c7(ctx))
         assert sc["summary"]["capacity_available"] is True
         assert sc["summary"]["header_present"] is True
+
+
+class TestC7RefClean:
+    def test_hard_transient_without_a_pause_is_still_clean(self):
+        ev = bm.parse_c7_events(
+            "2026-10-06 02:23:04,568 - x - INFO - [-] - Memory pressure level: soft -> hard "
+            "(current=45.3GB, soft=39.2GB, hard=44.8GB, ceiling=56.0GB)\n"
+        )
+        assert bm.c7_ref_clean(ev) is True
+
+    def test_pause_park_or_abort_is_not_clean(self):
+        for kind in ("decode_paused", "parked", "victim_abort", "abort_all", "abort"):
+            assert bm.c7_ref_clean([{"kind": kind}]) is False

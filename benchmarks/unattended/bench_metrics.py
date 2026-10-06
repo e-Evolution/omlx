@@ -630,6 +630,16 @@ def identity_verdict(
     return out
 
 
+def c7_ref_clean(events: list[dict[str, Any]]) -> bool:
+    """A headroom reference is clean when nothing paused, parked or aborted it.
+
+    A transient hard crossing that the hot-cache shrink absorbs does not alter
+    decoding, so it does not make the reference unclean.
+    """
+    bad = ("decode_paused", "parked", "victim_abort", "abort_all", "abort")
+    return not any(e["kind"] in bad for e in events)
+
+
 def capacity_check(capacity: dict[str, Any], header: str | None) -> dict[str, Any]:
     """Capacity endpoint availability and the X-oMLX-Max-Context-Tokens header."""
     body = capacity.get("body") if isinstance(capacity, dict) else None

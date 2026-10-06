@@ -1060,11 +1060,7 @@ async def _c7_refs_only(
         ev = bm.parse_c7_events(ctx.server.log_since(off))
         lp: dict[str, list[dict]] = {}
         _c7_attach_lp(ctx, lp, before, [r])
-        clean = not any(
-            e["kind"] in ("decode_paused", "parked", "victim_abort", "abort_all", "abort")
-            or (e["kind"] == "pressure" and e["to"] == "hard")
-            for e in ev
-        )
+        clean = bm.c7_ref_clean(ev)
         refs[r["name"]] = {"result": dict(r), "lp": lp.get(r["name"]), "clean": clean}
         results.append(r)
     wall = round(time.time() - t, 2)
