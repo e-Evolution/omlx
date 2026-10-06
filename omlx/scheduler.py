@@ -5928,14 +5928,36 @@ class Scheduler:
         (with memory scheduling on)."""
         self._admission_progress_at = time.monotonic()
 
+    def _progress_clock_on(self) -> bool:
+        """Whether the admission-stall clocks measure time without progress.
+
+        With memory scheduling on, always. Off, only while a hold the park
+        feature created is active (``_park_memory_hold``): the head then
+        waits for work the scheduler holds back on purpose, and upstream's
+        clock (from when the head first blocked) would fail it while that
+        work progresses. With park off such holds never exist, so the clock
+        stays upstream's.
+        """
+        return self._memory_scheduling_on() or self._park_memory_hold()
+
+    def _park_memory_hold(self) -> bool:
+        """A hold the park feature created: a parked or decode-paused
+        request running solo, or one waiting in the queue."""
+        if not self._park_enabled():
+            return False
+        if self._solo_request() is not None:
+            return True
+        return any(request.parked for request in self.waiting)
+
     def _admission_idle_since(self, blocked_since: float) -> float:
         """Start of the current no-progress stretch for a blocked head.
 
-        With memory scheduling off the clock is upstream's: it runs from
-        when the head first blocked, whatever else progresses.
+        Without the progress clock (``_progress_clock_on``) the clock is
+        upstream's: it runs from when the head first blocked, whatever else
+        progresses.
         """
         progress = self._admission_progress_at
-        if progress is None or not self._memory_scheduling_on():
+        if progress is None or not self._progress_clock_on():
             return blocked_since
         return max(blocked_since, progress)
 
@@ -5974,8 +5996,9 @@ class Scheduler:
         progress, or ``admission_no_progress_timeout_s`` while memory is
         scheduled on purpose (``_deliberate_memory_hold``), so a genuine
         deadlock still surfaces with an error. With memory scheduling off
-        the clock is upstream's: ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` from
-        when the head first blocked.
+        and no park hold (``_progress_clock_on``) the clock is upstream's:
+        ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` from when the head first
+        blocked.
         """
         if not self.waiting:
             self._clear_memory_admission_blocker()
@@ -5988,7 +6011,7 @@ class Scheduler:
             # client's own timeouts apply.
             self._clear_memory_admission_blocker(request_id)
             return None
-        progress_clock = self._memory_scheduling_on()
+        progress_clock = self._progress_clock_on()
         now = time.monotonic()
         if request_id != self._memory_admission_blocked_request_id:
             self._memory_admission_blocked_request_id = request_id
@@ -6078,7 +6101,7 @@ class Scheduler:
         if request.parked:
             self._clear_store_cache_admission_blocker(request_id)
             return None
-        progress_clock = self._memory_scheduling_on()
+        progress_clock = self._progress_clock_on()
         now = time.monotonic()
         if request_id != self._store_cache_admission_blocked_request_id:
             self._store_cache_admission_blocked_request_id = request_id
@@ -6088,8 +6111,8 @@ class Scheduler:
             return None
 
         # Backpressure, not a failure, while the writer drains (a drained
-        # write is progress) or other requests progress. Memory scheduling
-        # off: upstream's fixed timeout from when the head first blocked.
+        # write is progress) or other requests progress. Without the progress
+        # clock: upstream's fixed timeout from when the head first blocked.
         timeout = getattr(
             self,
             "_STORE_CACHE_ADMISSION_STALL_TIMEOUT_S",

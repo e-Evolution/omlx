@@ -325,14 +325,38 @@ def test_off_uses_the_fixed_stall_timeout(pressured, clock):
     assert f"persisted for {timeout:.1f}s (admission_paused). " in failed.error
 
 
-def test_off_has_no_long_bound_for_deliberate_holds(pressured, clock):
+def test_off_without_park_has_no_long_bound_for_a_solo_mark(pressured, clock):
+    """Park off: no park hold exists, so the clock stays upstream's."""
     scheduler, _head, solo = pressured
     scheduler._memory_scheduling = False
-    scheduler._solo_request_id = solo.request_id  # a parked head resumed solo
+    assert scheduler._park_enabled() is False
+    scheduler._solo_request_id = solo.request_id
     assert _schedule(scheduler) == []
     clock.advance(scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S)
     (failed,) = _schedule(scheduler)
     assert failed.error_metadata["reason"] == "solo_hold"
+    assert "no_progress_seconds" not in failed.error_metadata
+
+
+def test_off_with_park_a_parked_solo_keeps_the_progress_clock(pressured, clock):
+    """Park on: a parked head resumed solo is a hold the fork created, so the
+    head behind it waits while the solo request progresses (D5's clock and
+    600 s bound) whatever memory_scheduling says."""
+    scheduler, _head, solo = pressured
+    scheduler._memory_scheduling = False
+    scheduler.config.memory_pressure_park = True
+    scheduler._solo_request_id = solo.request_id
+    assert _schedule(scheduler) == []
+    for _ in range(3):
+        clock.advance(scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S - 1)
+        scheduler._note_admission_progress()  # the solo request emits a token
+        assert _schedule(scheduler) == []
+    clock.advance(scheduler.config.admission_no_progress_timeout_s)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_metadata["reason"] == "solo_hold"
+    assert failed.error_metadata["no_progress_seconds"] == int(
+        scheduler.config.admission_no_progress_timeout_s
+    )
 
 
 def test_off_store_cache_backpressure_uses_the_fixed_timeout(
