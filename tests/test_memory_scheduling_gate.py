@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Memory scheduling is on only where memory pressure is planned for.
 
-``memory.memory_scheduling`` is ``auto`` (default: on with an explicit custom
-ceiling), ``on`` or ``off``. It gates the admission behaviours that plan
-against a fixed memory budget:
+Three behaviours of the pause-resume cycle used to be on whenever the prefill
+memory guard was on (its default), which changed admission for every user:
 
 1. the never-fits 400 ``context_exceeds_capacity``, ``GET /v1/omlx/capacity``
    numbers and the ``X-oMLX-Max-Context-Tokens`` header;
 2. the fits-later wait (a request that fits alone waits instead of being
-   rejected on current usage);
+   rejected on current usage), including the solo admission of a lone head;
 3. the progress-based admission-stall clock (600 s bound while memory is
    held on purpose, store-cache backpressure not a failure while writes
    drain).
 
-Off, these paths behave as on upstream ``main``.
+They plan against a fixed memory budget, so they are on only when the
+operator pinned one: ``memory.memory_scheduling`` is ``auto`` (default: on
+with an explicit custom ceiling), ``on`` or ``off``. Off, these paths behave
+as on upstream ``main``.
 """
 
 import logging
@@ -28,7 +30,9 @@ from fastapi.testclient import TestClient
 from test_process_memory_enforcer import _make_enforcer
 from test_scheduler_admission_progress import _schedule
 from test_scheduler_capacity_gate import GB
+from test_scheduler_park import PROMPT_C, step, submit
 from test_scheduler_prefill_memory_guard import _make_request, _make_scheduler
+from test_scheduler_solo_admission import _lone_rig
 from test_server_context_capacity import _engine_with_scheduler
 
 import omlx.scheduler as scheduler_module
@@ -281,6 +285,21 @@ def test_off_rejects_a_fits_later_request_with_the_old_error(gated):
     assert rejection is not None
     assert rejection.capacity is None  # the old current-usage rejection
     assert rejection.message.startswith("Prefill would require")
+
+
+def test_off_does_not_admit_a_lone_head_solo(tmp_path, mock_tokenizer, monkeypatch):
+    rig, _usage, _solo = _lone_rig(tmp_path, mock_tokenizer, monkeypatch)
+    try:
+        scheduler = rig.scheduler
+        scheduler._memory_scheduling = False
+        submit(rig, "lone", PROMPT_C, arrival=1.0)
+        outputs = step(rig)
+        (failed,) = [o for o in outputs if o.error]
+        assert failed.request_id == "lone"
+        assert failed.error_code != "context_exceeds_capacity"
+        assert scheduler._solo_request_id is None
+    finally:
+        rig.close()
 
 
 def test_off_uses_the_fixed_stall_timeout(pressured, clock):

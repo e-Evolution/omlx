@@ -2684,9 +2684,10 @@ class Scheduler:
         # must steer the user to that knob instead of "close other apps".
         self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
-        # Memory scheduling: resolved by ProcessMemoryEnforcer from
-        # memory.memory_scheduling. The admission features that plan against
-        # a fixed memory budget consult it; off keeps upstream admission.
+        # Memory scheduling (the never-fits gate and capacity hint, the
+        # fits-later wait with the solo admission, the progress-based stall
+        # clock): resolved by ProcessMemoryEnforcer from
+        # memory.memory_scheduling. Off keeps upstream admission.
         self._memory_scheduling: bool = False
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
@@ -12629,21 +12630,25 @@ class Scheduler:
         return free - wait.free_bytes <= int(fit_line * PARK_THRASH_FREE_DELTA_FRACTION)
 
     def _mark_solo(self, head: "Request", why: str) -> None:
-        """Let ``head`` resume as the solo request (nothing else admitted)."""
+        """Let ``head`` run as the solo request (nothing else admitted):
+        a parked head resuming, or a queued head admitted ("admit")."""
         self._solo_request_id = head.request_id
         key = (head.request_id, head.park_count)
         if self._solo_logged == key:
             return
         self._solo_logged = key
         reasons = {
+            "admit": "it fits under the ceiling only with nothing else running",
             "solo": "it fits under the ceiling only with nothing else running",
             "fits": "it was paused again while running alone",
             "max_hold": "it waited the longest hold while nothing ran",
         }
+        action = "Admitting request" if why == "admit" else "Resuming parked request"
         logger.info(
-            "Resuming parked request %s alone (solo): %s; nothing else is "
+            "%s %s alone (solo): %s; nothing else is "
             "admitted until it finishes, and memory pressure below the "
             "emergency threshold does not pause it again",
+            action,
             head.request_id,
             reasons.get(why, why),
         )
@@ -14337,18 +14342,21 @@ class Scheduler:
             if fits_later:
                 self._log_fits_later(request.request_id, est.estimated, hard_limit)
                 raise _PreflightDeferredError()
-
-            message = self._format_rejection_message(
-                estimated=est.estimated,
-                current=current,
-                peak=peak,
-                hard_limit=hard_limit,
-            )
-            return _PreflightRejection(
-                message=message,
-                estimated_bytes=int(est.estimated),
-                limit_bytes=int(hard_limit),
-            )
+            if not self._fits_solo(capacity, est):
+                message = self._format_rejection_message(
+                    estimated=est.estimated,
+                    current=current,
+                    peak=peak,
+                    hard_limit=hard_limit,
+                )
+                return _PreflightRejection(
+                    message=message,
+                    estimated_bytes=int(est.estimated),
+                    limit_bytes=int(hard_limit),
+                )
+            solo = True
+        else:
+            solo = False
         safety_rejection = self._preflight_safety_rejection(
             est=est,
             current_usage_bytes=current,
@@ -14374,7 +14382,32 @@ class Scheduler:
             return safety_rejection
         if self._external_media_reservation_short(request, est):
             raise _PreflightDeferredError()
+        if solo:
+            self._mark_solo(request, "admit")
         return None
+
+    def _fits_solo(
+        self, capacity: "_CapacityEstimate | None", est: "_AdmissionEstimate"
+    ) -> bool:
+        """A head over the admission line runs alone instead of failing.
+
+        With nothing admitted (and no store write giving memory back), a
+        request that fits alone by estimate but whose peak, priced on the
+        current usage, lands between the admission line and the solo line
+        (the ceiling and prefill safety cap minus the estimate margin) runs
+        as the solo request: the same rule a parked head follows. The
+        usage it is priced on holds memory no admitted request owns (queued
+        requests' vision embeddings, settling buffers). Nothing is admitted
+        beside it and the enforcer leaves it to the emergency brake; the
+        chunk guard still bounds each prefill chunk. Only with the park
+        feature and memory scheduling on (no capacity estimate otherwise).
+        """
+        if not self._park_enabled() or capacity is None or not capacity.fits_alone:
+            return False
+        if self._num_admitted_requests():
+            return False
+        lines = self._park_resume_lines()
+        return lines is not None and est.estimated <= lines[1]
 
     def _external_media_reservation_short(
         self, request: "Request", est: "_AdmissionEstimate"
@@ -14707,8 +14740,8 @@ class Scheduler:
 
         None when it cannot be estimated: no monitor, no memory limit, model
         weights or KV dimensions unknown, or memory scheduling off. Without
-        an estimate there is no never-fits error, no fits-later wait and no
-        capacity hint: the upstream current-usage preflight.
+        an estimate there is no never-fits error, no fits-later wait, no solo
+        admission and no capacity hint: the upstream current-usage preflight.
         """
         if not self._memory_scheduling_on():
             return None
@@ -14933,6 +14966,8 @@ class Scheduler:
             if fits_later:
                 self._log_fits_later(request_id, est.estimated, admission_limit)
                 return
+            if self._fits_solo(capacity, est):
+                return  # queues; the in-stream admission runs it alone
             message = self._format_rejection_message(
                 estimated=est.estimated,
                 current=current,
