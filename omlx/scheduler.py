@@ -316,6 +316,15 @@ def _deferred_admission_backoff_s(attempts: int) -> float:
 
 
 @dataclass
+class _ParkThrashWait:
+    """The memory picture a thrashing parked head waits to see change."""
+
+    park_count: int
+    free_bytes: int
+    admitted_ids: frozenset[str]
+
+
+@dataclass
 class _DeferredAdmissionWait:
     """The memory picture a fits-later head deferred on."""
 
@@ -1501,6 +1510,20 @@ PARK_MAX_HOLD_S = 300.0
 # Free memory a parked request must find beyond its own estimated need before
 # it resumes, as a fraction of the admission line (estimate error margin).
 PARK_RESUME_MARGIN_FRACTION = 0.02
+# Hysteresis under the hard watermark: a parked head resumes beside admitted
+# work only when current + reserve + need stays this fraction of the hard
+# watermark below it. The enforcer pauses at the watermark; resuming right up
+# to it re-triggers the pause at the next poll (seen under forced memory
+# pressure: pause, resume, pressure, pause until the park budget ran out and
+# the request was aborted).
+PARK_RESUME_HARD_MARGIN_FRACTION = 0.05
+# Anti-thrash: a head parked or paused this many times within the window
+# waits for a stronger signal than "fits" before it resumes beside admitted
+# work: an admitted row left (finished, aborted, paused) or free memory rose
+# by more than PARK_THRASH_FREE_DELTA_FRACTION of the resume line.
+PARK_THRASH_PAUSES = 2
+PARK_THRASH_WINDOW_S = 60.0
+PARK_THRASH_FREE_DELTA_FRACTION = 0.05
 # Seconds between "waiting" log lines for the same parked head.
 _PARK_WAIT_LOG_INTERVAL_S = 30.0
 # Saturation value of ``_polls_since_resume``: "long enough since the last
@@ -2140,6 +2163,10 @@ class SchedulerConfig:
     # path when its last media token is inside the cached prefix (decode
     # fairness, parkable). Off keeps the external media prefill.
     media_text_suffix_chunked: bool = False
+    # Decode pauses are budgeted apart from prefill parks, and more generously:
+    # a pause keeps every generated token exactly (no re-prefill), while the
+    # abort that follows an exhausted budget loses them all.
+    max_decode_pauses_per_request: int = 8
     park_resume_ok_polls: int = 3
 
     # Paged cache settings (internal defaults)
@@ -2546,6 +2573,14 @@ class Scheduler:
         self._park_resume_fit: tuple[str, int, int] | None = None
         self._park_wait_logged: tuple[str, float] | None = None
         self._park_pins: dict[str, _ParkPins] = {}
+        # Anti-thrash records of parked heads (see _park_thrash_holds).
+        self._park_thrash_waits: dict[str, _ParkThrashWait] = {}
+        # Solo run: a request that fits under the ceiling only when nothing
+        # else runs. While it is admitted nothing else is admitted, and the
+        # enforcer does not pause or abort it below the emergency threshold
+        # (see memory_pressure_solo_request). Read by the enforcer thread.
+        self._solo_request_id: str | None = None
+        self._solo_logged: tuple[str, int] | None = None
         # Decode pause: ids asked for by request_decode_pause (thread-safe set,
         # drained at step start) and the resume record of each paused row.
         self._pending_decode_pauses: set[str] = set()
@@ -12302,9 +12337,9 @@ class Scheduler:
         """Whether a parked request may resume now.
 
         With no live pressure monitor, always (never starve a parked
-        request). Otherwise, when ``head`` has a memory estimate, once the
-        free memory covers its need plus a margin; without an estimate, once
-        enough consecutive ok polls were seen.
+        request). Otherwise, when ``head`` has a memory estimate, once it
+        fits under the resume line; without an estimate, once enough
+        consecutive ok polls were seen.
         """
         if self._park_signal_stale():
             return True
@@ -12318,48 +12353,215 @@ class Scheduler:
         """Whether a parked head still blocks admission.
 
         The hold is the head's reservation: nothing newer is admitted while
-        it waits, so nothing consumes the headroom it waits for. It never
-        applies when nothing is admitted (admission must be able to recover)
-        or without a live pressure monitor. With a memory estimate the head
-        resumes when it fits. Without one it resumes after an ok-poll streak,
-        or past PARK_MAX_HOLD_S unless the last pressure was hard; that
-        escape also waits ``park_resume_ok_polls`` polls after the previous
-        resume. Every escape resumes one request per scheduling pass, so a
-        burst of resumes cannot re-trigger hard pressure.
+        it waits, so nothing consumes the headroom it waits for. Without a
+        live pressure monitor it never applies. With a memory estimate
+        (``_park_resume_verdict``):
+
+        - beside admitted work the head resumes only when it fits under the
+          hard watermark minus the hysteresis margin, and a head that was
+          parked or paused twice within PARK_THRASH_WINDOW_S also waits for
+          an admitted row to leave or free memory to rise (anti-thrash);
+        - with nothing admitted it resumes when it fits; when it fits only
+          under the ceiling, or it keeps being paused while alone, it resumes
+          as the solo request (``_mark_solo``): nothing else is admitted
+          while it runs and the enforcer leaves it alone below the emergency
+          threshold, so pausing it again cannot loop. One that does not fit
+          even alone waits at most PARK_MAX_HOLD_S, then runs solo.
+
+        Without an estimate, the older rules apply: nothing admitted
+        releases the head; otherwise an ok-poll streak, or past
+        PARK_MAX_HOLD_S unless the last pressure was hard (that escape also
+        waits ``park_resume_ok_polls`` polls after the previous resume).
+        Every escape resumes one request per scheduling pass.
         """
         if self._park_resumed_this_pass:
             return True
-        if not self._num_admitted_requests() or self._park_signal_stale():
+        if self._park_signal_stale():
             return False
-        fit = self._park_memory_fit(head)
-        if fit is not None:
-            return not fit
-        if self._park_ok_polls_met():
+        admitted = self._num_admitted_requests()
+        verdict = self._park_resume_verdict(head)
+        if verdict is None:
+            if not admitted:
+                return False
+            if self._park_ok_polls_met():
+                return False
+            need = max(1, getattr(self.config, "park_resume_ok_polls", 3))
+            held_s = time.monotonic() - head.parked_at
+            if held_s >= PARK_MAX_HOLD_S and self._last_pressure_level != "hard":
+                return self._polls_since_resume < need
+            return True
+        if admitted:
+            if verdict != "fits":
+                return True
+            return self._park_thrash_holds(head)
+        if verdict == "fits" and not self._park_thrashing(head):
             return False
-        need = max(1, getattr(self.config, "park_resume_ok_polls", 3))
-        held_s = time.monotonic() - head.parked_at
-        if held_s >= PARK_MAX_HOLD_S and self._last_pressure_level != "hard":
-            return self._polls_since_resume < need
+        if verdict in ("fits", "solo"):
+            self._mark_solo(head, verdict)
+            return False
+        if time.monotonic() - head.parked_at >= PARK_MAX_HOLD_S:
+            self._mark_solo(head, "max_hold")
+            return False
         return True
 
     def _park_memory_fit(self, head: "Request") -> bool | None:
-        """Whether the free memory covers ``head``'s need plus the margin.
+        """Whether ``head`` fits under the resume line (None: no estimate)."""
+        verdict = self._park_resume_verdict(head)
+        return None if verdict is None else verdict == "fits"
 
-        None when either side cannot be estimated (the caller falls back to
-        the ok-poll rule). A head never resumes on hard pressure, whatever
-        the estimate says. Logs the wait (rate-limited) and records the fit
-        for the resume log.
+    def _park_resume_lines(self) -> tuple[int, int] | None:
+        """(fit line, solo line) a parked head is measured against.
+
+        The fit line is the admission line minus the estimate margin, and
+        never above the hard watermark minus the hysteresis margin: the
+        enforcer pauses at the watermark, so a head resumed right up to it
+        is paused again at the next poll. The solo line is what a request
+        running alone must stay under: the ceiling (and the prefill safety
+        cap) minus the estimate margin. None without an admission line.
+        """
+        admission = self._admission_limit_bytes()
+        if admission <= 0:
+            return None
+        fit_line = admission - int(admission * PARK_RESUME_MARGIN_FRACTION)
+        watermark = self._memory_hard_watermark_bytes
+        if watermark > 0:
+            fit_line = min(
+                fit_line,
+                watermark - int(watermark * PARK_RESUME_HARD_MARGIN_FRACTION),
+            )
+        ceilings = [
+            v
+            for v in (self._memory_hard_limit_bytes, self._prefill_abort_cap())
+            if v > 0
+        ]
+        ceiling = min(ceilings) if ceilings else admission
+        solo_line = max(fit_line, ceiling - int(ceiling * PARK_RESUME_MARGIN_FRACTION))
+        return fit_line, solo_line
+
+    def _park_resume_verdict(self, head: "Request") -> str | None:
+        """Where ``head`` stands: "fits", "solo", "wait", or None.
+
+        "fits": current + in-flight reserve + need is under the fit line.
+        "solo": only under the solo line (the ceiling). "wait": neither, or
+        the last pressure poll was hard (memory may still be draining). None
+        when need or the lines cannot be estimated. Logs the wait
+        (rate-limited) and records a fit for the resume log.
         """
         need = self._parked_resume_need_bytes(head)
-        free = self._park_free_bytes()
-        if need is None or free is None:
+        lines = self._park_resume_lines()
+        if need is None or lines is None:
             return None
-        margin = int(self._admission_limit_bytes() * PARK_RESUME_MARGIN_FRACTION)
-        if self._last_pressure_level == "hard" or free < need + margin:
+        fit_line, solo_line = lines
+        used = self._current_usage_bytes() + self._inflight_prefill_reserve_bytes()
+        free = fit_line - used
+        if self._last_pressure_level == "hard" or used + need > solo_line:
             self._log_park_wait(head.request_id, need, free)
-            return False
+            return "wait"
+        if need > free:
+            self._log_park_wait(head.request_id, need, free)
+            return "solo"
         self._park_resume_fit = (head.request_id, need, free)
-        return True
+        return "fits"
+
+    def _park_thrashing(self, head: "Request") -> bool:
+        """Parked or paused PARK_THRASH_PAUSES times within the window."""
+        now = time.monotonic()
+        recent = [t for t in head.park_times if now - t <= PARK_THRASH_WINDOW_S]
+        return len(recent) >= PARK_THRASH_PAUSES
+
+    def _park_thrash_holds(self, head: "Request") -> bool:
+        """Whether a thrashing head that fits still waits (beside admitted work).
+
+        The first time it fits after its latest pause, the memory picture
+        (free bytes under the fit line, admitted rows) is recorded and it
+        waits. It resumes once an admitted row left (finished, aborted or
+        paused) or free memory rose by more than
+        PARK_THRASH_FREE_DELTA_FRACTION of the fit line.
+        """
+        if not self._park_thrashing(head):
+            return False
+        rid = head.request_id
+        lines = self._park_resume_lines()
+        fit_line = lines[0] if lines is not None else 0
+        free = fit_line - (
+            self._current_usage_bytes() + self._inflight_prefill_reserve_bytes()
+        )
+        admitted_ids = self._admitted_request_ids()
+        for stale in [
+            r for r in self._park_thrash_waits if r != rid and r not in self.requests
+        ]:
+            self._park_thrash_waits.pop(stale, None)
+        wait = self._park_thrash_waits.get(rid)
+        if wait is None or wait.park_count != head.park_count:
+            self._park_thrash_waits[rid] = _ParkThrashWait(
+                park_count=head.park_count,
+                free_bytes=free,
+                admitted_ids=admitted_ids,
+            )
+            logger.info(
+                "Parked request %s was paused %d times within %.0f s; it "
+                "resumes when a running request finishes or pauses, or free "
+                "memory rises by %.1f GB",
+                rid,
+                len(head.park_times),
+                PARK_THRASH_WINDOW_S,
+                fit_line * PARK_THRASH_FREE_DELTA_FRACTION / 1024**3,
+            )
+            return True
+        if not wait.admitted_ids <= admitted_ids:
+            return False
+        return free - wait.free_bytes <= int(fit_line * PARK_THRASH_FREE_DELTA_FRACTION)
+
+    def _mark_solo(self, head: "Request", why: str) -> None:
+        """Let ``head`` resume as the solo request (nothing else admitted)."""
+        self._solo_request_id = head.request_id
+        key = (head.request_id, head.park_count)
+        if self._solo_logged == key:
+            return
+        self._solo_logged = key
+        reasons = {
+            "solo": "it fits under the ceiling only with nothing else running",
+            "fits": "it was paused again while running alone",
+            "max_hold": "it waited the longest hold while nothing ran",
+        }
+        logger.info(
+            "Resuming parked request %s alone (solo): %s; nothing else is "
+            "admitted until it finishes, and memory pressure below the "
+            "emergency threshold does not pause it again",
+            head.request_id,
+            reasons.get(why, why),
+        )
+
+    def _solo_request(self) -> "Request | None":
+        """The live solo request (admitted, not parked), clearing a stale mark."""
+        rid = self._solo_request_id
+        if rid is None:
+            return None
+        request = self.requests.get(rid)
+        if request is None or request.is_finished():
+            self._solo_request_id = None
+            return None
+        return None if request.parked else request
+
+    def _solo_holds(self, head: "Request") -> bool:
+        """Whether a running solo request keeps ``head`` from being admitted."""
+        solo = self._solo_request()
+        return solo is not None and solo is not head
+
+    def memory_pressure_solo_request(self) -> str | None:
+        """The solo request when it is the only admitted request, else None.
+
+        Thread-safe read for the memory enforcer: at hard pressure below
+        the emergency threshold it neither pauses nor aborts this request,
+        because nothing else runs and pausing it would only resume it again.
+        """
+        try:
+            solo = self._solo_request()
+            if solo is None or self._admitted_request_ids() != {solo.request_id}:
+                return None
+            return solo.request_id
+        except RuntimeError:  # the queues mutated mid-read on the MLX thread
+            return None
 
     def _log_park_wait(self, request_id: str, need: int, free: int) -> None:
         now = time.monotonic()
@@ -12577,11 +12779,18 @@ class Scheduler:
         qualifies for a decode pause unless ``_decode_pause_exclusion_reason``
         names why not.
         """
-        budget = getattr(self.config, "max_parks_per_request", 3)
-        if request.park_count >= budget:
-            return f"park budget spent ({request.park_count}/{budget})"
         if request.request_id in self.running:
+            budget = getattr(self.config, "max_decode_pauses_per_request", 8)
+            if request.decode_pause_count >= budget:
+                return (
+                    f"decode pause budget spent "
+                    f"({request.decode_pause_count}/{budget})"
+                )
             return self._decode_pause_exclusion_reason(request)
+        budget = getattr(self.config, "max_parks_per_request", 3)
+        parks = request.park_count - request.decode_pause_count
+        if parks >= budget:
+            return f"park budget spent ({parks}/{budget})"
         if request.specprefill_indices is not None:
             return "SpecPrefill sparse prefill patches model-wide state"
         if (
@@ -13026,6 +13235,8 @@ class Scheduler:
         request.parked = True
         request.parked_at = time.monotonic()
         request.park_count = park_number
+        request.decode_pause_count += 1
+        request.park_times.append(request.parked_at)
         self._enqueue_parked(request)
         self._ok_polls = 0
         self._park_stats["parks"] += 1
@@ -13288,6 +13499,7 @@ class Scheduler:
         request.parked = True
         request.parked_at = time.monotonic()
         request.park_count += 1
+        request.park_times.append(request.parked_at)
         request.park_committed_tokens = committed
         self._clear_request_admission_bookkeeping(rid)
         get_prefill_tracker().remove(rid)
@@ -13304,7 +13516,7 @@ class Scheduler:
             "Parked request %s at %d tokens committed (park %d/%d), reason: %s%s",
             rid,
             committed,
-            request.park_count,
+            request.park_count - request.decode_pause_count,
             budget,
             reason,
             (
@@ -14774,6 +14986,9 @@ class Scheduler:
             # only after enough consecutive ok pressure polls; nothing newer
             # overtakes them while they wait.
             if self.waiting[0].parked and self._park_hold_applies(self.waiting[0]):
+                break
+            # A solo request runs alone: nothing is admitted beside it.
+            if self._solo_holds(self.waiting[0]):
                 break
             # A fits-later head that deferred keeps the hold until the memory
             # picture changes; retrying earlier only restores its prefix again.

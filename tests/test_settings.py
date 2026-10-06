@@ -398,6 +398,7 @@ class TestSchedulerSettings:
             "memory_pressure_park": False,
             "media_text_suffix_chunked": False,
             "max_parks_per_request": 3,
+            "max_decode_pauses_per_request": 8,
             "park_resume_ok_polls": 3,
         }
 

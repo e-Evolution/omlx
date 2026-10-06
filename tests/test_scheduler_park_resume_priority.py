@@ -171,14 +171,21 @@ def test_max_hold_does_not_release_a_head_that_does_not_fit(live):
     assert scheduler._park_hold_applies(head) is True
 
 
-def test_nothing_admitted_and_stale_monitor_escapes_still_release(live, monkeypatch):
+def test_nothing_admitted_releases_only_a_head_that_fits_alone(live, monkeypatch):
+    """Nothing admitted used to release any head at once, even one that
+    alone overflows the line: it resumed, was paused at the next poll and
+    looped until its park budget ran out. Now it waits, bounded by
+    PARK_MAX_HOLD_S, unless it fits; the stale-monitor escape stays."""
     scheduler, usage = live
     head = _parked_request()
     usage[0] = scheduler._admission_limit_bytes()
     assert scheduler._park_hold_applies(head) is True
 
     monkeypatch.setattr(scheduler, "_num_admitted_requests", lambda: 0)
+    assert scheduler._park_hold_applies(head) is True
+    head.parked_at -= scheduler_module.PARK_MAX_HOLD_S + 1
     assert scheduler._park_hold_applies(head) is False
+    assert scheduler._solo_request_id == head.request_id
 
     monkeypatch.setattr(scheduler, "_num_admitted_requests", lambda: 1)
     scheduler._last_pressure_poll_at = (

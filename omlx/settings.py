@@ -360,12 +360,16 @@ class SchedulerSettings:
     # and resumes from its last committed prefix once pressure has cleared.
     # Best with prefill_progress_commit_blocks > 0 (otherwise it resumes cold).
     memory_pressure_park: bool = False
-    # Parks a single request may take before it falls back to the abort.
+    # Prefill parks a single request may take before it falls back to the abort.
     max_parks_per_request: int = 3
     # Prefill a media request's uncached text suffix through the chunked text
     # path when its last media token is inside the cached prefix, so it shares
     # the GPU with decodes and can be parked. Off keeps the external prefill.
     media_text_suffix_chunked: bool = False
+    # Decode pauses a single request may take before it falls back to the
+    # abort. Separate and larger than the park budget: a decode pause keeps
+    # every generated token exactly, while the abort loses them all.
+    max_decode_pauses_per_request: int = 8
     # Consecutive "ok" pressure polls before parked requests may resume when
     # no memory estimate is available (with one, a parked request resumes
     # once the estimated free memory covers its need).
@@ -415,6 +419,9 @@ class SchedulerSettings:
             memory_pressure_park=data.get("memory_pressure_park") is True,
             media_text_suffix_chunked=data.get("media_text_suffix_chunked") is True,
             max_parks_per_request=positive_int("max_parks_per_request", 3),
+            max_decode_pauses_per_request=positive_int(
+                "max_decode_pauses_per_request", 8
+            ),
             park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
         )
 
@@ -1350,6 +1357,10 @@ class GlobalSettings:
             self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
         for env_name, attr in (
             ("OMLX_MAX_PARKS_PER_REQUEST", "max_parks_per_request"),
+            (
+                "OMLX_MAX_DECODE_PAUSES_PER_REQUEST",
+                "max_decode_pauses_per_request",
+            ),
             ("OMLX_PARK_RESUME_OK_POLLS", "park_resume_ok_polls"),
         ):
             if raw := os.getenv(env_name):
@@ -1884,6 +1895,11 @@ class GlobalSettings:
                 f"Invalid max_parks_per_request: "
                 f"{self.scheduler.max_parks_per_request} (must be >= 1)"
             )
+        if self.scheduler.max_decode_pauses_per_request < 1:
+            errors.append(
+                f"Invalid max_decode_pauses_per_request: "
+                f"{self.scheduler.max_decode_pauses_per_request} (must be >= 1)"
+            )
         if self.scheduler.park_resume_ok_polls < 1:
             errors.append(
                 f"Invalid park_resume_ok_polls: "
@@ -2070,6 +2086,9 @@ class GlobalSettings:
             memory_pressure_park=self.scheduler.memory_pressure_park,
             media_text_suffix_chunked=self.scheduler.media_text_suffix_chunked,
             max_parks_per_request=self.scheduler.max_parks_per_request,
+            max_decode_pauses_per_request=(
+                self.scheduler.max_decode_pauses_per_request
+            ),
             park_resume_ok_polls=self.scheduler.park_resume_ok_polls,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
