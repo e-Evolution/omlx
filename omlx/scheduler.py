@@ -12349,18 +12349,33 @@ class Scheduler:
         )
 
     def _solo_request(self) -> "Request | None":
-        """The live solo request (admitted, not parked), clearing a stale mark."""
+        """The live solo request (admitted, not parked), else None.
+
+        Read-only: the enforcer thread calls it through
+        ``memory_pressure_solo_request`` while the MLX thread may be marking
+        a new solo request, so only ``_solo_holds`` (MLX thread) clears a
+        stale mark.
+        """
         rid = self._solo_request_id
         if rid is None:
             return None
         request = self.requests.get(rid)
-        if request is None or request.is_finished():
-            self._solo_request_id = None
+        if request is None or request.is_finished() or request.parked:
             return None
-        return None if request.parked else request
+        return request
 
     def _solo_holds(self, head: "Request") -> bool:
-        """Whether a running solo request keeps ``head`` from being admitted."""
+        """Whether a running solo request keeps ``head`` from being admitted.
+
+        Runs on the MLX thread, the only writer of ``_solo_request_id``: it
+        clears the mark once its request is gone or finished.
+        """
+        rid = self._solo_request_id
+        if rid is not None:
+            request = self.requests.get(rid)
+            if request is None or request.is_finished():
+                self._solo_request_id = None
+                return False
         solo = self._solo_request()
         return solo is not None and solo is not head
 

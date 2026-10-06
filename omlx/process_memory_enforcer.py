@@ -1025,6 +1025,17 @@ class ProcessMemoryEnforcer:
             return True
         return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
 
+    def _at_emergency_level(self, current: int, ceiling: int) -> bool:
+        """``_is_emergency_pressure`` without counting another poll.
+
+        For a re-check within the poll that already counted itself.
+        """
+        if ceiling <= 0 or current < ceiling:
+            return False
+        if current >= ceiling + _EMERGENCY_OVER_CEILING_MARGIN_BYTES:
+            return True
+        return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
+
     def _refresh_effective_metal_cap_bytes(self) -> int:
         """Refresh the cached effective Metal cap outside the poll hot path."""
         self._effective_metal_cap_bytes = get_effective_metal_cap_bytes()
@@ -2372,6 +2383,26 @@ class ProcessMemoryEnforcer:
                                     entry.engine, busy_victim
                                 )
                             )
+                            if single is _NO_LIVE_VICTIM:
+                                # The relief is for the non-emergency path
+                                # only: if usage grew past the emergency line
+                                # meanwhile, the brake gets its last resort
+                                # (one pause first, then abort-all below).
+                                now = self._current_usage_bytes()
+                                if self._at_emergency_level(now, ceiling):
+                                    logger.warning(
+                                        "Hard memory pressure on '%s' reached "
+                                        "the emergency level (current=%s, "
+                                        "ceiling=%s) with no live victim; "
+                                        "applying the emergency brake",
+                                        busy_victim,
+                                        _format_gb(now),
+                                        _format_gb(ceiling),
+                                    )
+                                    if self._emergency_pause_first(now, ceiling):
+                                        break
+                                    emergency = True
+                                    single = None
                             if single is _NO_LIVE_VICTIM:
                                 logger.warning(
                                     "Hard memory pressure on '%s': no live "

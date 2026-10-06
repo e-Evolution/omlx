@@ -34,7 +34,7 @@ import functools
 import logging
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import test_scheduler_decode_pause as dp
@@ -544,3 +544,78 @@ def test_a_media_prompt_whose_images_are_cached_is_not_reserved(tmp_path, monkey
         assert scheduler._external_media_reservation_short(m, est) is True
     finally:
         rig.close()
+
+
+# --- Review R3-no-live-victim-emergency -------------------------------------
+
+
+async def _tick_growing(enforcer, start_gb, grown_gb):
+    """One poll whose first reading is ``start_gb`` and every later one
+    ``grown_gb``: usage keeps growing while the poll runs."""
+    readings = iter([start_gb * GB])
+
+    def active():
+        return next(readings, grown_gb * GB)
+
+    with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        mock_mx.get_active_memory.side_effect = active
+        mock_mx.get_cache_memory.return_value = 0
+        await enforcer._check_and_enforce()
+
+
+class TestNoLiveVictimNeverDisarmsTheEmergencyBrake:
+    @pytest.mark.asyncio
+    async def test_hard_but_not_emergency_aborts_nothing(self, enforcer):
+        engine = _scripted_engine(_ScriptedScheduler([]))
+        _busy(enforcer, engine)
+
+        await tick(enforcer, 97)
+
+        engine.abort_one_request_for_memory.assert_awaited_once()
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_usage_growing_into_emergency_still_aborts_all(self, enforcer):
+        """The poll starts below the ceiling (single-victim path), finds no
+        live victim, and usage has meanwhile grown past ceiling + 2 GB: the
+        last resort runs instead of "nothing aborted"."""
+        engine = _scripted_engine(_ScriptedScheduler([]))
+        _busy(enforcer, engine)
+
+        await _tick_growing(enforcer, 97, 103)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=False)
+
+    @pytest.mark.asyncio
+    async def test_usage_growing_into_emergency_tries_one_pause_first(
+        self, enforcer, caplog
+    ):
+        """A row that becomes pausable only once usage reached the emergency
+        (the hard-path pause found none) is paused before abort-all."""
+        scheduler = _ScriptedScheduler([])
+        victim = MemoryVictim("b", 9_000, 6 * GB, 1)
+        calls = []
+
+        def select():
+            calls.append(1)
+            return victim if len(calls) > 1 else None
+
+        scheduler.select_decode_pause_victim = select
+        engine = _scripted_engine(scheduler)
+        _busy(enforcer, engine)
+
+        with caplog.at_level(logging.WARNING):
+            await _tick_growing(enforcer, 97, 103)
+
+        assert scheduler.paused == ["b"]
+        assert "Emergency memory pressure: pausing decoding request b" in caplog.text
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emergency_with_no_live_victim_aborts_all(self, enforcer):
+        engine = _scripted_engine(_ScriptedScheduler([]))
+        _busy(enforcer, engine)
+
+        await tick(enforcer, 103)
+
+        engine.abort_all_requests.assert_awaited_once_with(spare_parked=False)
