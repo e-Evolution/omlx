@@ -3731,17 +3731,22 @@ class TestSingleVictimFallback:
         engine.abort_one_request_for_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_victim_falls_back_to_abort_all_sparing_parked(
-        self, enforcer, monkeypatch
+    async def test_no_live_victim_aborts_nothing_below_the_emergency(
+        self, enforcer, monkeypatch, caplog
     ):
+        """No live request means only queued ones are left, and they hold no
+        memory: aborting them frees nothing (C7 image-decode aborted queued
+        requests this way). The emergency brake stays armed."""
         monkeypatch.setenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "true")
         engine = self._engine([])
         self._busy(enforcer, engine)
 
-        await self._tick(enforcer, 97)
+        with caplog.at_level("WARNING"):
+            await self._tick(enforcer, 97)
 
         engine.abort_one_request_for_memory.assert_awaited_once()
-        engine.abort_all_requests.assert_awaited_once_with(spare_parked=True)
+        engine.abort_all_requests.assert_not_awaited()
+        assert "no live request holds memory to free" in caplog.text
 
     @pytest.mark.asyncio
     async def test_engine_without_the_hook_falls_back_to_abort_all(
