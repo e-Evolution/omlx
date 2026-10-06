@@ -220,6 +220,16 @@ def test_an_expired_backoff_triggers_the_next_attempt(
     tmp_path, mock_tokenizer, monkeypatch
 ):
     import time
+    import types
+
+    # Advance only the scheduler's clock, so the test does not depend on
+    # wall-clock sleeps (which were flaky with a 50 ms margin).
+    offset = [0.0]
+    fake_time = types.SimpleNamespace(
+        **{name: getattr(time, name) for name in dir(time) if not name.startswith("__")}
+    )
+    fake_time.monotonic = lambda: time.monotonic() + offset[0]
+    monkeypatch.setattr(scheduler_module, "time", fake_time)
 
     rig, _usage, _ids, restores = _deferring_rig(
         tmp_path, mock_tokenizer, monkeypatch, base_s=0.5, max_s=60.0
@@ -228,13 +238,16 @@ def test_an_expired_backoff_triggers_the_next_attempt(
         submit(rig, "later", LATER_PROMPT, arrival=1.0)
         step(rig, 2)
         assert len(restores) == 1
-        time.sleep(0.55)
+        offset[0] += 0.75  # past the 0.5 s backoff
         step(rig)
         assert len(restores) == 2, restores
-        # The backoff doubled to 1 s: half a second later it still waits.
-        time.sleep(0.55)
+        # The backoff doubled to 1 s: 0.25 s later it still waits.
+        offset[0] += 0.25
         step(rig)
         assert len(restores) == 2, restores
+        offset[0] += 1.0  # past the doubled backoff
+        step(rig)
+        assert len(restores) == 3, restores
     finally:
         rig.close()
 
