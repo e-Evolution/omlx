@@ -434,6 +434,18 @@ _RE_EV_RESUME_FIT = re.compile(
     r"Resuming parked request (\S+): need ([\d.]+) GB fits in free ([\d.]+) GB"
 )
 _RE_EV_ABORT_ALL = re.compile(r"Hard memory pressure: aborted (\d+) request\(s\) on")
+_RE_EV_SOLO = re.compile(
+    r"Hard memory pressure: (\S+) runs alone \(solo\)|Resuming parked request (\S+) alone \(solo\)"
+)
+_RE_EV_BUDGET = re.compile(
+    r"Decode pause skipped for (\S+): decode pause budget spent \((\d+)/(\d+)\)"
+)
+_RE_EV_EMERG_WAIT = re.compile(
+    r"Emergency memory pressure: waiting for the decode pause of (\S+) on"
+)
+_RE_EV_MEDIA_DEFER = re.compile(
+    r"Deferring media prefill (\S+): its external-loop peak ~([\d.]+) GB"
+)
 
 
 def parse_c7_events(text: str) -> list[dict[str, Any]]:
@@ -510,6 +522,37 @@ def parse_c7_events(text: str) -> list[dict[str, Any]]:
         if m:
             events.append({"kind": "abort_all", "ts": ts, "n": int(m.group(1))})
             continue
+        m = _RE_EV_SOLO.search(line)
+        if m:
+            events.append({"kind": "solo", "ts": ts, "rid": m.group(1) or m.group(2)})
+            continue
+        m = _RE_EV_BUDGET.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "decode_budget_spent",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "used": int(m.group(2)),
+                    "budget": int(m.group(3)),
+                }
+            )
+            continue
+        m = _RE_EV_EMERG_WAIT.search(line)
+        if m:
+            events.append({"kind": "emergency_pause_wait", "ts": ts, "rid": m.group(1)})
+            continue
+        m = _RE_EV_MEDIA_DEFER.search(line)
+        if m:
+            events.append(
+                {
+                    "kind": "media_deferred",
+                    "ts": ts,
+                    "rid": m.group(1),
+                    "peak_gb": float(m.group(2)),
+                }
+            )
+            continue
         events.extend(parse_park_events(line))
     return events
 
@@ -584,6 +627,48 @@ def identity_verdict(
             margin=cmp["margin"],
             mean_abs_dlp=cmp["mean_abs_dlp"],
         )
+    return out
+
+
+def capacity_check(capacity: dict[str, Any], header: str | None) -> dict[str, Any]:
+    """Capacity endpoint availability and the X-oMLX-Max-Context-Tokens header."""
+    body = capacity.get("body") if isinstance(capacity, dict) else None
+    available = isinstance(body, dict) and body.get("available") is True
+    return {
+        "capacity_available": bool(available),
+        "header_present": bool(header),
+        "header": header or None,
+    }
+
+
+def save_c7_refs(path, refs: dict[str, dict[str, Any]], ceiling_gb: float | None) -> None:
+    """Persist alone-run references: name -> {result (with text), lp, clean}."""
+    Path(path).write_text(json.dumps({"ceiling_gb": ceiling_gb, "refs": refs}))
+
+
+def load_c7_refs(path) -> dict[str, Any]:
+    return json.loads(Path(path).read_text())
+
+
+def identity_against_refs(
+    refs: dict[str, dict[str, Any]],
+    results: list[dict[str, Any]],
+    lps: dict[str, list[dict]],
+    paused: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Identity of each completed request against its headroom reference."""
+    out: dict[str, dict[str, Any]] = {}
+    for r in results:
+        ref = refs.get(r["name"])
+        if not ref or not r.get("ok"):
+            continue
+        res = ref["result"]
+        v = identity_verdict(res, r, ref_lp=ref.get("lp"), test_lp=lps.get(r["name"]))
+        v["paused"] = r["name"] in paused
+        v["ref_ok"] = bool(res.get("ok"))
+        v["ref_clean"] = bool(ref.get("clean", True))
+        v["prompt_mismatch"] = res.get("prompt_tokens") != r.get("prompt_tokens")
+        out[r["name"]] = v
     return out
 
 
@@ -757,6 +842,14 @@ def summarize_c7(
         "drain_waits": sum(1 for e in events if e["kind"] == "drain_wait"),
         "park_waits": sum(1 for e in events if e["kind"] == "park_wait"),
         "resume_fits": sum(1 for e in events if e["kind"] == "resume_fit"),
+        "solo_events": sum(1 for e in events if e["kind"] == "solo"),
+        "decode_budget_spent": sum(
+            1 for e in events if e["kind"] == "decode_budget_spent"
+        ),
+        "emergency_pause_waits": sum(
+            1 for e in events if e["kind"] == "emergency_pause_wait"
+        ),
+        "media_deferrals": sum(1 for e in events if e["kind"] == "media_deferred"),
         "hard_pressure_seen": any(
             e["kind"] == "pressure" and e["to"] == "hard" for e in events
         ),

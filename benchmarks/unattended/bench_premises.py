@@ -1032,6 +1032,71 @@ def _c7_attach_lp(
             rows[r["name"]] = bm.load_logprob_dump(path)
 
 
+async def _c7_refs_only(
+    ctx: Ctx,
+    kind: str,
+    prompts: list[Any],
+    warm: list[dict[str, Any]],
+    mt: int,
+) -> dict[str, Any]:
+    """D4: run every prompt ALONE (greedy, logprob dump) at a ceiling with headroom.
+
+    Saved to ``<out>/references.json`` for the pressure runs (``--c7-refs-from``).
+    """
+    a = ctx.args
+    dump_dir = ctx.server.dump_dir
+    off_all = ctx.server.log_size()
+    t = time.time()
+    results: list[dict[str, Any]] = []
+    refs: dict[str, dict[str, Any]] = {}
+    for i, prompt in enumerate(prompts):
+        if i:
+            await asyncio.sleep(a.settle_s)
+        off = ctx.server.log_size()
+        before = bm.dump_listing(dump_dir) if dump_dir else set()
+        r = await ctx.chat(
+            prompt, mt, SAMPLING_GREEDY, name=f"req{i}", keep_text=True, keep_chunks=True
+        )
+        ev = bm.parse_c7_events(ctx.server.log_since(off))
+        lp: dict[str, list[dict]] = {}
+        _c7_attach_lp(ctx, lp, before, [r])
+        clean = not any(
+            e["kind"] in ("decode_paused", "parked", "victim_abort", "abort_all", "abort")
+            or (e["kind"] == "pressure" and e["to"] == "hard")
+            for e in ev
+        )
+        refs[r["name"]] = {"result": dict(r), "lp": lp.get(r["name"]), "clean": clean}
+        results.append(r)
+    wall = round(time.time() - t, 2)
+    events = bm.parse_c7_events(ctx.server.log_since(off_all))
+    summary = bm.summarize_c7(kind, results, events, wall_s=wall)
+    summary["refs_only"] = True
+    summary["refs_clean"] = all(v["clean"] for v in refs.values())
+    summary["verdict"] = (
+        "refs_failed"
+        if not summary["all_final_ok"]
+        else "refs_ok"
+        if summary["refs_clean"]
+        else "refs_pressured"
+    )
+    bm.save_c7_refs(ctx.server.out / "references.json", refs, a.p7_ceiling_gb)
+    for r in [*warm, *results]:
+        for k in ("text", "chunk_times", "chunk_chars"):
+            r.pop(k, None)
+    return {
+        "scenario": kind,
+        "refs_only": True,
+        "ceiling_gb": a.p7_ceiling_gb,
+        "max_tokens": mt,
+        "warm": warm,
+        "requests": results,
+        "references": [],
+        "identity": {},
+        "wall_s": wall,
+        "summary": summary,
+    }
+
+
 async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
     a = ctx.args
     mode = "image" if kind.startswith("image") else "text"
@@ -1060,6 +1125,8 @@ async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
         else:
             prompts.append(bm.p7_content(text, mode, ctx.seed("C7", kind, i, "img")))
     dump_dir = ctx.server.dump_dir
+    if getattr(a, "c7_refs_only", False):
+        return await _c7_refs_only(ctx, kind, prompts, warm, mt)
     before = bm.dump_listing(dump_dir) if dump_dir else set()
     off = ctx.server.log_size()
 
@@ -1082,7 +1149,18 @@ async def _c7_pressure(ctx: Ctx, kind: str) -> dict[str, Any]:
     _c7_attach_lp(ctx, lps, before, results)
     identity: dict[str, dict[str, Any]] = {}
     refs: list[dict[str, Any]] = []
-    if kind in ("decode", "image-decode") and not a.c7_no_identity:
+    if getattr(a, "c7_refs_from", None) and not a.c7_no_identity:
+        ref_path = Path(a.c7_refs_from) / "references.json"
+        data = bm.load_c7_refs(ref_path)
+        identity = bm.identity_against_refs(
+            data["refs"],
+            results,
+            lps,
+            paused=set(bm.attribute_decode_pauses(events, results)),
+        )
+        for v in identity.values():
+            v["ref_ceiling_gb"] = data.get("ceiling_gb")
+    elif kind in ("decode", "image-decode") and not a.c7_no_identity:
         paused = bm.attribute_decode_pauses(events, results)
         for i, r in enumerate(results):
             if not r.get("ok"):
@@ -1220,6 +1298,7 @@ async def _c7_never_fits(ctx: Ctx) -> dict[str, Any]:
     follow.pop("text", None)
     summary = bm.summarize_c7("never-fits", [], events, never_fits=nf)
     summary["followup_ok"] = bool(follow.get("ok"))
+    summary.update(bm.capacity_check(capacity, header))
     return {
         "scenario": "never-fits",
         "ceiling_gb": a.p7_ceiling_gb,
@@ -1396,6 +1475,8 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
                 "c7_never_prompt_tokens",
                 "c7_never_max_tokens",
                 "c7_no_identity",
+                "c7_refs_only",
+                "c7_refs_from",
             )
         }
         if server.premise == "C7"
@@ -1572,6 +1653,19 @@ def main(argv: list[str] | None = None) -> int:
         "--c7-no-identity",
         action="store_true",
         help="C7 decode: skip the alone-run greedy identity references",
+    )
+    ap.add_argument(
+        "--c7-refs-only",
+        action="store_true",
+        help="C7 D4: run each prompt alone (no pressure) and save references.json "
+        "in --out; use a ceiling with headroom",
+    )
+    ap.add_argument(
+        "--c7-refs-from",
+        default=None,
+        metavar="DIR",
+        help="C7 D4: compare each pressured request with DIR/references.json "
+        "instead of running alone references on the pressured server",
     )
     ap.add_argument(
         "--p7-mode",

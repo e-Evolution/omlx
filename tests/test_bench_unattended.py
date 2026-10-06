@@ -2353,3 +2353,148 @@ class TestC7Wiring:
         )
         assert (a.p7_ceiling_gb, a.p7_hard_threshold, a.c7_max_tokens) == (30.0, 0.7, 100)
 
+
+
+# --------------------------------------------------------------------------
+# C7 re-run (D4): ceiling-headroom references, new log lines, capacity checks
+# --------------------------------------------------------------------------
+
+C7R_LOG = """\
+2026-10-06 10:00:01,000 - omlx.process_memory_enforcer - WARNING - [-] - Hard memory pressure: rid-a runs alone (solo) on 'm'; it is not paused or aborted below the emergency threshold (ceiling 48.0GB)
+2026-10-06 10:00:02,000 - omlx.scheduler - INFO - [-] - Resuming parked request rid-b alone (solo): it fits under the ceiling only with nothing else running; nothing else is admitted until it finishes, and memory pressure below the emergency threshold does not pause it again
+2026-10-06 10:00:03,000 - omlx.scheduler - INFO - [-] - Decode pause skipped for rid-c: decode pause budget spent (8/8)
+2026-10-06 10:00:04,000 - omlx.process_memory_enforcer - WARNING - [-] - Emergency memory pressure: waiting for the decode pause of rid-a on 'm' before aborting (poll 1/2)
+2026-10-06 10:00:05,000 - omlx.scheduler - INFO - [-] - Deferring media prefill rid-d: its external-loop peak ~20.1 GB would cross the hard watermark line 36.5 GB beside admitted work; it waits for admitted requests to finish
+"""
+
+
+class TestParseC7RerunEvents:
+    def test_new_lines_become_events(self):
+        ev = bm.parse_c7_events(C7R_LOG)
+        assert [e["kind"] for e in ev] == [
+            "solo",
+            "solo",
+            "decode_budget_spent",
+            "emergency_pause_wait",
+            "media_deferred",
+        ]
+        assert ev[0]["rid"] == "rid-a" and ev[1]["rid"] == "rid-b"
+        assert ev[2]["rid"] == "rid-c" and (ev[2]["used"], ev[2]["budget"]) == (8, 8)
+        assert ev[3]["rid"] == "rid-a"
+        assert ev[4]["rid"] == "rid-d" and ev[4]["peak_gb"] == 20.1
+
+    def test_resume_solo_line_is_not_a_fit_resume(self):
+        ev = bm.parse_c7_events(C7R_LOG)
+        assert "resume_fit" not in {e["kind"] for e in ev}
+
+    def test_summary_counts_them(self):
+        s = bm.summarize_c7("decode", [], bm.parse_c7_events(C7R_LOG))
+        assert s["solo_events"] == 2
+        assert s["decode_budget_spent"] == 1
+        assert s["emergency_pause_waits"] == 1
+        assert s["media_deferrals"] == 1
+
+
+class TestCapacityCheck:
+    def test_available_with_header(self):
+        c = bm.capacity_check({"status": 200, "body": {"available": True}}, "123456")
+        assert c == {"capacity_available": True, "header_present": True, "header": "123456"}
+
+    def test_unavailable_and_no_header(self):
+        c = bm.capacity_check({"status": 200, "body": {"available": False}}, None)
+        assert c["capacity_available"] is False and c["header_present"] is False
+
+    def test_error_or_missing_body(self):
+        assert bm.capacity_check({"status": None, "error": "x"}, "1")["capacity_available"] is False
+        assert bm.capacity_check({"status": 200, "body": None}, "")["header_present"] is False
+
+
+class TestC7References:
+    def _ref(self, text="a b c", ptok=100):
+        return {"name": "req0", "ok": True, "text": text, "prompt_tokens": ptok, "completion_tokens": 3}
+
+    def test_round_trip(self, tmp_path):
+        p = tmp_path / "references.json"
+        bm.save_c7_refs(p, {"req0": {"result": self._ref(), "lp": [{"t": 1}]}}, ceiling_gb=56.0)
+        data = bm.load_c7_refs(p)
+        assert data["ceiling_gb"] == 56.0
+        assert data["refs"]["req0"]["result"]["text"] == "a b c"
+        assert data["refs"]["req0"]["lp"] == [{"t": 1}]
+
+    def test_identity_against_refs_identical(self):
+        refs = {"req0": {"result": self._ref(), "lp": None}}
+        got = bm.identity_against_refs(refs, [_c7req("req0", 100, text="a b c")], {}, paused=set())
+        assert got["req0"]["identical"] is True
+        assert got["req0"]["paused"] is False
+        assert got["req0"]["ref_ok"] is True and got["req0"]["ref_clean"] is True
+
+    def test_identity_against_refs_divergent_marks_paused(self):
+        refs = {"req0": {"result": self._ref(), "lp": None}}
+        got = bm.identity_against_refs(
+            refs, [_c7req("req0", 100, text="a b q")], {}, paused={"req0"}
+        )
+        assert got["req0"]["identical"] is False
+        assert got["req0"]["classification"] == "unclassified"
+        assert got["req0"]["paused"] is True
+
+    def test_failed_or_unreferenced_requests_are_skipped(self):
+        refs = {"req0": {"result": self._ref(), "lp": None}}
+        got = bm.identity_against_refs(
+            refs,
+            [_c7req("req0", 100, ok=False), _c7req("req1", 100)],
+            {},
+            paused=set(),
+        )
+        assert got == {}
+
+    def test_prompt_mismatch_is_flagged(self):
+        refs = {"req0": {"result": self._ref(ptok=100), "lp": None}}
+        got = bm.identity_against_refs(refs, [_c7req("req0", 999, text="a b c")], {}, paused=set())
+        assert got["req0"]["prompt_mismatch"] is True
+
+
+class TestScenarioC7Refs(TestScenarioC7):
+    def test_refs_only_runs_alone_serially_and_saves_references(self, tmp_path):
+        ctx, calls, _, asyncio = self._ctx("decode", paused_log="")
+        ctx.server.out = tmp_path
+        ctx.args.c7_refs_only = True
+        ctx.args.p7_ceiling_gb = 56.0
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert [c[0] for c in calls] == ["req0", "req1", "req2"]
+        assert all(c[3] == bp.SAMPLING_GREEDY for c in calls)
+        data = bm.load_c7_refs(tmp_path / "references.json")
+        assert data["ceiling_gb"] == 56.0
+        assert set(data["refs"]) == {"req0", "req1", "req2"}
+        assert data["refs"]["req0"]["result"]["text"] == "alpha beta gamma"
+        assert data["refs"]["req0"]["clean"] is True
+        assert sc["summary"]["verdict"] == "refs_ok"
+        assert bp.scenario_ok("C7", sc) is True
+
+    def test_refs_only_flags_a_pressured_reference(self, tmp_path):
+        ctx, _, _, asyncio = self._ctx("decode")  # C7_LOG has hard pressure + pause
+        ctx.server.out = tmp_path
+        ctx.args.c7_refs_only = True
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert sc["summary"]["verdict"] == "refs_pressured"
+
+    def test_refs_from_replaces_the_alone_phase(self, tmp_path):
+        ctx, calls, _, asyncio = self._ctx("decode")
+        ref = _c7req("req0", 120000, text="alpha beta gamma")
+        refs = {
+            f"req{i}": {"result": {**ref, "name": f"req{i}", "prompt_tokens": p}, "lp": None, "clean": True}
+            for i, p in enumerate((120000, 90000, 100000))
+        }
+        bm.save_c7_refs(tmp_path / "references.json", refs, 56.0)
+        ctx.args.c7_refs_from = str(tmp_path)
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert [c[0] for c in calls] == ["req0", "req1", "req2"]
+        assert sc["summary"]["identity"]["checked"] == 3
+        assert sc["summary"]["identity"]["identical"] == 3
+        assert sc["identity"]["req0"]["paused"] is True
+        assert sc["identity"]["req0"]["ref_ceiling_gb"] == 56.0
+
+    def test_never_fits_summary_carries_capacity_fields(self):
+        ctx, _, _, asyncio = self._ctx("never-fits", paused_log="")
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert sc["summary"]["capacity_available"] is True
+        assert sc["summary"]["header_present"] is True
