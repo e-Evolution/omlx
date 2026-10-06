@@ -48,7 +48,7 @@ from test_scheduler_park_resume_priority import _parked_request
 from test_scheduler_prefill_memory_guard import _make_scheduler
 
 import omlx.scheduler as scheduler_module
-from omlx.request import MemoryVictim, Request, SamplingParams
+from omlx.request import MemoryVictim, Request, RequestStatus, SamplingParams
 from omlx.settings import GlobalSettings, SchedulerSettings
 
 GB = 1024**3
@@ -529,3 +529,48 @@ async def test_a_row_paused_twice_waits_for_the_other_row_instead_of_thrashing(
         assert scheduler.get_park_stats()["decode_resumes"] == 2
     finally:
         rig.close()
+
+
+# --- A solo mark raced between the enforcer and the MLX thread -----------------
+
+
+def test_the_enforcer_read_never_clears_a_solo_mark_set_meanwhile(lined):
+    """The enforcer thread reads a finished solo request while the MLX thread
+    marks a new one: the new mark survives (the enforcer side is read-only)."""
+    scheduler, _, admitted = lined
+    old = _parked_request("old")
+    old.parked = False
+    old.status = RequestStatus.FINISHED_STOPPED
+    new = _parked_request("new")
+    scheduler.requests = {"old": old}
+    scheduler._solo_request_id = "old"
+    admitted["ids"] = frozenset()
+
+    class _Interleaved(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if key == "old":
+                # MLX thread, between the enforcer's read and any write back.
+                scheduler._mark_solo(new, "solo")
+            return value
+
+    scheduler.requests = _Interleaved(scheduler.requests)
+
+    assert scheduler.memory_pressure_solo_request() is None
+    assert scheduler._solo_request_id == "new"
+
+
+def test_only_the_scheduler_thread_clears_a_finished_solo_mark(lined):
+    scheduler, _, _ = lined
+    old = _parked_request("old")
+    old.parked = False
+    old.status = RequestStatus.FINISHED_STOPPED
+    scheduler.requests = {"old": old}
+    scheduler._solo_request_id = "old"
+
+    assert scheduler.memory_pressure_solo_request() is None
+    assert scheduler._solo_request_id == "old"  # the enforcer read wrote nothing
+
+    head = _parked_request("head")
+    assert scheduler._solo_holds(head) is False  # scheduler thread
+    assert scheduler._solo_request_id is None
