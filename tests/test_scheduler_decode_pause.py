@@ -209,7 +209,7 @@ def test_a_decoding_row_is_pausable_when_nothing_excludes_it(tmp_path):
         ("mtp", "batched Lightning MTP"),
         ("vlm_mtp", "VLM-MTP"),
         ("no_ssd", "no paged SSD cache"),
-        ("budget", "park budget spent"),
+        ("budget", "decode pause budget spent (8/8)"),
     ],
 )
 def test_v1_exclusions_name_why_a_decoding_row_cannot_pause(
@@ -234,7 +234,9 @@ def test_v1_exclusions_name_why_a_decoding_row_cannot_pause(
         elif case == "no_ssd":
             monkeypatch.setattr(scheduler, "paged_ssd_cache_manager", None)
         elif case == "budget":
-            request.park_count = 3
+            # Decode pauses have their own budget; prefill parks do not count.
+            request.park_count = 11
+            request.decode_pause_count = 8
         reason = scheduler._park_exclusion_reason(request)
         assert reason is not None and expected in reason
         assert scheduler.request_decode_pause("a") is False

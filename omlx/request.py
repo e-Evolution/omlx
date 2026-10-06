@@ -264,7 +264,13 @@ class Request:
     # committed prefix. ``parked`` is True from the park until the resume.
     parked: bool = False
     parked_at: float = 0.0  # time.monotonic() of the latest park
-    park_count: int = 0  # Parks taken so far (bounded by max_parks_per_request)
+    # Parks and decode pauses taken so far (the sequence number of the next
+    # one's storage id). Prefill parks are bounded by max_parks_per_request,
+    # decode pauses by max_decode_pauses_per_request.
+    park_count: int = 0
+    decode_pause_count: int = 0  # Decode pauses among ``park_count``
+    # time.monotonic() of each park or decode pause, for the thrash rule.
+    park_times: list[float] = field(default_factory=list)
     # Prompt tokens a prefill park left committed in the prefix cache.
     park_committed_tokens: int = 0
 
