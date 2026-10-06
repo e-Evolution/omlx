@@ -102,8 +102,10 @@ def _scheduler(model, tokenizer, *, tq_bits=TQ_BITS, capacity=160 * MB):
     if tq_bits is not None:
         scheduler._turboquant_kv_bits = float(tq_bits)
         scheduler._set_model_info_for_monitor()
-    # What the enforcer propagates: guard on, a capacity line.
+    # What the enforcer propagates: guard on, memory scheduling on, a
+    # capacity line.
     scheduler._prefill_memory_guard = True
+    scheduler._memory_scheduling = True
     scheduler._memory_hard_limit_bytes = capacity
     scheduler._memory_hard_watermark_bytes = capacity
     scheduler._prefill_headroom_safety = 1.0

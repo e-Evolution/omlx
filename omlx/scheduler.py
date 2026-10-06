@@ -2602,6 +2602,11 @@ class Scheduler:
         # must steer the user to that knob instead of "close other apps".
         self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
+        # Memory scheduling (the never-fits gate and capacity hint, the
+        # fits-later wait with the solo admission, the progress-based stall
+        # clock): resolved by ProcessMemoryEnforcer from
+        # memory.memory_scheduling. Off keeps upstream admission.
+        self._memory_scheduling: bool = False
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -5828,16 +5833,25 @@ class Scheduler:
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
 
+    def _memory_scheduling_on(self) -> bool:
+        """Whether memory scheduling is on (see ``_memory_scheduling``)."""
+        return getattr(self, "_memory_scheduling", False) is True
+
     def _note_admission_progress(self) -> None:
         """Record that a request made progress: a token was emitted, a
         prefill chunk or an external prefill ran, a request was admitted, or
-        a store-cache write drained. The admission-stall clocks restart."""
+        a store-cache write drained. The admission-stall clocks restart
+        (with memory scheduling on)."""
         self._admission_progress_at = time.monotonic()
 
     def _admission_idle_since(self, blocked_since: float) -> float:
-        """Start of the current no-progress stretch for a blocked head."""
+        """Start of the current no-progress stretch for a blocked head.
+
+        With memory scheduling off the clock is upstream's: it runs from
+        when the head first blocked, whatever else progresses.
+        """
         progress = self._admission_progress_at
-        if progress is None:
+        if progress is None or not self._memory_scheduling_on():
             return blocked_since
         return max(blocked_since, progress)
 
@@ -5875,7 +5889,9 @@ class Scheduler:
         for. The line is ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` without
         progress, or ``admission_no_progress_timeout_s`` while memory is
         scheduled on purpose (``_deliberate_memory_hold``), so a genuine
-        deadlock still surfaces with an error.
+        deadlock still surfaces with an error. With memory scheduling off
+        the clock is upstream's: ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` from
+        when the head first blocked.
         """
         if not self.waiting:
             self._clear_memory_admission_blocker()
@@ -5888,11 +5904,13 @@ class Scheduler:
             # client's own timeouts apply.
             self._clear_memory_admission_blocker(request_id)
             return None
+        progress_clock = self._memory_scheduling_on()
         now = time.monotonic()
         if request_id != self._memory_admission_blocked_request_id:
             self._memory_admission_blocked_request_id = request_id
             self._memory_admission_blocked_since = now
-            self._log_admission_wait(request_id, reason)
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         timeout = getattr(
@@ -5900,7 +5918,7 @@ class Scheduler:
             "_MEMORY_ADMISSION_STALL_TIMEOUT_S",
             Scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S,
         )
-        if self._deliberate_memory_hold():
+        if progress_clock and self._deliberate_memory_hold():
             timeout = max(
                 timeout,
                 float(getattr(self.config, "admission_no_progress_timeout_s", 600.0)),
@@ -5909,7 +5927,8 @@ class Scheduler:
             self._memory_admission_blocked_since
         )
         if idle_for < timeout:
-            self._log_admission_wait(request_id, reason)
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         stalled_for = now - self._memory_admission_blocked_since
@@ -5930,11 +5949,23 @@ class Scheduler:
             fmt=format_bytes,
             tail=["reduce context length", "lower hot_cache_max_size"],
         )
-        message = (
-            "Request could not be admitted because memory pressure persisted "
-            f"for {stalled_for:.1f}s ({reason}) and no request made progress "
-            f"for {idle_for:.1f}s. {advice}."
-        )
+        metadata = {
+            "request_id": request_id,
+            "reason": reason,
+            "stalled_seconds": int(stalled_for),
+        }
+        if progress_clock:
+            message = (
+                "Request could not be admitted because memory pressure persisted "
+                f"for {stalled_for:.1f}s ({reason}) and no request made progress "
+                f"for {idle_for:.1f}s. {advice}."
+            )
+            metadata["no_progress_seconds"] = int(idle_for)
+        else:
+            message = (
+                "Request could not be admitted because memory pressure persisted "
+                f"for {stalled_for:.1f}s ({reason}). {advice}."
+            )
         logger.warning("Memory admission stalled for %s: %s", request_id, message)
         return RequestOutput(
             request_id=request_id,
@@ -5942,12 +5973,7 @@ class Scheduler:
             finish_reason="error",
             error=message,
             error_code="memory_admission_stalled",
-            error_metadata={
-                "request_id": request_id,
-                "reason": reason,
-                "stalled_seconds": int(stalled_for),
-                "no_progress_seconds": int(idle_for),
-            },
+            error_metadata=metadata,
         )
 
     def _store_cache_admission_stall_output(
@@ -5968,15 +5994,18 @@ class Scheduler:
         if request.parked:
             self._clear_store_cache_admission_blocker(request_id)
             return None
+        progress_clock = self._memory_scheduling_on()
         now = time.monotonic()
         if request_id != self._store_cache_admission_blocked_request_id:
             self._store_cache_admission_blocked_request_id = request_id
             self._store_cache_admission_blocked_since = now
-            self._log_admission_wait(request_id, reason)
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         # Backpressure, not a failure, while the writer drains (a drained
-        # write is progress) or other requests progress.
+        # write is progress) or other requests progress. Memory scheduling
+        # off: upstream's fixed timeout from when the head first blocked.
         timeout = getattr(
             self,
             "_STORE_CACHE_ADMISSION_STALL_TIMEOUT_S",
@@ -5986,7 +6015,8 @@ class Scheduler:
             self._store_cache_admission_blocked_since
         )
         if idle_for < timeout:
-            self._log_admission_wait(request_id, reason)
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         stalled_for = now - self._store_cache_admission_blocked_since
@@ -5996,12 +6026,16 @@ class Scheduler:
         self._clear_request_admission_bookkeeping(request_id)
         get_prefill_tracker().remove(request_id)
 
+        progress = (
+            f" and no request made progress for {idle_for:.1f}s"
+            if progress_clock
+            else ""
+        )
         message = (
             "Request could not be admitted because store-cache cleanup stayed "
-            f"full for {stalled_for:.1f}s ({reason}) and no request made "
-            f"progress for {idle_for:.1f}s. The previous response "
-            "cache is still being persisted; retry after the cache writer drains "
-            "or reduce cache/write pressure."
+            f"full for {stalled_for:.1f}s ({reason}){progress}. The previous "
+            "response cache is still being persisted; retry after the cache "
+            "writer drains or reduce cache/write pressure."
         )
         logger.warning(
             "Store-cache admission stalled for %s: %s "
@@ -6022,7 +6056,7 @@ class Scheduler:
                 "request_id": request_id,
                 "reason": reason,
                 "stalled_seconds": int(stalled_for),
-                "no_progress_seconds": int(idle_for),
+                **({"no_progress_seconds": int(idle_for)} if progress_clock else {}),
                 "store_cache_in_flight": gate_in_flight,
                 "pending_store_cleanups": pending_cleanups,
                 "store_cache_cap": gate_cap,
@@ -11929,12 +11963,18 @@ class Scheduler:
         The solo request when it is the only admitted request, or a request
         in the external prefill loop with nothing else admitted (it cannot
         be parked, and with nothing else running aborting it frees memory
-        for nobody). Thread-safe read: at hard pressure below the emergency
-        threshold the enforcer neither pauses nor aborts it.
+        for nobody; with memory scheduling on only, so the enforcer's hard
+        path stays upstream's otherwise). Thread-safe read: at hard pressure
+        below the emergency threshold the enforcer neither pauses nor aborts
+        it.
         """
         try:
             external = self._external_prefill_request_id
-            if external is not None and not self._admitted_request_ids():
+            if (
+                external is not None
+                and self._memory_scheduling_on()
+                and not self._admitted_request_ids()
+            ):
                 return external
             solo = self._solo_request()
             if solo is None or self._admitted_request_ids() != {solo.request_id}:
@@ -13765,7 +13805,7 @@ class Scheduler:
         requests' vision embeddings, settling buffers). Nothing is admitted
         beside it and the enforcer leaves it to the emergency brake; the
         chunk guard still bounds each prefill chunk. Only with the park
-        feature on.
+        feature and memory scheduling on (no capacity estimate otherwise).
         """
         if not self._park_enabled() or capacity is None or not capacity.fits_alone:
             return False
@@ -14086,8 +14126,12 @@ class Scheduler:
         """Whether ``context_tokens + max_tokens`` fits with nothing else running.
 
         None when it cannot be estimated: no monitor, no memory limit, model
-        weights or KV dimensions unknown.
+        weights or KV dimensions unknown, or memory scheduling off. Without
+        an estimate there is no never-fits error, no fits-later wait, no solo
+        admission and no capacity hint: the upstream current-usage preflight.
         """
+        if not self._memory_scheduling_on():
+            return None
         monitor = self.memory_monitor
         if monitor is None:
             return None
@@ -14161,7 +14205,10 @@ class Scheduler:
 
     def max_viable_context_tokens(self) -> int | None:
         """Cached capacity hint: the largest text context plus max_tokens
-        that fits with nothing else running, or None when unknown."""
+        that fits with nothing else running, or None when unknown or memory
+        scheduling is off."""
+        if not self._memory_scheduling_on():
+            return None
         capacity = self._capacity_limit_bytes()
         weights = self._model_weights_bytes()
         if capacity <= 0 or weights <= 0:

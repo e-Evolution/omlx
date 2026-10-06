@@ -600,6 +600,7 @@ async def lifespan(app: FastAPI):
             hard_threshold=memory_settings.hard_threshold,
             prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
+            memory_scheduling=memory_settings.memory_scheduling,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer
@@ -3757,7 +3758,9 @@ async def get_model_capacity(
     ``capacity_bytes``, ``weights_bytes``, ``kv_bytes_per_token``,
     ``max_viable_context_tokens``) plus ``free_bytes_now``. Never loads a
     model: an unloaded one is a 409. ``available`` is false when the
-    capacity cannot be estimated (no memory limit, unknown weights).
+    capacity cannot be estimated (no memory limit, unknown weights), or when
+    memory scheduling is off (``memory.memory_scheduling``): the endpoint
+    still answers, with ``memory_scheduling: "off"`` and the reason.
     """
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -3775,6 +3778,17 @@ async def get_model_capacity(
         else None
     )
     if not isinstance(snapshot, dict):
+        enforcer = _server_state.process_memory_enforcer
+        if enforcer is not None and not getattr(
+            enforcer, "memory_scheduling_enabled", True
+        ):
+            reason = getattr(enforcer, "memory_scheduling_reason", "")
+            return {
+                "model": model_id,
+                "available": False,
+                "memory_scheduling": "off",
+                "reason": f"memory scheduling is off ({reason})",
+            }
         return {
             "model": model_id,
             "available": False,

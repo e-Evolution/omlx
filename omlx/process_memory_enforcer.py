@@ -136,6 +136,73 @@ def _format_gb(b: int) -> str:
     return f"{b / 1024**3:.1f}GB"
 
 
+@dataclass(frozen=True)
+class MemorySchedulingState:
+    """Resolved ``memory.memory_scheduling``.
+
+    ``enabled`` turns on the never-fits gate and capacity hint, the
+    fits-later wait (with the solo admission of a lone head) and the
+    progress-based admission-stall clock. ``warn``: the operator forced it
+    on but it cannot be (the guard is off).
+    """
+
+    mode: str
+    enabled: bool
+    reason: str
+    warn: bool = False
+
+    def log_line(self) -> str:
+        return f"Memory scheduling: {'on' if self.enabled else 'off'} ({self.reason})"
+
+
+def resolve_memory_scheduling(
+    mode: Any,
+    *,
+    prefill_memory_guard: bool,
+    memory_guard_tier: str,
+    custom_ceiling_bytes: int,
+) -> MemorySchedulingState:
+    """Whether memory scheduling is on, and why.
+
+    These behaviours plan against a fixed memory budget: a request that
+    "fits later" waits for memory that is expected to come back, and the
+    capacity numbers promise what fits alone. That holds when the operator
+    pinned the ceiling (custom tier with a ceiling > 0: deterministic
+    resources, memory pressure expected). On a tier the ceiling follows the
+    other apps' memory, so "auto" keeps upstream admission there. A custom
+    ceiling value left under another tier pins nothing and does not count.
+    "on" forces it on but still needs the prefill memory guard; "off"
+    forces it off. An unknown mode resolves as "auto".
+    """
+    resolved = _settings.normalize_memory_scheduling(mode) or "auto"
+    if resolved == "off":
+        return MemorySchedulingState(resolved, False, "memory_scheduling=off")
+    if not prefill_memory_guard:
+        if resolved == "on":
+            return MemorySchedulingState(
+                resolved,
+                False,
+                "memory_scheduling=on needs the prefill memory guard, and the "
+                "prefill memory guard is off",
+                warn=True,
+            )
+        return MemorySchedulingState(resolved, False, "prefill memory guard is off")
+    if resolved == "on":
+        return MemorySchedulingState(resolved, True, "memory_scheduling=on")
+    if memory_guard_tier == "custom" and custom_ceiling_bytes > 0:
+        return MemorySchedulingState(
+            resolved,
+            True,
+            f"explicit ceiling {custom_ceiling_bytes / 1024**3:.1f} GB",
+        )
+    return MemorySchedulingState(
+        resolved,
+        False,
+        "no explicit memory ceiling; set memory_guard_tier=custom with "
+        "memory_guard_custom_ceiling_gb, or memory_scheduling=on",
+    )
+
+
 def get_macos_vm_stats() -> dict[str, int] | None:
     """Snapshot of mach `vm_statistics64` in bytes.
 
@@ -438,6 +505,7 @@ class ProcessMemoryEnforcer:
         hard_threshold: float | None = None,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
+        memory_scheduling: str = "auto",
     ):
         """
         Initialize the process memory enforcer.
@@ -467,6 +535,8 @@ class ProcessMemoryEnforcer:
             prefill_safe_zone_ratio: Fraction of hard cap below which prefill
                 runs at full chunk size; above triggers adaptive shrink.
             prefill_min_chunk_tokens: Floor for adaptive shrink.
+            memory_scheduling: "auto", "on" or "off"; see
+                resolve_memory_scheduling. Propagated to every scheduler.
         """
         self._engine_pool = engine_pool
         self._memory_guard_tier = self._normalize_tier(memory_guard_tier)
@@ -491,6 +561,11 @@ class ProcessMemoryEnforcer:
         self._prefill_headroom_safety = self._get_prefill_headroom_safety()
         self._prefill_safe_zone_ratio = prefill_safe_zone_ratio
         self._prefill_min_chunk_tokens = prefill_min_chunk_tokens
+        self._memory_scheduling_mode = (
+            _settings.normalize_memory_scheduling(memory_scheduling) or "auto"
+        )
+        self._memory_scheduling_state: MemorySchedulingState | None = None
+        self._resolve_memory_scheduling()
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
@@ -581,6 +656,7 @@ class ProcessMemoryEnforcer:
         old = self._memory_guard_tier
         self._memory_guard_tier = new_tier
         self._refresh_tier_thresholds()
+        self._resolve_memory_scheduling()
         if self._running:
             if self._prefill_memory_guard:
                 self._refresh_effective_metal_cap_bytes()
@@ -603,6 +679,7 @@ class ProcessMemoryEnforcer:
             return
         old = self._memory_guard_custom_ceiling_bytes
         self._memory_guard_custom_ceiling_bytes = new_value
+        self._resolve_memory_scheduling()
         if self._running:
             if self._prefill_memory_guard:
                 self._refresh_effective_metal_cap_bytes()
@@ -1376,9 +1453,56 @@ class ProcessMemoryEnforcer:
     @prefill_memory_guard.setter
     def prefill_memory_guard(self, value: bool) -> None:
         self._prefill_memory_guard = value
+        self._resolve_memory_scheduling()
         if self._running:
             self._propagate_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
+
+    @property
+    def memory_scheduling(self) -> str:
+        """The configured mode: "auto", "on" or "off"."""
+        return self._memory_scheduling_mode
+
+    @memory_scheduling.setter
+    def memory_scheduling(self, value: str) -> None:
+        mode = _settings.normalize_memory_scheduling(value)
+        if mode is None:
+            raise ValueError(f"Invalid memory_scheduling: {value!r}")
+        self._memory_scheduling_mode = mode
+        self._resolve_memory_scheduling()
+        if self._running:
+            self._propagate_memory_limit()
+
+    @property
+    def memory_scheduling_enabled(self) -> bool:
+        """Whether memory scheduling is on (see resolve_memory_scheduling)."""
+        state = self._memory_scheduling_state
+        return state is not None and state.enabled
+
+    @property
+    def memory_scheduling_reason(self) -> str:
+        state = self._memory_scheduling_state
+        return state.reason if state is not None else ""
+
+    def _resolve_memory_scheduling(self) -> None:
+        """Re-resolve the mode against the guard and ceiling; log a change.
+
+        Runs at startup and whenever the mode, the guard, the tier or the
+        custom ceiling changes (admin settings apply live).
+        """
+        state = resolve_memory_scheduling(
+            self._memory_scheduling_mode,
+            prefill_memory_guard=self._prefill_memory_guard,
+            memory_guard_tier=self._memory_guard_tier,
+            custom_ceiling_bytes=self._memory_guard_custom_ceiling_bytes,
+        )
+        if state == self._memory_scheduling_state:
+            return
+        self._memory_scheduling_state = state
+        if state.warn:
+            logger.warning(state.log_line())
+        else:
+            logger.info(state.log_line())
 
     @staticmethod
     def _resolve_scheduler(entry: Any) -> Any | None:
@@ -1538,6 +1662,7 @@ class ProcessMemoryEnforcer:
             # the distinction to point at the right knob.
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
+            scheduler._memory_scheduling = self.memory_scheduling_enabled
             scheduler._admission_paused = admission_paused
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio

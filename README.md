@@ -282,9 +282,24 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 
 #### Memory capacity
 
-A request that cannot fit even with nothing else running (model weights + KV for the prompt plus `max_tokens` + the prefill transient, over the memory guard's capacity line) is rejected up front with HTTP 400 and `omlx_code: "context_exceeds_capacity"`. The usual error envelope stays (`message`, `type`, `code`, `estimated_bytes`, `limit_bytes`) and adds `required_bytes`, `capacity_bytes`, `weights_bytes`, `kv_bytes_per_token`, `requested_context_tokens`, `requested_max_tokens`, `max_viable_context_tokens` and `retryable: false`: compact or shorten the context, or lower `max_tokens`, before retrying. A request that fits alone but not right now is not rejected; it waits until running requests free memory.
+These capacity features plan against a fixed memory budget, so they are part of **memory scheduling**, which is on only when that budget is fixed:
 
-`GET /v1/omlx/capacity?model=<id>&context_tokens=<n>&max_tokens=<m>` (API key like the other `/v1` routes) returns the same numbers for a request of that size plus `free_bytes_now`, without loading the model (an unloaded model is a 409; `available: false` when no estimate exists). Chat completions also carry an `X-oMLX-Max-Context-Tokens` header: the largest prompt plus `max_tokens` that fits alone.
+| `memory.memory_scheduling` (env `OMLX_MEMORY_SCHEDULING`) | Effect |
+|---|---|
+| `auto` (default) | On when the prefill memory guard is on and an explicit ceiling is set (`memory_guard_tier: custom` with `memory_guard_custom_ceiling_gb` > 0, or `--memory-guard-gb`). Off on the `safe` / `balanced` / `aggressive` tiers. |
+| `on` | On whatever the tier. It still needs the prefill memory guard; with the guard off it stays off and logs a warning. |
+| `off` | Off. Admission is the same as without these features. |
+
+Why an explicit ceiling: waiting for memory and promising what fits alone only make sense when the budget is fixed and memory pressure is expected. On a tier, the ceiling follows the memory other apps use, so a request that fits now may not fit a minute later. At startup, and whenever the mode, the guard, the tier or the ceiling changes, the server logs the resolved state, for example `Memory scheduling: on (explicit ceiling 48.0 GB)` or `Memory scheduling: off (no explicit memory ceiling; ...)`.
+
+With memory scheduling on:
+
+- **Never fits.** A request that cannot fit even with nothing else running (model weights + KV for the prompt plus `max_tokens` + the prefill transient, over the memory guard's capacity line) is rejected up front with HTTP 400 and `omlx_code: "context_exceeds_capacity"`. The usual error envelope stays (`message`, `type`, `code`, `estimated_bytes`, `limit_bytes`) and adds `required_bytes`, `capacity_bytes`, `weights_bytes`, `kv_bytes_per_token`, `requested_context_tokens`, `requested_max_tokens`, `max_viable_context_tokens` and `retryable: false`. Compact or shorten the context, or lower `max_tokens`, before retrying.
+- **Fits later.** A request that fits alone but not right now is not rejected. It waits at the head of the queue until running requests free memory. With the park feature on and nothing running, it can run alone (solo) instead of being rejected.
+- **Stall clock.** A queued request fails after 60 s without progress by any request (a token, a prefill chunk, a drained cache write), not 60 s after it started waiting. While memory is held on purpose, the bound is `scheduler.admission_no_progress_timeout_s` (default 600 s).
+- **Capacity numbers.** `GET /v1/omlx/capacity?model=<id>&context_tokens=<n>&max_tokens=<m>` (API key like the other `/v1` routes) returns the same numbers for a request of that size plus `free_bytes_now`, without loading the model. An unknown model is a 404 and an unloaded one a 409; `available: false` when no estimate exists. Chat completions also carry an `X-oMLX-Max-Context-Tokens` header: the largest prompt plus `max_tokens` that fits alone.
+
+With memory scheduling off, a request is checked against the current usage and rejected if it does not fit now, a queued request fails 60 s after it started waiting for memory, and there is no header. The capacity endpoint still answers for a loaded model, with `available: false`, `memory_scheduling: "off"` and the reason.
 
 ### Tool Calling & Structured Output
 
@@ -343,8 +358,11 @@ omlx serve --model-dir ~/models
 # Choose a memory guard tier at startup
 omlx serve --model-dir ~/models --memory-guard safe
 
-# Set a custom memory guard ceiling in GB
+# Set a custom memory guard ceiling in GB (also turns memory scheduling on)
 omlx serve --model-dir ~/models --memory-guard-gb 48
+
+# Force memory scheduling on or off (default auto)
+OMLX_MEMORY_SCHEDULING=on omlx serve --model-dir ~/models
 
 # Enable SSD cache for KV blocks
 omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache

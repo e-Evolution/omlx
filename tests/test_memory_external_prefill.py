@@ -68,6 +68,7 @@ def enforcer(mock_engine_pool):  # noqa: F811
         ceiling=100 * GB,
         soft_threshold=0.85,
         hard_threshold=0.95,
+        memory_scheduling="on",
     )
 
 
@@ -265,6 +266,42 @@ async def test_lone_external_media_prefill_at_hard_pressure_is_not_aborted(
         engine.abort_all_requests.assert_not_awaited()
         assert "m runs alone (solo)" in caplog.text
         _assert_completed(rows, expected, outputs)
+    finally:
+        await mlx_thread.run(rig.close)
+
+
+@pytest.mark.asyncio
+async def test_memory_scheduling_off_keeps_upstream_abort_all_for_the_lone_prefill(
+    tmp_path, mock_engine_pool, monkeypatch, mlx_thread  # noqa: F811
+):
+    """Fork flags off (no park, no single victim) and memory scheduling off:
+    the lone external prefill is not reported as solo, so hard pressure
+    aborts everything as on main."""
+    monkeypatch.delenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", raising=False)
+    enforcer = _make_enforcer(
+        mock_engine_pool,
+        ceiling=100 * GB,
+        soft_threshold=0.85,
+        hard_threshold=0.95,
+        memory_scheduling="off",
+    )
+    rig = await mlx_thread.run(_rig, tmp_path / "off", park_enabled=False)
+    try:
+        engine = _rig_engine(rig)
+        _busy(enforcer, engine)
+        readings = _Readings(rig, monkeypatch, 30)
+        entered, release = _hold_external_prefill(rig, monkeypatch, "m")
+        await mlx_thread.run(_media, rig, "m", 1.0)
+
+        stepping = asyncio.create_task(mlx_thread.run(park.step, rig))
+        assert await asyncio.to_thread(entered.wait, 30)
+        readings.gb = 97  # over hard, under the ceiling
+        await tick(enforcer, 97)
+        assert rig.scheduler._memory_scheduling is False
+        assert rig.scheduler.memory_pressure_solo_request() is None
+        engine.abort_all_requests.assert_awaited()
+        release.set()
+        await stepping
     finally:
         await mlx_thread.run(rig.close)
 
