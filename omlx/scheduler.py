@@ -327,8 +327,6 @@ class _DeferredAdmissionWait:
     retry_at: float
     free_bytes: int | None
     admitted_ids: frozenset[str]
-    # Post-completion store jobs still owning a finished request's KV.
-    store_jobs: int = 0
 
 
 @dataclass
@@ -13977,25 +13975,9 @@ class Scheduler:
 
     def _fits_later(self, capacity: "_CapacityEstimate | None") -> bool:
         """A request that fits alone waits instead of failing only while
-        memory that comes back is held: admitted rows (freed when they
-        finish) or a finished request's KV still owned by the store-cache
-        pipeline (freed when its write drains). Queued requests hold none,
-        so they never justify waiting."""
-        if capacity is None:
-            return False
-        return self._num_admitted_requests() > 0 or self._store_cache_jobs() > 0
-
-    def _store_cache_jobs(self) -> int:
-        """Post-completion store jobs that still own a finished request's KV.
-
-        The gate counts submissions until ``_drain_pending_async_removes``
-        drops the cache references; a deferred remove without a gate counts
-        too. Right after a request finishes this memory is still in the usage
-        reading, so a preflight charges it although it comes back."""
-        gate = getattr(self, "_store_cache_gate", None)
-        in_flight = gate.in_flight if gate is not None else 0
-        pending = len(getattr(self, "_pending_async_removes", None) or ())
-        return max(in_flight, pending)
+        admitted rows hold memory that comes back when they finish. Queued
+        requests hold none, so they never justify waiting."""
+        return capacity is not None and self._num_admitted_requests() > 0
 
     def _release_deferred_admission(self, request: "Request") -> None:
         """Undo this admission attempt for a request that waits (fits later).
@@ -14046,27 +14028,22 @@ class Scheduler:
             retry_at=time.monotonic() + _deferred_admission_backoff_s(attempts),
             free_bytes=self._park_free_bytes(),
             admitted_ids=self._admitted_request_ids(),
-            store_jobs=self._store_cache_jobs(),
         )
 
     def _deferred_admission_holds(self, head: "Request") -> bool:
         """Whether a deferred fits-later ``head`` waits instead of retrying.
 
-        It retries once the memory picture changed since it deferred:
-        nothing admitted and no store write pending any more (the fits-later
-        wait no longer applies), a store write drained, a row it waited on
-        left (finished, aborted or paused), free memory rose by more than
-        ``DEFERRED_ADMISSION_FREE_DELTA_FRACTION`` of the admission line, or
-        its backoff expired. The record stays, so a new deferral doubles the
-        backoff.
+        It retries once the memory picture changed since it deferred: no row
+        is admitted any more (the fits-later wait no longer applies), a row
+        it waited on left (finished, aborted or paused), free memory rose by
+        more than ``DEFERRED_ADMISSION_FREE_DELTA_FRACTION`` of the admission
+        line, or its backoff expired. The record stays, so a new deferral
+        doubles the backoff.
         """
         wait = self._deferred_admissions.get(head.request_id)
         if wait is None:
             return False
-        store_jobs = self._store_cache_jobs()
-        if not self._num_admitted_requests() and not store_jobs:
-            return False
-        if store_jobs < wait.store_jobs:
+        if not self._num_admitted_requests():
             return False
         if not wait.admitted_ids <= self._admitted_request_ids():
             return False
