@@ -1526,6 +1526,8 @@ PARK_THRASH_WINDOW_S = 60.0
 PARK_THRASH_FREE_DELTA_FRACTION = 0.05
 # Seconds between "waiting" log lines for the same parked head.
 _PARK_WAIT_LOG_INTERVAL_S = 30.0
+# Seconds between "Admission waiting for memory" lines for the same head.
+_ADMISSION_WAIT_LOG_INTERVAL_S = 30.0
 # Saturation value of ``_polls_since_resume``: "long enough since the last
 # resume that the hysteresis gate is open". It is the initial value (no resume
 # has happened yet) and the cap that keeps the counter from growing without
@@ -2167,6 +2169,12 @@ class SchedulerConfig:
     # a pause keeps every generated token exactly (no re-prefill), while the
     # abort that follows an exhausted budget loses them all.
     max_decode_pauses_per_request: int = 8
+    # A queued request waiting for memory fails only when no request made
+    # progress (a token, a prefill chunk, an admission, a drained store-cache
+    # write) for this long while memory is scheduled on purpose (a parked or
+    # decode-paused request, a solo request, a deferred fits-later head).
+    # Otherwise the 60 s no-progress line applies.
+    admission_no_progress_timeout_s: float = 600.0
     park_resume_ok_polls: int = 3
 
     # Paged cache settings (internal defaults)
@@ -2736,6 +2744,11 @@ class Scheduler:
         self._memory_admission_blocked_since: float = 0.0
         self._store_cache_admission_blocked_request_id: str | None = None
         self._store_cache_admission_blocked_since: float = 0.0
+        # Last time any request made progress (see _note_admission_progress);
+        # the admission-stall clocks run from it. None until the first one.
+        self._admission_progress_at: float | None = None
+        # Last "Admission waiting for memory" line (head id, time).
+        self._admission_wait_logged: tuple[str, float] | None = None
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -3390,6 +3403,9 @@ class Scheduler:
                 drained = True
         self._pending_async_removes = pending
         if drained:
+            # A drained store-cache write is progress: backpressure is not a
+            # stall while the writer drains.
+            self._note_admission_progress()
             # The completion-time deferred clear may have already fired while
             # the async store worker still owned extracted KV buffers. Anchor
             # another ordinary deferred clear to the point where those final
@@ -6067,8 +6083,62 @@ class Scheduler:
         """Whether memory scheduling is on (see ``_memory_scheduling``)."""
         return getattr(self, "_memory_scheduling", False) is True
 
+    def _note_admission_progress(self) -> None:
+        """Record that a request made progress: a token was emitted, a
+        prefill chunk or an external prefill ran, a request was admitted, or
+        a store-cache write drained. The admission-stall clocks restart
+        (with memory scheduling on)."""
+        self._admission_progress_at = time.monotonic()
+
+    def _admission_idle_since(self, blocked_since: float) -> float:
+        """Start of the current no-progress stretch for a blocked head.
+
+        With memory scheduling off the clock is upstream's: it runs from
+        when the head first blocked, whatever else progresses.
+        """
+        progress = self._admission_progress_at
+        if progress is None or not self._memory_scheduling_on():
+            return blocked_since
+        return max(blocked_since, progress)
+
+    def _deliberate_memory_hold(self) -> bool:
+        """Whether memory is being scheduled on purpose: a solo request runs,
+        a fits-later head backs off, or a parked or decode-paused request
+        waits. A queued request then waits under the long no-progress bound.
+        """
+        if self._solo_request() is not None or self._deferred_admissions:
+            return True
+        return any(request.parked for request in self.waiting)
+
+    def _log_admission_wait(self, request_id: str, reason: str) -> None:
+        now = time.monotonic()
+        last = self._admission_wait_logged
+        if (
+            last is not None
+            and last[0] == request_id
+            and now - last[1] < _ADMISSION_WAIT_LOG_INTERVAL_S
+        ):
+            return
+        self._admission_wait_logged = (request_id, now)
+        logger.info(
+            "Admission waiting for memory: %s; %d request(s) progressing",
+            reason,
+            self._num_admitted_requests(),
+        )
+
     def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
-        """Fail one head-of-line request after persistent memory admission stall."""
+        """Fail one head-of-line request after a persistent memory admission
+        stall in which no request made progress.
+
+        Progress by any request (``_note_admission_progress``) restarts the
+        clock: admitted work that drains will free the memory the head waits
+        for. The line is ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` without
+        progress, or ``admission_no_progress_timeout_s`` while memory is
+        scheduled on purpose (``_deliberate_memory_hold``), so a genuine
+        deadlock still surfaces with an error. With memory scheduling off
+        the clock is upstream's: ``_MEMORY_ADMISSION_STALL_TIMEOUT_S`` from
+        when the head first blocked.
+        """
         if not self.waiting:
             self._clear_memory_admission_blocker()
             return None
@@ -6080,10 +6150,13 @@ class Scheduler:
             # client's own timeouts apply.
             self._clear_memory_admission_blocker(request_id)
             return None
+        progress_clock = self._memory_scheduling_on()
         now = time.monotonic()
         if request_id != self._memory_admission_blocked_request_id:
             self._memory_admission_blocked_request_id = request_id
             self._memory_admission_blocked_since = now
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         timeout = getattr(
@@ -6091,7 +6164,17 @@ class Scheduler:
             "_MEMORY_ADMISSION_STALL_TIMEOUT_S",
             Scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S,
         )
-        if now - self._memory_admission_blocked_since < timeout:
+        if progress_clock and self._deliberate_memory_hold():
+            timeout = max(
+                timeout,
+                float(getattr(self.config, "admission_no_progress_timeout_s", 600.0)),
+            )
+        idle_for = now - self._admission_idle_since(
+            self._memory_admission_blocked_since
+        )
+        if idle_for < timeout:
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         stalled_for = now - self._memory_admission_blocked_since
@@ -6112,10 +6195,23 @@ class Scheduler:
             fmt=format_bytes,
             tail=["reduce context length", "lower hot_cache_max_size"],
         )
-        message = (
-            "Request could not be admitted because memory pressure persisted "
-            f"for {stalled_for:.1f}s ({reason}). {advice}."
-        )
+        metadata = {
+            "request_id": request_id,
+            "reason": reason,
+            "stalled_seconds": int(stalled_for),
+        }
+        if progress_clock:
+            message = (
+                "Request could not be admitted because memory pressure persisted "
+                f"for {stalled_for:.1f}s ({reason}) and no request made progress "
+                f"for {idle_for:.1f}s. {advice}."
+            )
+            metadata["no_progress_seconds"] = int(idle_for)
+        else:
+            message = (
+                "Request could not be admitted because memory pressure persisted "
+                f"for {stalled_for:.1f}s ({reason}). {advice}."
+            )
         logger.warning("Memory admission stalled for %s: %s", request_id, message)
         return RequestOutput(
             request_id=request_id,
@@ -6123,11 +6219,7 @@ class Scheduler:
             finish_reason="error",
             error=message,
             error_code="memory_admission_stalled",
-            error_metadata={
-                "request_id": request_id,
-                "reason": reason,
-                "stalled_seconds": int(stalled_for),
-            },
+            error_metadata=metadata,
         )
 
     def _store_cache_admission_stall_output(
@@ -6148,18 +6240,29 @@ class Scheduler:
         if request.parked:
             self._clear_store_cache_admission_blocker(request_id)
             return None
+        progress_clock = self._memory_scheduling_on()
         now = time.monotonic()
         if request_id != self._store_cache_admission_blocked_request_id:
             self._store_cache_admission_blocked_request_id = request_id
             self._store_cache_admission_blocked_since = now
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
+        # Backpressure, not a failure, while the writer drains (a drained
+        # write is progress) or other requests progress. Memory scheduling
+        # off: upstream's fixed timeout from when the head first blocked.
         timeout = getattr(
             self,
             "_STORE_CACHE_ADMISSION_STALL_TIMEOUT_S",
             Scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S,
         )
-        if now - self._store_cache_admission_blocked_since < timeout:
+        idle_for = now - self._admission_idle_since(
+            self._store_cache_admission_blocked_since
+        )
+        if idle_for < timeout:
+            if progress_clock:
+                self._log_admission_wait(request_id, reason)
             return None
 
         stalled_for = now - self._store_cache_admission_blocked_since
@@ -6169,11 +6272,16 @@ class Scheduler:
         self._clear_request_admission_bookkeeping(request_id)
         get_prefill_tracker().remove(request_id)
 
+        progress = (
+            f" and no request made progress for {idle_for:.1f}s"
+            if progress_clock
+            else ""
+        )
         message = (
             "Request could not be admitted because store-cache cleanup stayed "
-            f"full for {stalled_for:.1f}s ({reason}). The previous response "
-            "cache is still being persisted; retry after the cache writer drains "
-            "or reduce cache/write pressure."
+            f"full for {stalled_for:.1f}s ({reason}){progress}. The previous "
+            "response cache is still being persisted; retry after the cache "
+            "writer drains or reduce cache/write pressure."
         )
         logger.warning(
             "Store-cache admission stalled for %s: %s "
@@ -6194,6 +6302,7 @@ class Scheduler:
                 "request_id": request_id,
                 "reason": reason,
                 "stalled_seconds": int(stalled_for),
+                **({"no_progress_seconds": int(idle_for)} if progress_clock else {}),
                 "store_cache_in_flight": gate_in_flight,
                 "pending_store_cleanups": pending_cleanups,
                 "store_cache_cap": gate_cap,
@@ -7765,6 +7874,7 @@ class Scheduler:
                             raise _PackedPrefillError(error) from error
                     else:
                         done = self._run_prefill_chunks(plans) if plans else [True]
+                self._note_admission_progress()
             except _PackedPrefillError as e:
                 logger.error(
                     "Packed prefill failed for %s: %s",
@@ -15070,12 +15180,19 @@ class Scheduler:
             # overtakes them while they wait.
             if self.waiting[0].parked and self._park_hold_applies(self.waiting[0]):
                 break
-            # A solo request runs alone: nothing is admitted beside it.
+            # A solo request runs alone: nothing is admitted beside it. The
+            # head waits while it progresses (the long no-progress bound).
             if self._solo_holds(self.waiting[0]):
+                stalled = self._memory_admission_stall_output("solo_hold")
+                if stalled is not None:
+                    rejected_outputs.append(stalled)
                 break
             # A fits-later head that deferred keeps the hold until the memory
             # picture changes; retrying earlier only restores its prefix again.
             if self._deferred_admission_holds(self.waiting[0]):
+                stalled = self._memory_admission_stall_output("deferred_admission")
+                if stalled is not None:
+                    rejected_outputs.append(stalled)
                 break
 
             admitted = self._num_admitted_requests()
@@ -15773,6 +15890,7 @@ class Scheduler:
                     continue
                 finally:
                     self._external_prefill_request_id = None
+                    self._note_admission_progress()
 
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]
@@ -17299,6 +17417,8 @@ class Scheduler:
                 scheduled = chunked_scheduled + scheduled
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+            if scheduled:
+                self._note_admission_progress()
             # A step that advanced chunked prefills is work even with no
             # decode running: without this the engine loop sleeps up to
             # step_interval between chunks. A step that merely HELD a
@@ -17344,6 +17464,7 @@ class Scheduler:
                 output.has_work = True
 
                 if responses:
+                    self._note_admission_progress()
                     outputs, finished_ids = self._process_batch_responses(responses)
                     output.outputs.extend(outputs)
                     output.finished_request_ids.update(finished_ids)

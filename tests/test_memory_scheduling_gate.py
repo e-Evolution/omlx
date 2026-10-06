@@ -8,7 +8,10 @@ against a fixed memory budget:
 1. the never-fits 400 ``context_exceeds_capacity``, ``GET /v1/omlx/capacity``
    numbers and the ``X-oMLX-Max-Context-Tokens`` header;
 2. the fits-later wait (a request that fits alone waits instead of being
-   rejected on current usage).
+   rejected on current usage);
+3. the progress-based admission-stall clock (600 s bound while memory is
+   held on purpose, store-cache backpressure not a failure while writes
+   drain).
 
 Off, these paths behave as on upstream ``main``.
 """
@@ -18,10 +21,12 @@ from types import SimpleNamespace
 
 import pytest
 import test_process_memory_enforcer as enforcer_tests
+import test_scheduler_admission_progress as progress_tests
 import test_scheduler_capacity_gate as gate_tests
 import test_server_context_capacity as server_tests
 from fastapi.testclient import TestClient
 from test_process_memory_enforcer import _make_enforcer
+from test_scheduler_admission_progress import _schedule
 from test_scheduler_capacity_gate import GB
 from test_scheduler_prefill_memory_guard import _make_request, _make_scheduler
 from test_server_context_capacity import _engine_with_scheduler
@@ -30,12 +35,16 @@ import omlx.scheduler as scheduler_module
 import omlx.server as server
 from omlx.exceptions import ContextExceedsCapacityError, PrefillMemoryExceededError
 from omlx.process_memory_enforcer import resolve_memory_scheduling
+from omlx.scheduler import _StoreCacheGate
 from omlx.settings import GlobalSettings, MemorySettings
 
-# Shared fixtures: an enforcer's engine pool, a guarded scheduler and the
+# Shared fixtures: an enforcer's engine pool, a guarded scheduler, a scheduler
+# whose head waits under memory pressure with a controlled clock, and the
 # capacity endpoint's engine pool.
 mock_engine_pool = enforcer_tests.mock_engine_pool
 gated = gate_tests.gated
+clock = progress_tests.clock
+pressured = progress_tests.pressured
 capacity_env = server_tests.capacity_env
 
 # --- Resolution -------------------------------------------------------------
@@ -225,7 +234,7 @@ def test_the_enforcer_propagates_the_state_to_schedulers(
     assert scheduler._memory_scheduling is False
 
 
-# --- Off: these paths behave as on main --------------------------------------
+# --- Off: the three paths behave as on main ----------------------------------
 
 
 def test_off_has_no_capacity_estimate_snapshot_or_hint(gated):
@@ -272,6 +281,62 @@ def test_off_rejects_a_fits_later_request_with_the_old_error(gated):
     assert rejection is not None
     assert rejection.capacity is None  # the old current-usage rejection
     assert rejection.message.startswith("Prefill would require")
+
+
+def test_off_uses_the_fixed_stall_timeout(pressured, clock):
+    """Progress by others does not restart the clock and the error is the
+    one main returns."""
+    scheduler, _head, _running = pressured
+    scheduler._memory_scheduling = False
+    timeout = scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S
+    assert _schedule(scheduler) == []
+    clock.advance(timeout - 10)
+    scheduler._note_admission_progress()
+    clock.advance(9)
+    assert _schedule(scheduler) == []
+    clock.advance(1)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_code == "memory_admission_stalled"
+    assert failed.error_metadata == {
+        "request_id": "head",
+        "reason": "admission_paused",
+        "stalled_seconds": int(timeout),
+    }
+    assert "no request made progress" not in failed.error
+    assert f"persisted for {timeout:.1f}s (admission_paused). " in failed.error
+
+
+def test_off_has_no_long_bound_for_deliberate_holds(pressured, clock):
+    scheduler, _head, solo = pressured
+    scheduler._memory_scheduling = False
+    scheduler._solo_request_id = solo.request_id  # a parked head resumed solo
+    assert _schedule(scheduler) == []
+    clock.advance(scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_metadata["reason"] == "solo_hold"
+
+
+def test_off_store_cache_backpressure_uses_the_fixed_timeout(
+    pressured,
+    clock,
+):
+    scheduler, _head, running = pressured
+    scheduler._memory_scheduling = False
+    del scheduler.running[running.request_id]
+    scheduler._admission_paused = False
+    gate = _StoreCacheGate(cap=1)
+    gate.note_submitted()
+    scheduler._store_cache_gate = gate
+    timeout = scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S
+    assert _schedule(scheduler) == []
+    clock.advance(timeout - 1)
+    scheduler._note_admission_progress()  # a drained write
+    assert _schedule(scheduler) == []
+    clock.advance(1)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_code == "store_cache_admission_stalled"
+    assert "no_progress_seconds" not in failed.error_metadata
+    assert "no request made progress" not in failed.error
 
 
 def test_off_does_not_exempt_an_external_prefill_from_the_enforcer():

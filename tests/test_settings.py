@@ -399,6 +399,7 @@ class TestSchedulerSettings:
             "media_text_suffix_chunked": False,
             "max_parks_per_request": 3,
             "max_decode_pauses_per_request": 8,
+            "admission_no_progress_timeout_s": 600.0,
             "park_resume_ok_polls": 3,
         }
 

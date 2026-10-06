@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -331,6 +332,16 @@ class ModelSettings:
         )
 
 
+def _is_valid_positive_seconds(value: Any) -> bool:
+    """A positive finite number; bool is an int subclass and is rejected."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
@@ -370,6 +381,12 @@ class SchedulerSettings:
     # abort. Separate and larger than the park budget: a decode pause keeps
     # every generated token exactly, while the abort loses them all.
     max_decode_pauses_per_request: int = 8
+    # Seconds a queued request waits for memory with no request making
+    # progress while memory is scheduled on purpose (a parked or paused
+    # request, a solo request, a deferred head) before it fails. Progress by
+    # any request (a token, a prefill chunk, a drained cache write) restarts
+    # the clock.
+    admission_no_progress_timeout_s: float = 600.0
     # Consecutive "ok" pressure polls before parked requests may resume when
     # no memory estimate is available (with one, a parked request resumes
     # once the estimated free memory covers its need).
@@ -409,6 +426,10 @@ class SchedulerSettings:
                 return default
             return value
 
+        no_progress_s = data.get("admission_no_progress_timeout_s", 600.0)
+        if not _is_valid_positive_seconds(no_progress_s):
+            no_progress_s = 600.0
+
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
@@ -422,6 +443,7 @@ class SchedulerSettings:
             max_decode_pauses_per_request=positive_int(
                 "max_decode_pauses_per_request", 8
             ),
+            admission_no_progress_timeout_s=float(no_progress_s),
             park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
         )
 
@@ -1368,6 +1390,18 @@ class GlobalSettings:
                     setattr(self.scheduler, attr, int(raw))
                 except ValueError:
                     logger.warning(f"Invalid {env_name} value: {raw}")
+        if raw := os.getenv("OMLX_ADMISSION_NO_PROGRESS_TIMEOUT_S"):
+            try:
+                no_progress_s = float(raw)
+            except ValueError:
+                no_progress_s = None
+            if no_progress_s is not None and _is_valid_positive_seconds(no_progress_s):
+                self.scheduler.admission_no_progress_timeout_s = no_progress_s
+            else:
+                logger.warning(
+                    f"Invalid OMLX_ADMISSION_NO_PROGRESS_TIMEOUT_S value: {raw} "
+                    "(must be a finite number > 0)"
+                )
 
         # Cache settings
         if cache_enabled := os.getenv("OMLX_CACHE_ENABLED"):
@@ -1900,6 +1934,14 @@ class GlobalSettings:
                 f"Invalid max_decode_pauses_per_request: "
                 f"{self.scheduler.max_decode_pauses_per_request} (must be >= 1)"
             )
+        if not _is_valid_positive_seconds(
+            self.scheduler.admission_no_progress_timeout_s
+        ):
+            errors.append(
+                f"Invalid admission_no_progress_timeout_s: "
+                f"{self.scheduler.admission_no_progress_timeout_s!r} "
+                "(must be a finite number > 0)"
+            )
         if self.scheduler.park_resume_ok_polls < 1:
             errors.append(
                 f"Invalid park_resume_ok_polls: "
@@ -2088,6 +2130,9 @@ class GlobalSettings:
             max_parks_per_request=self.scheduler.max_parks_per_request,
             max_decode_pauses_per_request=(
                 self.scheduler.max_decode_pauses_per_request
+            ),
+            admission_no_progress_timeout_s=(
+                self.scheduler.admission_no_progress_timeout_s
             ),
             park_resume_ok_polls=self.scheduler.park_resume_ok_polls,
             initial_cache_blocks=self.cache.initial_cache_blocks,
