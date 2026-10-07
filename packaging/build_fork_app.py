@@ -46,45 +46,64 @@ PIN_PACKAGES = (
     "fastapi",
 )
 
-# Turned on for the fork app only, through Info.plist ``LSEnvironment``. The
-# Swift app builds the server environment from its own process environment
-# (PythonRuntime.makeEnvironment) and omlx/settings.py applies these variables
-# after settings.json, so the upstream defaults in the repo stay off.
+# Fork-app defaults, in the settings.json shape. The build writes them to
+# FORK_DEFAULTS_FILE inside the bundle and LSEnvironment carries only the
+# pointer (FORK_ENV). omlx/settings.py loads the file below settings.json, so
+# precedence is explicit env > settings.json > these defaults > built-in
+# defaults: every value can be changed from settings.json or the admin UI
+# without a rebuild, and the upstream defaults in the repo stay off.
+FORK_DEFAULTS_FILE = Path("Contents") / "Resources" / "omlx-fork-defaults.json"
+
 # MLX buffer-cache bound (GB) for the fork app. Lightning MTP batch decode with
 # TurboQuant KV dequantizes the full KV every step; the freed buffers pile up
 # in MLX's cache (65-73 GB observed) until the memory guard aborts.
-FORK_MLX_CACHE_LIMIT_GB = "16"
+FORK_MLX_CACHE_LIMIT_GB = 16.0
 
-# No batched-decode gate (OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS stays at its
-# default 0). It capped the combined decode context at 200k tokens because two
-# long TurboQuant rows hit memory pressure and the memory guard aborted them.
-# Memory pressure now pauses a decoding row into the SSD cache and resumes it
-# from its exact prefix, so batches are left to the memory enforcer.
+# No batched-decode gate (scheduler.max_batched_decode_context_tokens stays at
+# its default 0). It capped the combined decode context at 200k tokens because
+# two long TurboQuant rows hit memory pressure and the memory guard aborted
+# them. Memory pressure now pauses a decoding row into the SSD cache and
+# resumes it from its exact prefix, so batches are left to the memory enforcer.
 
-FORK_ENV = {
-    "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
-    "OMLX_MEMORY_PRESSURE_PARK": "true",
-    # Hard pressure with nothing parkable aborts the one largest request
-    # instead of every in-flight one (emergency and unload still abort all).
-    "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
-    # A media prompt whose images are all cached prefills its text suffix in
-    # the chunked path: decode keeps running and the prefill can be parked.
-    "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true",
-    "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
-    # Append-only mid-transcript system updates: pi sends prompt changes as
-    # mid-transcript system messages; folding them into the system head breaks
-    # the prefix cache for the whole conversation.
-    "OMLX_MID_SYSTEM_POLICY": "inline_note",
-    # Deterministic thinking retention: pi's image marker and the system-update
-    # notes above would otherwise strip the agent loop's thinking mid-history.
-    # Retained thinking is capped at about this many tokens (the unbounded
-    # preserve_thinking=true corrupted output at about 50k).
-    "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
-    # The fork app serves unattended agents on a known machine where memory
-    # pressure is expected, so memory scheduling (never-fits 400, fits-later
-    # wait, progress-based stall clock) is on whatever the guard tier is.
-    "OMLX_MEMORY_SCHEDULING": "on",
+FORK_DEFAULTS: dict[str, dict[str, object]] = {
+    "scheduler": {
+        "prefill_progress_commit_blocks": 4,
+        "memory_pressure_park": True,
+        # Hard pressure with nothing parkable aborts the one largest request
+        # instead of every in-flight one (emergency and unload still abort all).
+        "memory_abort_single_victim": True,
+        # A media prompt whose images are all cached prefills its text suffix
+        # in the chunked path: decode keeps running and the prefill can be
+        # parked.
+        "media_text_suffix_chunked": True,
+    },
+    "memory": {
+        "mlx_cache_limit_gb": FORK_MLX_CACHE_LIMIT_GB,
+        # The fork app serves unattended agents on a known machine where
+        # memory pressure is expected, so memory scheduling (never-fits 400,
+        # fits-later wait, progress-based stall clock) is on whatever the
+        # guard tier is.
+        "memory_scheduling": "on",
+    },
+    "server": {
+        # Append-only mid-transcript system updates: pi sends prompt changes
+        # as mid-transcript system messages; folding them into the system head
+        # breaks the prefix cache for the whole conversation.
+        "mid_system_policy": "inline_note",
+        # Deterministic thinking retention: pi's image marker and the
+        # system-update notes above would otherwise strip the agent loop's
+        # thinking mid-history. Retained thinking is capped at about this many
+        # tokens (the unbounded preserve_thinking=true corrupted output at
+        # about 50k).
+        "thinking_retention_guard_tokens": 20000,
+    },
 }
+
+# LSEnvironment: only the pointer. A relative path resolves next to the omlx
+# package, i.e. Contents/Resources, wherever the app is installed. The Swift
+# app builds the server environment from its own process environment
+# (PythonRuntime.makeEnvironment), so the variable reaches the server.
+FORK_ENV = {"OMLX_DEFAULTS_FILE": FORK_DEFAULTS_FILE.name}
 
 # The Swift updater polls this URL (ReleasesChecker.releasesURL) and can swap
 # the running bundle with the official release. Both hosts have 14 characters,
@@ -137,6 +156,9 @@ class Options:
     # summary), e.g. when the source tree is newer than the last release app.
     allow_pin_mismatch: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=lambda: dict(FORK_ENV))
+    defaults: Mapping[str, Mapping[str, object]] = field(
+        default_factory=lambda: {k: dict(v) for k, v in FORK_DEFAULTS.items()}
+    )
 
 
 def default_runner(cmd, **kwargs):
@@ -575,6 +597,9 @@ def build(
 
     contents = app / "Contents"
     overlay = overlay_package(opts.package, contents / "Resources" / "omlx")
+    (app / FORK_DEFAULTS_FILE).write_text(
+        json.dumps({k: dict(v) for k, v in opts.defaults.items()}, indent=2) + "\n"
+    )
 
     info = patch_info_plist(
         contents / "Info.plist",
@@ -595,6 +620,7 @@ def build(
                 "fork_commit": _git_rev(opts.package.parent, runner),
                 "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "env": dict(opts.env),
+                "defaults": {k: dict(v) for k, v in opts.defaults.items()},
             },
             indent=2,
         )

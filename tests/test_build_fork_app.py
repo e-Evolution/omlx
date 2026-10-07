@@ -328,28 +328,70 @@ def test_fork_version_keeps_the_numeric_prefix_the_swift_parser_reads(bfa):
     assert "a" not in low and "b" not in low
 
 
-def test_fork_env_guard_is_a_valid_thinking_retention_value(bfa):
+def test_fork_defaults_guard_is_a_valid_thinking_retention_value(bfa):
     from omlx.api.thinking_retention import normalize_guard_tokens
 
-    raw = bfa.FORK_ENV["OMLX_THINKING_RETENTION_GUARD_TOKENS"]
+    raw = bfa.FORK_DEFAULTS["server"]["thinking_retention_guard_tokens"]
     assert normalize_guard_tokens(raw) == 20000
 
 
-def test_default_env_enables_d1_and_park(bfa):
-    assert bfa.FORK_ENV == {
-        "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
-        "OMLX_MEMORY_PRESSURE_PARK": "true",
-        "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
-        "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true",
-        "OMLX_MLX_CACHE_LIMIT_GB": "16",
-        "OMLX_MID_SYSTEM_POLICY": "inline_note",
-        "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
-        "OMLX_MEMORY_SCHEDULING": "on",
+def test_fork_defaults_are_settings_shaped(bfa):
+    assert bfa.FORK_DEFAULTS == {
+        "scheduler": {
+            "prefill_progress_commit_blocks": 4,
+            "memory_pressure_park": True,
+            "memory_abort_single_victim": True,
+            "media_text_suffix_chunked": True,
+        },
+        "memory": {
+            "mlx_cache_limit_gb": 16.0,
+            "memory_scheduling": "on",
+        },
+        "server": {
+            "mid_system_policy": "inline_note",
+            "thinking_retention_guard_tokens": 20000,
+        },
     }
-    assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
     # The batched-decode gate is off: memory pressure pauses a decoding row
     # instead of aborting, so the fork no longer caps the batch context.
-    assert "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS" not in bfa.FORK_ENV
+    scheduler = bfa.FORK_DEFAULTS["scheduler"]
+    assert "max_batched_decode_context_tokens" not in scheduler
+    assert "batched_decode_hold_max_s" not in scheduler
+
+
+def test_lsenvironment_only_points_at_the_defaults_file(bfa):
+    assert bfa.FORK_ENV == {"OMLX_DEFAULTS_FILE": "omlx-fork-defaults.json"}
+    expected = Path("Contents/Resources/omlx-fork-defaults.json")
+    assert expected == bfa.FORK_DEFAULTS_FILE
+
+
+def test_every_fork_default_loads_through_omlx_settings(bfa, tmp_path, monkeypatch):
+    from omlx.settings import GlobalSettings
+
+    path = tmp_path / "omlx-fork-defaults.json"
+    path.write_text(json.dumps(bfa.FORK_DEFAULTS))
+    monkeypatch.setenv("OMLX_DEFAULTS_FILE", str(path))
+    for name in (
+        "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS",
+        "OMLX_MEMORY_PRESSURE_PARK",
+        "OMLX_MEMORY_ABORT_SINGLE_VICTIM",
+        "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED",
+        "OMLX_MLX_CACHE_LIMIT_GB",
+        "OMLX_MEMORY_SCHEDULING",
+        "OMLX_MID_SYSTEM_POLICY",
+        "OMLX_THINKING_RETENTION_GUARD_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    base = tmp_path / "home"
+    base.mkdir()
+    settings = GlobalSettings.load(base_path=base)
+    assert settings.fork_defaults_report == (
+        "Fork defaults: 8 applied, 0 overridden by settings.json, "
+        "0 overridden by env"
+    )
+    for section, values in bfa.FORK_DEFAULTS.items():
+        for key, value in values.items():
+            assert getattr(getattr(settings, section), key) == value
 
 
 # ------------------------------------------------------------ updater patch
@@ -467,11 +509,16 @@ def test_build_end_to_end_without_sign_or_dmg(bfa, donor, fork_pkg, tmp_path):
     assert summary["app"] == app and summary["dmg"] is None
     data = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
     assert data["CFBundleIdentifier"] == "app.omlx.fork"
-    assert data["LSEnvironment"]["OMLX_MEMORY_PRESSURE_PARK"] == "true"
+    assert data["LSEnvironment"] == {"OMLX_DEFAULTS_FILE": "omlx-fork-defaults.json"}
+    resources = app / "Contents" / "Resources"
+    defaults = resources / data["LSEnvironment"]["OMLX_DEFAULTS_FILE"]
+    assert json.loads(defaults.read_text()) == bfa.FORK_DEFAULTS
+    assert not (donor / bfa.FORK_DEFAULTS_FILE).exists()
     assert (app / "Contents" / "Resources" / "omlx" / "added.py").exists()
     assert b"api.github.com" not in (app / "Contents" / "MacOS" / "oMLX").read_bytes()
     marker = json.loads((app / "Contents" / "Resources" / "FORK_BUILD.json").read_text())
     assert marker["donor_version"] == "0.7.0" and marker["fork_version"] == "0.7.0-fork.1"
+    assert marker["env"] == bfa.FORK_ENV and marker["defaults"] == bfa.FORK_DEFAULTS
     assert not [c for c in runner.calls if c[0] in ("codesign", "hdiutil")]
 
 
