@@ -30,48 +30,12 @@ What it changes in the copy:
   Stale `.pyc` of changed modules are removed.
 - `Info.plist`: bundle id `app.omlx.fork`, name `oMLX Fork`, version
   `0.7.0-fork.N` (the Swift version parser reads only the numeric prefix and
-  the suffix has no dev/alpha/beta/rc marker), and `LSEnvironment`.
-- **D1, park, a bounded MLX buffer cache and serialized long-context decode ON** through `LSEnvironment`:
-  `OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS=4`, `OMLX_MEMORY_PRESSURE_PARK=true`,
-  `OMLX_MEDIA_TEXT_SUFFIX_CHUNKED=true` (a media prompt whose images are all
-  cached prefills its text suffix chunked, so decode keeps running and the
-  prefill is parkable),
-  `OMLX_MLX_CACHE_LIMIT_GB=16` (`mx.set_cache_limit`, applied at server startup;
-  keeps the enforcer's pool from growing to 65-73 GB during MTP batch decode.
-  Upstream default is 0 = unbounded),
-  `OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS=200000` (a request whose context plus
-  the running rows' would exceed this waits and decodes alone on the fused
-  single-row kernels; 45k + 130k recovered live, 2 x 130k did not. Upstream
-  default is 0 = off),
-  `OMLX_BATCHED_DECODE_HOLD_MAX_S=120` (while that gate holds a long request,
-  shorter requests behind it whose combined context still fits are admitted
-  past it; once the held request has waited 120 s backfill stops so it cannot
-  starve. 0 = never backfill, strict head-of-line),
-  `OMLX_MID_SYSTEM_POLICY=inline_note` (pi sends system-prompt changes as
-  mid-transcript system messages. Templates that reject them used to get them
-  folded into the leading system message, which rewrites the prompt head and
-  invalidates the prefix cache. `inline_note` renders each one in place as its
-  own `<system-update>` user message, so earlier tokens never change. A
-  per-model `mid_system_policy` setting overrides it; upstream default is
-  `user_note_safe`),
-  `OMLX_THINKING_RETENTION_GUARD_TOKENS=20000` (pi's `Attached image(s) from
-  tool result:` message and the system-update notes above are user messages,
-  so the Qwen template treats each as a new query and strips the agent loop's
-  thinking mid-history, breaking the prefix cache. With the guard set, those
-  messages no longer move the strip boundary and thinking is retained within
-  the loop, but never more than about 20000 tokens: past that, everything
-  before the turn that crossed the guard is stripped once. A real user
-  message still strips all earlier thinking. Never globally enables
-  `preserve_thinking`, which corrupted output at about 50k retained tokens.
-  Applies only to templates that advertise `preserve_thinking`. Stripped turns
-  render an empty `<think>` block once the module takes control. A per-model
-  `thinking_retention_guard_tokens` setting overrides it; upstream default is
-  off).
-  The Swift app passes its own process environment to the server
-  (`PythonRuntime.makeEnvironment`) and `omlx/settings.py` applies these
-  variables after `settings.json`. Upstream defaults in the repo stay off.
-  LaunchServices applies `LSEnvironment` only when the app is opened from
-  Finder, Dock, `open` or a login item, not when the binary is run directly.
+  the suffix has no dev/alpha/beta/rc marker), and `LSEnvironment` with a
+  single variable, `OMLX_DEFAULTS_FILE=omlx-fork-defaults.json`.
+- `Resources/omlx-fork-defaults.json`: the fork defaults (see
+  [Fork defaults](#fork-defaults)). They are defaults, not fixed values: every
+  one can be changed from `~/.omlx/settings.json` (or the admin UI where it is
+  exposed) without a rebuild.
 - **Self-update disabled**: the release URL string inside the Swift binary
   (`api.github.com` -> `no-update.test`, same length) is patched, so the
   updater can never find a release to download or swap in.
@@ -79,10 +43,86 @@ What it changes in the copy:
 - Quarantine stripped, then ad-hoc re-signed inside-out with the donor's
   hardened runtime and entitlements (`disable-library-validation` is what lets
   the hardened runtime load the ad-hoc dylibs).
-- `Resources/FORK_BUILD.json` records donor/fork versions and the fork commit.
+- `Resources/FORK_BUILD.json` records donor/fork versions, the fork commit,
+  the `LSEnvironment` and the defaults.
 
 Gatekeeper (`spctl -a`) rejects ad-hoc apps; that is expected for local use.
 Installing from the DMG is fine because a locally built DMG has no quarantine.
+
+## Fork defaults
+
+`omlx/settings.py` reads the file that `OMLX_DEFAULTS_FILE` names (a relative
+path resolves next to the `omlx` package, so `Contents/Resources` wherever the
+app is installed). It has the `settings.json` shape and sits under it:
+
+**explicit env var > `settings.json` > fork defaults file > built-in defaults**
+
+A default applies only when `settings.json` does not contain that key. Values
+taken from the defaults file are never written to `settings.json`: a save (the
+admin UI, the app's own rewrites, a CLI flag) leaves the key out unless you
+changed it. Without `OMLX_DEFAULTS_FILE` (the official app, `omlx serve`)
+nothing changes. LaunchServices applies `LSEnvironment` only when the app is
+opened from Finder, Dock, `open` or a login item, not when the binary is run
+directly.
+
+| Key | Fork default | Built-in | What it does |
+| --- | --- | --- | --- |
+| `scheduler.prefill_progress_commit_blocks` | `4` | `0` | D1: commit prefill progress to the prefix cache every 4 blocks, so an aborted or parked prompt resumes there. |
+| `scheduler.memory_pressure_park` | `true` | `false` | Hard pressure parks the newest prefill (or pauses a decode) instead of aborting. |
+| `scheduler.memory_abort_single_victim` | `true` | `false` | Hard pressure with nothing parkable aborts only the largest request (emergency and unload still abort all). |
+| `scheduler.media_text_suffix_chunked` | `true` | `false` | A media prompt whose images are all cached prefills its text suffix chunked: decode keeps running and the prefill is parkable. |
+| `memory.mlx_cache_limit_gb` | `16` | `0` (unbounded) | `mx.set_cache_limit` at startup; keeps MLX's buffer pool from growing to 65-73 GB during MTP batch decode. |
+| `memory.memory_scheduling` | `"on"` | `"auto"` | Never-fits 400, fits-later wait and the progress-based stall clock, whatever the guard tier. |
+| `server.mid_system_policy` | `"inline_note"` | unset | pi's mid-transcript system messages render in place as `<system-update>` user messages instead of being folded into the system head, so the prefix cache survives. A per-model setting overrides it. |
+| `server.thinking_retention_guard_tokens` | `20000` | unset (off) | pi's image-marker and system-update messages no longer strip the agent loop's thinking; retained thinking is capped at about 20000 tokens (unbounded `preserve_thinking` corrupted output at about 50k). A per-model setting overrides it. |
+
+The batched-decode gate (`scheduler.max_batched_decode_context_tokens`) is no
+longer a fork default: memory pressure pauses a decoding row into the SSD
+cache and resumes it from its exact prefix, so batches are left to the memory
+enforcer.
+
+The two `scheduler.*` switches that runtime code reads from the environment
+(`memory_abort_single_victim`, `media_text_suffix_chunked`) are exported as
+`OMLX_MEMORY_ABORT_SINGLE_VICTIM` / `OMLX_MEDIA_TEXT_SUFFIX_CHUNKED` by
+`omlx serve` when enabled.
+
+The server log shows one startup line, for example
+`Fork defaults: 7 applied, 1 overridden by settings.json (memory.memory_scheduling), 0 overridden by env`.
+A missing or malformed defaults file logs a warning and every setting falls
+back to `settings.json` and the built-in defaults.
+
+### Override a fork default
+
+Quit oMLX Fork first: the app rewrites `settings.json` while it runs, and an
+edit made meanwhile can be lost. Then add the key under its section in
+`~/.omlx/settings.json` and relaunch. For example, to turn memory scheduling
+back to `auto` and re-enable the batched-decode gate:
+
+```json
+{
+  "memory": {
+    "memory_scheduling": "auto"
+  },
+  "scheduler": {
+    "max_batched_decode_context_tokens": 200000,
+    "batched_decode_hold_max_s": 120.0
+  }
+}
+```
+
+Merge these keys into the existing sections; do not replace the file. Settings
+shown in the admin UI (for example memory scheduling) can be changed there
+instead, and the change is saved as your value.
+
+To go back to a fork default, quit the app, delete the key from
+`settings.json`, and relaunch.
+
+Older fork builds put these values in `LSEnvironment`, and any save then wrote
+them into `settings.json`. Those copies now count as your values and win over
+the fork defaults; the startup line lists them as "overridden by
+settings.json". Delete a key to let the fork default apply again. In
+particular, a `scheduler.max_batched_decode_context_tokens` of `200000` left by
+an older build keeps the gate on.
 
 ## Install
 
@@ -91,7 +131,7 @@ Installing from the DMG is fine because a locally built DMG has no quarantine.
 2. Open the DMG and drag **oMLX Fork** to Applications (or run
    `ditto "packaging/_fork_dist/oMLX Fork.app" "/Applications/oMLX Fork.app"`).
 3. Launch it from Finder (not the terminal binary, so `LSEnvironment` applies).
-4. Check the server log for the D1 and park settings.
+4. Check the server log for the `Fork defaults:` startup line.
 
 New bundle id means macOS asks again for permissions. Cache on a removable
 volume (for example `/Volumes/ExternalSSD...`) triggers a TCC prompt for
