@@ -32,7 +32,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -141,6 +141,9 @@ class Options:
     fork_rev: int = 1
     sign: bool = True
     dmg: bool = True
+    # Packages whose donor/venv version mismatch is accepted (reported in the
+    # summary), e.g. when the source tree is newer than the last release app.
+    allow_pin_mismatch: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=lambda: dict(FORK_ENV))
 
 
@@ -206,9 +209,16 @@ def validate_donor(
     expect_version: str,
     expect_build: str,
     venv_pins: Mapping[str, str],
-) -> None:
-    """Fail loudly (one error listing every problem) if the donor is unexpected."""
+    allow_pin_mismatch: Collection[str] = (),
+) -> list[str]:
+    """Fail loudly (one error listing every problem) if the donor is unexpected.
+
+    A version mismatch of a package named in ``allow_pin_mismatch`` is
+    accepted and returned instead, so the caller can report it; a pin missing
+    from the donor is never accepted.
+    """
     problems: list[str] = []
+    accepted: list[str] = []
     if not (donor / "Contents" / "Info.plist").is_file():
         raise DonorMismatch(f"{donor} is not an app bundle (no Contents/Info.plist)")
     info = read_info(donor)
@@ -228,9 +238,11 @@ def validate_donor(
         if have is None:
             problems.append(f"{pkg}: not found in the donor site-packages")
         elif want != have:
-            problems.append(f"{pkg}: donor has {have}, fork venv has {want}")
+            mismatch = f"{pkg}: donor has {have}, fork venv has {want}"
+            (accepted if pkg in allow_pin_mismatch else problems).append(mismatch)
     if problems:
         raise DonorMismatch("donor validation failed:\n  - " + "\n  - ".join(problems))
+    return accepted
 
 
 # ------------------------------------------------------------------- overlay
@@ -547,7 +559,10 @@ def build(
 ) -> dict:
     donor = opts.donor
     pins = dict(venv_pins) if venv_pins is not None else read_venv_pins()
-    validate_donor(donor, opts.expect_version, opts.expect_build, pins)
+    pin_mismatches = validate_donor(
+        donor, opts.expect_version, opts.expect_build, pins,
+        allow_pin_mismatch=opts.allow_pin_mismatch,
+    )
 
     out = opts.out
     app = out / f"{opts.name}.app"
@@ -620,6 +635,7 @@ def build(
         "version": info["CFBundleShortVersionString"],
         "overlay": overlay,
         "updater_urls_patched": patched_urls,
+        "pin_mismatches_accepted": pin_mismatches,
         "verify": verify,
         "gatekeeper": gatekeeper,
     }
@@ -645,12 +661,17 @@ def parse_args(argv=None) -> Options:
                    help="N in the 0.7.0-fork.N version suffix")
     p.add_argument("--no-dmg", dest="dmg", action="store_false")
     p.add_argument("--no-sign", dest="sign", action="store_false")
+    p.add_argument("--allow-pin-mismatch", action="append", default=[],
+                   metavar="PACKAGE",
+                   help="accept a donor/venv version mismatch of PACKAGE "
+                        "(repeatable); a missing pin is never accepted")
     ns = p.parse_args(argv)
     return Options(
         donor=ns.donor, out=ns.out, name=ns.name, bundle_id=ns.bundle_id,
         package=ns.package, expect_version=ns.expect_version,
         expect_build=ns.expect_build, fork_rev=ns.fork_rev,
         sign=ns.sign, dmg=ns.dmg,
+        allow_pin_mismatch=tuple(ns.allow_pin_mismatch),
     )
 
 
@@ -671,6 +692,8 @@ def print_summary(s: dict) -> None:
     print(f"dmg:        {s['dmg']}  ({_human(s['dmg_size'])})" if s["dmg"] else "dmg:        (skipped)")
     print(f"bundle id:  {s['bundle_id']}")
     print(f"version:    {s['version']}")
+    for mismatch in s["pin_mismatches_accepted"]:
+        print(f"WARNING: pin mismatch accepted: {mismatch}")
     print(f"overlay:    {ov['changed']} changed, {ov['added']} added, "
           f"{ov['pyc_removed']} stale .pyc removed, "
           f"{len(ov['donor_only_py'])} donor-only .py kept, "
