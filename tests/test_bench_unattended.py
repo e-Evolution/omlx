@@ -1043,6 +1043,185 @@ class TestBenchOverrides:
         assert srv.env["OMLX_MLX_CACHE_LIMIT_GB"] == "16"
 
 
+def _source_tree(root):
+    (root / "omlx").mkdir(parents=True)
+    (root / "omlx" / "cli.py").write_text("")
+    return root
+
+
+def _venv_python(root):
+    py = root / "venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    return py
+
+
+class TestSourceRuntime:
+    """OMLX_BENCH_PYTHON + OMLX_BENCH_SOURCE: serve a source tree from a venv."""
+
+    def test_unset_means_existing_runtimes(self):
+        assert bp.bench_source_runtime({}) is None
+
+    def test_both_vars_required(self, tmp_path):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        with pytest.raises(ValueError, match="both"):
+            bp.bench_source_runtime({"OMLX_BENCH_PYTHON": str(py)})
+        with pytest.raises(ValueError, match="both"):
+            bp.bench_source_runtime({"OMLX_BENCH_SOURCE": str(src)})
+
+    def test_validates_python_and_tree(self, tmp_path):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        with pytest.raises(ValueError, match="interpreter"):
+            bp.bench_source_runtime(
+                {"OMLX_BENCH_PYTHON": str(tmp_path / "nope"), "OMLX_BENCH_SOURCE": str(src)}
+            )
+        with pytest.raises(ValueError, match="omlx/cli.py"):
+            bp.bench_source_runtime(
+                {"OMLX_BENCH_PYTHON": str(py), "OMLX_BENCH_SOURCE": str(tmp_path)}
+            )
+
+    def test_keeps_venv_python_symlink_unresolved(self, tmp_path):
+        # Resolving a venv's bin/python symlink lands on the base interpreter
+        # and silently loses the venv's site-packages.
+        real = _venv_python(tmp_path)
+        link = tmp_path / "v2" / "bin" / "python"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real)
+        src = _source_tree(tmp_path / "src")
+        python, source = bp.bench_source_runtime(
+            {"OMLX_BENCH_PYTHON": str(link), "OMLX_BENCH_SOURCE": str(src)}
+        )
+        assert python == link
+        assert source == src.resolve()
+
+    def test_command_runs_module_cli_with_same_args(self, monkeypatch, tmp_path):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        monkeypatch.setenv("OMLX_BENCH_PYTHON", str(py))
+        monkeypatch.setenv("OMLX_BENCH_SOURCE", str(src))
+        srv = bp.Server("fork-off", "P3", 8002, 3, tmp_path, False)
+        cmd = srv.command()
+        assert cmd[:3] == [str(py), "-m", "omlx.cli"]
+        assert cmd[3:] == [
+            "serve",
+            "--base-path",
+            str(srv.base),
+            "--port",
+            "8002",
+            "--model-dir",
+            str(bp.REAL_BASE / "models"),
+        ]
+
+    def test_variant_env_and_settings_unchanged(self, monkeypatch, tmp_path):
+        before = bp.Server("fork-off", "P3", 8002, 3, tmp_path, False).env
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        monkeypatch.setenv("OMLX_BENCH_PYTHON", str(py))
+        monkeypatch.setenv("OMLX_BENCH_SOURCE", str(src))
+        assert bp.Server("fork-off", "P3", 8002, 3, tmp_path, False).env == before
+
+    def test_server_env_imports_only_the_source_tree(self, tmp_path):
+        src = _source_tree(tmp_path / "src")
+        env = bp.source_runtime_env(
+            {"PATH": "/bin", "PYTHONPATH": "/elsewhere", "PYTHONHOME": "/app/py"}, src
+        )
+        assert env["PYTHONPATH"] == str(src)
+        assert "PYTHONHOME" not in env
+        assert env["PATH"] == "/bin"
+
+    def test_verify_import_accepts_the_source_tree(self, tmp_path):
+        import json
+        import subprocess
+
+        src = _source_tree(tmp_path / "src")
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["env"] = cmd, kw["env"]
+            out = {"omlx": str(src / "omlx" / "__init__.py"), "versions": {"mlx": "0.32.3"}}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(out), "")
+
+        probe = bp.verify_source_import(Path("/v/bin/python"), src, {"PYTHONPATH": str(src)}, run=fake_run)
+        assert seen["cmd"][0] == "/v/bin/python"
+        assert seen["env"]["PYTHONPATH"] == str(src)
+        assert probe["versions"]["mlx"] == "0.32.3"
+
+    def test_verify_import_rejects_another_tree(self, tmp_path):
+        import json
+        import subprocess
+
+        src = _source_tree(tmp_path / "src")
+        other = tmp_path / "other" / "omlx" / "__init__.py"
+
+        def fake_run(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"omlx": str(other), "versions": {}}), "")
+
+        with pytest.raises(RuntimeError, match="imports omlx from"):
+            bp.verify_source_import(Path("/v/bin/python"), src, {}, run=fake_run)
+
+        def failing(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1, "", "ModuleNotFoundError")
+
+        with pytest.raises(RuntimeError, match="ModuleNotFoundError"):
+            bp.verify_source_import(Path("/v/bin/python"), src, {}, run=failing)
+
+    def test_preflight_refuses_upstream_variant(self, tmp_path):
+        rt = (_venv_python(tmp_path), _source_tree(tmp_path / "src"))
+        assert "upstream" in bp.source_runtime_preflight(rt, "upstream", lambda p: False)
+
+    def test_preflight_refuses_while_live_app_listens(self, tmp_path):
+        rt = (_venv_python(tmp_path), _source_tree(tmp_path / "src"))
+        busy = {8001}
+        msg = bp.source_runtime_preflight(rt, "fork-off", lambda p: p in busy)
+        assert msg and "8001" in msg
+        assert bp.source_runtime_preflight(rt, "fork-off", lambda p: False) is None
+
+    def test_runtime_info_records_tree_and_probe(self, monkeypatch, tmp_path):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        monkeypatch.setenv("OMLX_BENCH_PYTHON", str(py))
+        monkeypatch.setenv("OMLX_BENCH_SOURCE", str(src))
+        srv = bp.Server("fork-off", "P3", 8002, 3, tmp_path, False)
+        srv.runtime_probe = {"versions": {"mlx-vlm": "0.7.7"}}
+        info = srv.runtime_info()
+        assert info["mode"] == "source-venv"
+        assert info["python"] == str(py)
+        assert info["source"] == str(src.resolve())
+        assert info["probe"]["versions"]["mlx-vlm"] == "0.7.7"
+        assert "source_commit" in info
+
+    def test_dry_run_prints_command_and_starts_nothing(self, monkeypatch, tmp_path, capsys):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        monkeypatch.setenv("OMLX_BENCH_PYTHON", str(py))
+        monkeypatch.setenv("OMLX_BENCH_SOURCE", str(src))
+        monkeypatch.setattr(bp, "verify_source_import", lambda *a, **k: {"omlx": "ok"})
+        monkeypatch.setattr(bp, "port_in_use", lambda port: port == 8001)
+
+        def boom(*a, **k):
+            raise AssertionError("dry-run must not prepare or start a server")
+
+        monkeypatch.setattr(bp.Server, "prepare", boom)
+        monkeypatch.setattr(bp.Server, "start", boom)
+        rc = bp.main(["--variant", "fork-off", "--premise", "P3", "--dry-run", "--out", str(tmp_path)])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert f"{py} -m omlx.cli serve" in out
+        assert f"PYTHONPATH={src.resolve()}" in out
+        assert "would refuse now" in out and "8001" in out
+
+    def test_real_run_refused_while_live_app_listens(self, monkeypatch, tmp_path, capsys):
+        py, src = _venv_python(tmp_path), _source_tree(tmp_path / "src")
+        monkeypatch.setenv("OMLX_BENCH_PYTHON", str(py))
+        monkeypatch.setenv("OMLX_BENCH_SOURCE", str(src))
+        monkeypatch.setattr(bp, "port_in_use", lambda port: port == 8001)
+        rc = bp.main(["--variant", "fork-off", "--premise", "P3", "--out", str(tmp_path)])
+        assert rc == 2
+        assert "live app running" in capsys.readouterr().err
+
+    def test_runtime_info_default_mode_is_app_overlay(self, tmp_path):
+        srv = bp.Server("fork-off", "P3", 8002, 3, tmp_path, False)
+        assert srv.runtime_info()["mode"] == "app-overlay"
+        assert bp.Server("upstream", "P3", 8002, 3, tmp_path, False).runtime_info()["mode"] == "app"
+
+
 def test_fork_overlay_refuses_to_delete_foreign_dir(tmp_path):
     import bench_premises as bp
     import pytest

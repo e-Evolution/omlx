@@ -167,6 +167,97 @@ def bench_fork_repo(environ: Any = None) -> Path:
     return path
 
 
+LIVE_APP_PORT = 8001
+_IMPORT_PROBE = (
+    "import importlib.metadata as md, json, omlx\n"
+    "v = {}\n"
+    "for d in ('mlx', 'mlx-metal', 'mlx-lm', 'mlx-vlm', 'transformers'):\n"
+    "    try:\n"
+    "        v[d] = md.version(d)\n"
+    "    except md.PackageNotFoundError:\n"
+    "        v[d] = None\n"
+    "print(json.dumps({'omlx': omlx.__file__, 'versions': v}))\n"
+)
+
+
+def bench_source_runtime(environ: Any = None) -> tuple[Path, Path] | None:
+    """Venv runtime for fork-family variants, or None for the existing ones.
+
+    ``OMLX_BENCH_PYTHON`` is the interpreter (a venv's ``bin/python``) and
+    ``OMLX_BENCH_SOURCE`` the tree whose ``omlx/`` the server imports through
+    PYTHONPATH. Unlike the app overlay, the dependencies are the venv's own.
+    """
+    env = environ if environ is not None else os.environ
+    raw_py, raw_src = env.get("OMLX_BENCH_PYTHON"), env.get("OMLX_BENCH_SOURCE")
+    if not raw_py and not raw_src:
+        return None
+    if not (raw_py and raw_src):
+        raise ValueError("set both OMLX_BENCH_PYTHON and OMLX_BENCH_SOURCE")
+    # absolute(), not resolve(): a venv's bin/python is a symlink to the base
+    # interpreter, and following it would drop the venv's site-packages.
+    python = Path(raw_py).expanduser().absolute()
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError(f"OMLX_BENCH_PYTHON is not an executable interpreter: {python}")
+    source = Path(raw_src).expanduser().resolve()
+    if not (source / "omlx" / "cli.py").is_file():
+        raise ValueError(f"OMLX_BENCH_SOURCE has no omlx/cli.py: {source}")
+    return python, source
+
+
+def source_runtime_env(base: dict[str, str], source: Path) -> dict[str, str]:
+    """Server env for the venv runtime: only ``source`` on PYTHONPATH."""
+    env = {k: v for k, v in base.items() if k != "PYTHONHOME"}
+    env["PYTHONPATH"] = str(source)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def verify_source_import(
+    python: Path, source: Path, env: dict[str, str], run: Any = subprocess.run
+) -> dict[str, Any]:
+    """Import omlx exactly as the server will; refuse unless it comes from ``source``.
+
+    Returns the probe (omlx file and dependency versions) for the run record.
+    """
+    res = run(
+        [str(python), "-c", _IMPORT_PROBE],
+        env=env,
+        cwd=str(source),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"{python} cannot import omlx: {res.stderr.strip()[-2000:]}")
+    probe = json.loads(res.stdout.strip().splitlines()[-1])
+    got = Path(probe["omlx"]).resolve()
+    if not got.is_relative_to(source / "omlx"):
+        raise RuntimeError(f"{python} imports omlx from {got}, not from {source}")
+    return probe
+
+
+def source_runtime_preflight(
+    runtime: tuple[Path, Path] | None, variant: str, port_check: Any = None
+) -> str | None:
+    """Why the venv runtime must not start now, or None.
+
+    The upstream variant is the shipped app binary, so a source tree would be
+    silently ignored there. A real-model server must never share the machine
+    with the live app, so the live app port must be closed.
+    """
+    if runtime is None:
+        return None
+    if variant == "upstream":
+        return "OMLX_BENCH_PYTHON/OMLX_BENCH_SOURCE apply to fork-family variants, not upstream"
+    check = port_check or port_in_use
+    if check(LIVE_APP_PORT):
+        return (
+            f"port {LIVE_APP_PORT} accepts connections (live app running); "
+            "quit it before starting a real-model server"
+        )
+    return None
+
+
 def variant_model_settings(ms: dict[str, Any], variant: str) -> dict[str, Any]:
     """Per-variant model_settings.json tweaks (fork-nomtp: MTP off)."""
     out = copy.deepcopy(ms)
@@ -319,6 +410,9 @@ class Server:
         self.stdout_path = out / "logs" / f"{tag}.stdout.log"
         self.api_key = ""
         self.settings: dict[str, Any] = {}
+        # Venv runtime (OMLX_BENCH_PYTHON + OMLX_BENCH_SOURCE), fork variants only.
+        self.source_runtime = None if variant == "upstream" else bench_source_runtime()
+        self.runtime_probe: dict[str, Any] | None = None
 
     # -- preparation -------------------------------------------------------
     def _rmtree_guarded(self, path: str, roots: list[str]) -> None:
@@ -352,14 +446,16 @@ class Server:
 
     # -- lifecycle ---------------------------------------------------------
     def command(self) -> list[str]:
-        if self.variant == "upstream":
-            exe = str(UPSTREAM_CLI)
+        if self.source_runtime is not None:
+            exe_cmd = [str(self.source_runtime[0]), "-m", "omlx.cli"]
+        elif self.variant == "upstream":
+            exe_cmd = [str(UPSTREAM_CLI)]
         elif os.environ.get("OMLX_BENCH_FORK_RUNTIME", "app") == "venv":
-            exe = str(FORK_BIN)
+            exe_cmd = [str(FORK_BIN)]
         else:
-            exe = str(build_fork_overlay(fork_repo=bench_fork_repo()))
+            exe_cmd = [str(build_fork_overlay(fork_repo=bench_fork_repo()))]
         return [
-            exe,
+            *exe_cmd,
             "serve",
             "--base-path",
             str(self.base),
@@ -371,8 +467,11 @@ class Server:
 
     def start(self) -> None:
         self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("OMLX_")}
-        env.update(self.env)
+        env = self.process_env()
+        if self.source_runtime is not None:
+            python, source = self.source_runtime
+            self.runtime_probe = verify_source_import(python, source, env)
+            print(f"[runtime] {self.runtime_probe}", flush=True)
         fh = open(self.stdout_path, "wb")  # noqa: SIM115 - handed to Popen
         self.proc = subprocess.Popen(
             self.command(),
@@ -386,6 +485,33 @@ class Server:
             f"[server] {self.variant}/{self.premise} pid={self.proc.pid} port={self.port}",
             flush=True,
         )
+
+    def process_env(self) -> dict[str, str]:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("OMLX_")}
+        env.update(self.env)
+        if self.source_runtime is not None:
+            env = source_runtime_env(env, self.source_runtime[1])
+        return env
+
+    def runtime_info(self) -> dict[str, Any]:
+        """Which interpreter and omlx sources serve this variant (run record)."""
+        if self.source_runtime is not None:
+            python, source = self.source_runtime
+            return {
+                "mode": "source-venv",
+                "python": str(python),
+                "source": str(source),
+                "source_commit": _sh("git", "rev-parse", "HEAD", cwd=str(source)),
+                "source_describe": _sh(
+                    "git", "describe", "--tags", "--always", "--dirty", cwd=str(source)
+                ),
+                "probe": self.runtime_probe,
+            }
+        if self.variant == "upstream":
+            return {"mode": "app", "cli": str(UPSTREAM_CLI)}
+        if os.environ.get("OMLX_BENCH_FORK_RUNTIME", "app") == "venv":
+            return {"mode": "venv", "cli": str(FORK_BIN)}
+        return {"mode": "app-overlay", "source": str(bench_fork_repo())}
 
     def pids(self) -> list[int]:
         if self.proc is None:
@@ -1521,6 +1647,7 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
             )
         },
         "server_command": [Path(server.command()[0]).name, *server.command()[1:]],
+        "server_runtime": server.runtime_info() if hasattr(server, "runtime_info") else None,
         "feature_env": server.env,
         "max_concurrent_requests": server.max_concurrent,
         "cache": {
@@ -1712,6 +1839,30 @@ def serve_only(args: argparse.Namespace, out: Path) -> int:
     return 0
 
 
+def dry_run(args: argparse.Namespace) -> int:
+    """Print what each premise would launch (no settings, cache or server touched)."""
+    premises = ALL_PREMISES if args.premise == "all" else [args.premise]
+    runtime = None if args.variant == "upstream" else bench_source_runtime()
+    refusal = source_runtime_preflight(runtime, args.variant)
+    for p in premises:
+        srv = Server(args.variant, p, args.port, args.max_concurrent or PREMISE_CONCURRENCY[p],
+                     Path(args.out), args.keep_cache, args.batched_decode_limit)
+        env = srv.process_env()
+        print(f"[dry-run] {args.variant}/{p} cwd={srv.base}")
+        overlay = runtime is None and srv.runtime_info()["mode"] == "app-overlay"
+        # The app-overlay command builds the overlay on disk, so only describe it.
+        cmd = srv.runtime_info() if overlay else " ".join(srv.command())
+        print(f"[dry-run]   cmd: {cmd}")
+        print(f"[dry-run]   feature env: {srv.env}")
+        if runtime is not None:
+            print(f"[dry-run]   PYTHONPATH={env.get('PYTHONPATH')}")
+            print(f"[dry-run]   runtime: {srv.runtime_info()}")
+            print(f"[dry-run]   probe: {verify_source_import(runtime[0], runtime[1], env)}")
+    if refusal:
+        print(f"[dry-run] a real run would refuse now: {refusal}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global CACHE_ROOT
     ap = argparse.ArgumentParser(
@@ -1853,8 +2004,20 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="with --serve: stop after N seconds (0 = until SIGINT/SIGTERM)",
     )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the server command, env and runtime probe for each premise; start nothing",
+    )
     args = ap.parse_args(argv)
 
+    try:
+        source_runtime = bench_source_runtime()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.dry_run:
+        return dry_run(args)
     if not bm.port_allowed(args.port, args.allow_port):
         print(
             f"refusing protected port {args.port} (pass --allow-port {args.port} to override)",
@@ -1870,7 +2033,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.variant == "upstream" and not UPSTREAM_CLI.exists():
         print(f"missing {UPSTREAM_CLI}", file=sys.stderr)
         return 2
-    if args.variant != "upstream" and not FORK_BIN.exists():
+    refusal = source_runtime_preflight(source_runtime, args.variant)
+    if refusal:
+        print(f"refusing to start: {refusal}", file=sys.stderr)
+        return 2
+    if args.variant != "upstream" and source_runtime is None and not FORK_BIN.exists():
         print(f"missing {FORK_BIN}", file=sys.stderr)
         return 2
     CACHE_ROOT = args.cache_root

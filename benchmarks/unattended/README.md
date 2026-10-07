@@ -61,7 +61,22 @@ $PY benchmarks/unattended/report.py --out /tmp/omlx-unattended-bench
 ```
 
 `--premise {P1,P2,P3,P4,P6,all}`, `--runs N`, `--port` (default 8002),
-`--p1-cancel-fraction` (0.6), `--p3-max-tokens` (512), `--keep-cache`.
+`--p1-cancel-fraction` (0.6), `--p3-max-tokens` (512), `--keep-cache`,
+`--dry-run` (print the server command, env and runtime probe; start nothing).
+
+Server runtime for the fork-family variants (`upstream` always runs the app CLI):
+
+* default: the `/Applications/oMLX.app` Python and dependencies, with the
+  `omlx/` sources of `OMLX_BENCH_FORK_REPO` (or this tree) overlaid;
+* `OMLX_BENCH_PYTHON=<venv>/bin/python OMLX_BENCH_SOURCE=<tree>`: run
+  `<venv python> -m omlx.cli serve` with only `<tree>` on `PYTHONPATH`, so the
+  dependencies are the venv's (for example a venv built from upstream `main`'s
+  pins). Before launch the harness imports `omlx` with the server's exact env and
+  refuses unless it resolves inside `<tree>`; the probe (omlx path, mlx / mlx-lm /
+  mlx-vlm / transformers versions) and the tree's commit go into each run's
+  `setup.server_runtime`. A real run refuses while port 8001 (the live app)
+  accepts connections. A dev venv has no compiled custom kernels, so prefill is
+  slower than the shipped app for any tree.
 
 Method notes:
 
