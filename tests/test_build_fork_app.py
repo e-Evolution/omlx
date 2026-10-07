@@ -168,6 +168,55 @@ def test_validate_donor_rejects_pin_mismatch_and_names_package(bfa, donor):
         bfa.validate_donor(donor, "0.7.0", "2987", venv)
 
 
+def test_validate_donor_accepts_an_allowed_pin_mismatch_and_reports_it(bfa, donor):
+    venv = dict(PINS, **{"mlx-vlm": "0.7.4"})
+    accepted = bfa.validate_donor(
+        donor, "0.7.0", "2987", venv, allow_pin_mismatch=("mlx-vlm",)
+    )
+    assert accepted == ["mlx-vlm: donor has 0.7.1, fork venv has 0.7.4"]
+
+
+def test_validate_donor_allowance_is_per_package(bfa, donor):
+    venv = dict(PINS, **{"mlx-vlm": "0.7.4"}, mlx="0.33.0")
+    with pytest.raises(bfa.DonorMismatch, match="mlx: donor has"):
+        bfa.validate_donor(
+            donor, "0.7.0", "2987", venv, allow_pin_mismatch=("mlx-vlm",)
+        )
+
+
+def test_validate_donor_allowance_never_accepts_a_missing_pin(bfa, donor):
+    sp = next(donor.rglob("site-packages"))
+    for d in sp.glob("fastapi-*.dist-info"):
+        for f in d.iterdir():
+            f.unlink()
+        d.rmdir()
+    with pytest.raises(bfa.DonorMismatch, match="fastapi"):
+        bfa.validate_donor(
+            donor, "0.7.0", "2987", dict(PINS), allow_pin_mismatch=("fastapi",)
+        )
+
+
+def test_cli_allow_pin_mismatch_is_repeatable(bfa):
+    opts = bfa.parse_args(
+        ["--allow-pin-mismatch", "mlx-vlm", "--allow-pin-mismatch", "mlx"]
+    )
+    assert opts.allow_pin_mismatch == ("mlx-vlm", "mlx")
+    assert bfa.parse_args([]).allow_pin_mismatch == ()
+
+
+def test_build_records_accepted_pin_mismatches(bfa, donor, fork_pkg, tmp_path):
+    summary = bfa.build(
+        bfa.Options(
+            donor=donor, out=tmp_path / "dist", package=fork_pkg,
+            sign=False, dmg=False, allow_pin_mismatch=("mlx-vlm",),
+        ),
+        venv_pins=dict(PINS, **{"mlx-vlm": "0.7.4"}), runner=FakeRunner(),
+    )
+    assert summary["pin_mismatches_accepted"] == [
+        "mlx-vlm: donor has 0.7.1, fork venv has 0.7.4"
+    ]
+
+
 def test_validate_donor_rejects_missing_donor_pin(bfa, donor):
     sp = next(donor.rglob("site-packages"))
     for d in sp.glob("fastapi-*.dist-info"):
