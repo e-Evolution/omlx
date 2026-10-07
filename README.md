@@ -282,7 +282,7 @@ These capacity features plan against a fixed memory budget, so they are part of 
 | `on` | On whatever the tier. It still needs the prefill memory guard; with the guard off it stays off and logs a warning. |
 | `off` | Off. Admission is the same as without these features. |
 
-Why an explicit ceiling: waiting for memory and promising what fits alone only make sense when the budget is fixed and memory pressure is expected. On a tier, the ceiling follows the memory other apps use, so a request that fits now may not fit a minute later. At startup, and whenever the mode, the guard, the tier or the ceiling changes, the server logs the resolved state, for example `Memory scheduling: on (explicit ceiling 48.0 GB)` or `Memory scheduling: off (no explicit memory ceiling; ...)`.
+Why an explicit ceiling: waiting for memory and promising what fits alone only make sense when the budget is fixed and memory pressure is expected. On a tier, the ceiling follows the memory other apps use, so a request that fits now may not fit a minute later. At startup, and whenever the mode, the guard, the tier or the ceiling changes, the server logs the resolved state, for example `Memory scheduling: on (explicit ceiling 48.0 GB)` or `Memory scheduling: off (no explicit memory ceiling; ...)`. An explicit mode save from the admin settings logs the state even when it did not change. `GET /admin/api/global-settings` reports the live state as `memory.memory_scheduling_effective` (`{"enabled": true, "reason": "memory_scheduling=on"}`, or `null` when no enforcer runs); the `POST` response carries the same field. `memory.memory_scheduling` is the configured mode.
 
 With memory scheduling on:
 

@@ -1531,7 +1531,9 @@ class ProcessMemoryEnforcer:
         if mode is None:
             raise ValueError(f"Invalid memory_scheduling: {value!r}")
         self._memory_scheduling_mode = mode
-        self._resolve_memory_scheduling()
+        # An explicit mode set always logs the result, even unchanged, so an
+        # admin POST is visible in the log; the propagation re-pushes it.
+        self._resolve_memory_scheduling(announce=True)
         if self._running:
             self._propagate_memory_limit()
 
@@ -1546,11 +1548,15 @@ class ProcessMemoryEnforcer:
         state = self._memory_scheduling_state
         return state.reason if state is not None else ""
 
-    def _resolve_memory_scheduling(self) -> None:
+    def _resolve_memory_scheduling(self, *, announce: bool = False) -> None:
         """Re-resolve the mode against the guard and ceiling; log a change.
 
         Runs at startup and whenever the mode, the guard, the tier or the
-        custom ceiling changes (admin settings apply live).
+        custom ceiling changes (admin settings apply live). ``announce`` logs
+        the state even when it did not change. Only an enforcer that drives
+        an engine pool logs: the settings page's tier previews and the
+        cluster memory probe build throwaway enforcers (``engine_pool=None``)
+        with the default mode, and their lines read as the live one changing.
         """
         state = resolve_memory_scheduling(
             self._memory_scheduling_mode,
@@ -1558,9 +1564,10 @@ class ProcessMemoryEnforcer:
             memory_guard_tier=self._memory_guard_tier,
             custom_ceiling_bytes=self._memory_guard_custom_ceiling_bytes,
         )
-        if state == self._memory_scheduling_state:
-            return
+        changed = state != self._memory_scheduling_state
         self._memory_scheduling_state = state
+        if self._engine_pool is None or not (changed or announce):
+            return
         if state.warn:
             logger.warning(state.log_line())
         else:
