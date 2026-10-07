@@ -342,15 +342,14 @@ def test_default_env_enables_d1_and_park(bfa):
         "OMLX_MEMORY_ABORT_SINGLE_VICTIM": "true",
         "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true",
         "OMLX_MLX_CACHE_LIMIT_GB": "16",
-        "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": "200000",
-        "OMLX_BATCHED_DECODE_HOLD_MAX_S": "120",
         "OMLX_MID_SYSTEM_POLICY": "inline_note",
         "OMLX_THINKING_RETENTION_GUARD_TOKENS": "20000",
         "OMLX_MEMORY_SCHEDULING": "on",
     }
     assert bfa.FORK_MLX_CACHE_LIMIT_GB == "16"
-    assert bfa.FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS == "200000"
-    assert bfa.FORK_BATCHED_DECODE_HOLD_MAX_S == "120"
+    # The batched-decode gate is off: memory pressure pauses a decoding row
+    # instead of aborting, so the fork no longer caps the batch context.
+    assert "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS" not in bfa.FORK_ENV
 
 
 # ------------------------------------------------------------ updater patch
