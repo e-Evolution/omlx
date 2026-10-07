@@ -482,7 +482,9 @@ def test_env_override_is_applied_and_not_persisted(tmp_path):
     ):
         settings = GlobalSettings.load(base_path=tmp_path)
     assert settings.server.thinking_retention_guard_tokens == 20000
-    assert "thinking_retention_guard_tokens" not in settings.server.to_dict()
+    settings.save()
+    saved = json.loads((tmp_path / "settings.json").read_text())
+    assert "thinking_retention_guard_tokens" not in saved["server"]
 
 
 @pytest.mark.parametrize("raw", ["bogus", "0", "-3", "1.5", "nan", "true"])

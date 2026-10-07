@@ -402,6 +402,8 @@ class TestSchedulerSettings:
             "park_resume_ok_polls": 3,
             "max_batched_decode_context_tokens": 0,
             "batched_decode_hold_max_s": 120.0,
+            "memory_abort_single_victim": False,
+            "media_text_suffix_chunked": False,
         }
 
     def test_prefill_progress_commit_blocks_from_dict(self):
