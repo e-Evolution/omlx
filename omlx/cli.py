@@ -166,7 +166,7 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
-    from .settings import burst_decode_env, init_settings
+    from .settings import burst_decode_env, init_settings, scheduler_switch_env
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     process_title.set_process_title()
@@ -258,6 +258,9 @@ def serve_command(args):
     # engine construction (no restart needed when the mode changes later).
     for _key, _value in burst_decode_env(settings.server.burst_decode_mode).items():
         os.environ[_key] = _value
+    # The memory enforcer and the scheduler read these switches from the
+    # environment; an explicit env var already decided the settings value.
+    os.environ.update(scheduler_switch_env(settings.scheduler))
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
@@ -289,6 +292,10 @@ def serve_command(args):
         retention_days=settings.logging.retention_days,
     )
     print(f"Log directory: {log_dir}")
+    if settings.fork_defaults_report:
+        logging.getLogger("omlx.settings").log(
+            settings.fork_defaults_report_level, settings.fork_defaults_report
+        )
 
     # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
     # On Metal/MLX crashes (#511, #520), this dumps all Python thread

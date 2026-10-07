@@ -8,6 +8,8 @@ Note: Configuration validation tests are in test_config.py.
 
 import argparse
 import json
+import logging
+import os
 import socket
 import subprocess
 import sys
@@ -1059,6 +1061,11 @@ class TestServeCommandFunctions:
             get_hot_cache_max_size_bytes=lambda: 0,
         )
         settings.auth = SimpleNamespace(api_key=None)
+        settings.scheduler = SimpleNamespace(
+            memory_abort_single_victim=False, media_text_suffix_chunked=False
+        )
+        settings.fork_defaults_report = None
+        settings.fork_defaults_report_level = logging.INFO
         settings.ensure_directories = lambda: log_dir.mkdir(parents=True, exist_ok=True)
         settings.validate = lambda: []
         settings.save = MagicMock()
@@ -1225,6 +1232,42 @@ class TestServeCommandFunctions:
             listener.close()
             if previous_server is not None:
                 sys.modules["omlx.server"] = previous_server
+
+    def test_serve_seeds_switch_env_and_logs_fork_defaults(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Settings-enabled env switches are exported; the report is logged."""
+        from omlx.cli import serve_command
+
+        for name in (
+            "OMLX_MEMORY_ABORT_SINGLE_VICTIM",
+            "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED",
+        ):
+            monkeypatch.setenv(name, "x")  # registers the variable for restore
+            monkeypatch.delenv(name)
+        listener = self._reserve_port()
+        host, port = listener.getsockname()
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        settings.scheduler.memory_abort_single_victim = True
+        settings.fork_defaults_report = "Fork defaults: 8 applied"
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger="omlx.settings"),
+                pytest.raises(SystemExit),
+            ):
+                serve_command(args)
+        finally:
+            listener.close()
+        assert os.environ["OMLX_MEMORY_ABORT_SINGLE_VICTIM"] == "true"
+        assert "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED" not in os.environ
+        assert "Fork defaults: 8 applied" in caplog.text
 
     def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""

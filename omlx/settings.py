@@ -26,7 +26,7 @@ import logging
 import math
 import os
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -43,6 +43,18 @@ SETTINGS_VERSION = "1.0"
 
 # Default base path
 DEFAULT_BASE_PATH = Path.home() / ".omlx"
+
+# Optional defaults layer (the fork app points it at a JSON file in its bundle).
+# The file has the settings.json shape ({"scheduler": {...}, "memory": {...}})
+# and sits below settings.json: precedence is explicit env > settings.json >
+# this file > built-in defaults. Values it supplies are never saved into
+# settings.json. A relative path resolves next to the omlx package (the app's
+# Contents/Resources). Unset, nothing changes.
+FORK_DEFAULTS_ENV = "OMLX_DEFAULTS_FILE"
+_PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+# Sentinel: "the key was absent from settings.json".
+_MISSING: Any = object()
+_LOG_INFO = logging.INFO
 
 # One-line bootstrap file the macOS app writes when the user moves their data root
 BASE_PATH_BOOTSTRAP_FILE = (
@@ -200,13 +212,15 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
-    # Runtime-only override (env OMLX_MID_SYSTEM_POLICY, never persisted):
     # "strict" | "user_note_safe" | "inline_note". None derives the policy from
     # preserve_mid_system_cache. A per-model setting still takes precedence.
+    # Saved only when set in settings.json; the OMLX_MID_SYSTEM_POLICY env
+    # override is never persisted.
     mid_system_policy: str | None = None
-    # Runtime-only override (env OMLX_THINKING_RETENTION_GUARD_TOKENS, never
-    # persisted): token guard for deterministic thinking retention. None = off.
-    # A per-model setting still takes precedence.
+    # Token guard for deterministic thinking retention. None = off. A
+    # per-model setting still takes precedence. Saved only when set in
+    # settings.json; the OMLX_THINKING_RETENTION_GUARD_TOKENS env override is
+    # never persisted.
     thinking_retention_guard_tokens: int | None = None
     qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
@@ -238,17 +252,39 @@ class ServerSettings:
         return size
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary (runtime-only env overrides are not persisted)."""
+        """Convert to dictionary (unset optional overrides are left out)."""
         data = asdict(self)
-        data.pop("mid_system_policy", None)
-        data.pop("thinking_retention_guard_tokens", None)
+        for key in ("mid_system_policy", "thinking_retention_guard_tokens"):
+            if data[key] is None:
+                del data[key]
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         _host = data.get("host", data.get("bind_address", "127.0.0.1"))
+        mid_system_policy = None
+        if data.get("mid_system_policy") is not None:
+            from .api.utils import normalize_mid_system_policy
+
+            mid_system_policy = normalize_mid_system_policy(data["mid_system_policy"])
+            if mid_system_policy is None:
+                logger.warning(
+                    f"Invalid server.mid_system_policy: {data['mid_system_policy']!r}"
+                )
+        guard_tokens = None
+        if data.get("thinking_retention_guard_tokens") is not None:
+            from .api.thinking_retention import normalize_guard_tokens
+
+            raw_guard = data["thinking_retention_guard_tokens"]
+            guard_tokens = normalize_guard_tokens(raw_guard)
+            if guard_tokens is None:
+                logger.warning(
+                    f"Invalid server.thinking_retention_guard_tokens: {raw_guard!r}"
+                )
         return cls(
+            mid_system_policy=mid_system_policy,
+            thinking_retention_guard_tokens=guard_tokens,
             host=", ".join(_host) if isinstance(_host, list) else str(_host),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
@@ -402,6 +438,15 @@ class SchedulerSettings:
     # waited longer than this many seconds backfill stops so it cannot starve.
     # 0 = never backfill (strict head-of-line).
     batched_decode_hold_max_s: float = 120.0
+    # Hard memory pressure with nothing parkable aborts the one largest
+    # request instead of every in-flight one (emergency and unload still
+    # abort all). Read at runtime from OMLX_MEMORY_ABORT_SINGLE_VICTIM, which
+    # the CLI seeds from this field (scheduler_switch_env).
+    memory_abort_single_victim: bool = False
+    # A media prompt whose images are all cached prefills its text suffix in
+    # the chunked path (decode keeps running, the prefill can be parked).
+    # Read at runtime from OMLX_MEDIA_TEXT_SUFFIX_CHUNKED, seeded the same way.
+    media_text_suffix_chunked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -467,7 +512,32 @@ class SchedulerSettings:
             park_resume_ok_polls=positive_int("park_resume_ok_polls", 3),
             max_batched_decode_context_tokens=batched_decode_limit,
             batched_decode_hold_max_s=float(hold_max_s),
+            memory_abort_single_victim=data.get("memory_abort_single_victim") is True,
+            media_text_suffix_chunked=data.get("media_text_suffix_chunked") is True,
         )
+
+
+# Scheduler switches that runtime code reads straight from the environment.
+_SCHEDULER_SWITCH_ENV: tuple[tuple[str, str], ...] = (
+    ("memory_abort_single_victim", "OMLX_MEMORY_ABORT_SINGLE_VICTIM"),
+    ("media_text_suffix_chunked", "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED"),
+)
+_TRUTHY = ("true", "1", "yes", "on")
+
+
+def scheduler_switch_env(scheduler: SchedulerSettings) -> dict[str, str]:
+    """Env vars to seed for the enabled env-read scheduler switches.
+
+    The memory enforcer and the scheduler read these switches from the
+    environment on every use; seeding them at startup lets settings.json (and
+    the defaults file) turn them on. A disabled switch is not exported, so an
+    unset variable keeps reading as off.
+    """
+    return {
+        env_name: "true"
+        for attr, env_name in _SCHEDULER_SWITCH_ENV
+        if getattr(scheduler, attr)
+    }
 
 
 @dataclass
@@ -1175,6 +1245,19 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    # One startup line about the OMLX_DEFAULTS_FILE layer; None when unset.
+    fork_defaults_report: str | None = field(default=None, repr=False, compare=False)
+    # (``logging`` is a section field inside this class body.)
+    fork_defaults_report_level: int = field(
+        default=_LOG_INFO, repr=False, compare=False
+    )
+    # (section, key) -> (value applied by a non-persisted layer, value to save
+    # instead: the settings.json value, or _MISSING to leave the key out).
+    # save() swaps an unchanged applied value back, so neither the defaults
+    # file nor a runtime-only env override ever reaches settings.json.
+    _unpersisted: dict[tuple[str, str], tuple[Any, Any]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @classmethod
     def load(
@@ -1183,7 +1266,8 @@ class GlobalSettings:
         cli_args: Any | None = None,
     ) -> GlobalSettings:
         """
-        Load settings with priority hierarchy: CLI > env > file > defaults.
+        Load settings with priority hierarchy:
+        CLI > env > settings.json > OMLX_DEFAULTS_FILE > built-in defaults.
 
         Args:
             base_path: Base directory for oMLX (default: resolved via
@@ -1203,20 +1287,77 @@ class GlobalSettings:
         # Start with defaults
         settings = cls(base_path=resolved_base)
 
-        # Load from file if exists
-        settings_file = resolved_base / "settings.json"
-        if settings_file.exists():
-            settings._load_from_file(settings_file)
-            logger.debug(f"Loaded settings from {settings_file}")
+        # settings.json over the optional fork defaults file
+        layers = settings._load_persisted_layers(resolved_base / "settings.json")
 
         # Apply environment variable overrides
         settings._apply_env_overrides()
+        settings._report_fork_defaults(layers)
 
         # Apply CLI argument overrides
         if cli_args:
             settings._apply_cli_overrides(cli_args)
 
         return settings
+
+    def _load_persisted_layers(self, settings_file: Path) -> dict[str, Any]:
+        """Load settings.json over the OMLX_DEFAULTS_FILE layer (no env).
+
+        A defaults-file key applies only when settings.json lacks it; it goes
+        through the same ``from_dict`` validation and is recorded as
+        unpersisted. Returns what was applied/overridden for the report.
+        """
+        data = self._read_settings_file(settings_file) if settings_file.exists() else {}
+        layers: dict[str, Any] = {"applied": {}, "overridden": [], "problem": None}
+        defaults, layers["problem"] = _read_fork_defaults()
+        merged = {k: (dict(v) if isinstance(v, dict) else v) for k, v in data.items()}
+        applied_keys: list[tuple[str, str]] = []
+        for section, values in defaults.items():
+            section_obj = getattr(self, section, None)
+            if section not in _SETTINGS_SECTIONS or section_obj is None:
+                logger.warning(f"Fork defaults: unknown settings section {section!r}")
+                continue
+            known = {f.name for f in fields(section_obj)}
+            target = merged.setdefault(section, {})
+            if not isinstance(target, dict):
+                continue
+            for key, value in values.items():
+                if key not in known:
+                    logger.warning(f"Fork defaults: unknown setting {section}.{key}")
+                elif key in target:
+                    layers["overridden"].append(f"{section}.{key}")
+                else:
+                    target[key] = value
+                    applied_keys.append((section, key))
+        self._apply_settings_data(merged)
+        for section, key in applied_keys:
+            value = getattr(getattr(self, section), key)
+            layers["applied"][(section, key)] = value
+            self._unpersisted[(section, key)] = (value, _MISSING)
+        return layers
+
+    def _report_fork_defaults(self, layers: dict[str, Any]) -> None:
+        """Build the one-line startup report (logged by the CLI)."""
+        if layers["problem"] is not None:
+            self.fork_defaults_report = layers["problem"]
+            self.fork_defaults_report_level = logging.WARNING
+            return
+        if not layers["applied"] and not layers["overridden"]:
+            return
+        by_env = [
+            f"{section}.{key}"
+            for (section, key), value in layers["applied"].items()
+            if getattr(getattr(self, section), key) != value
+        ]
+
+        def part(names: list[str], source: str) -> str:
+            listed = f" ({', '.join(names)})" if names else ""
+            return f"{len(names)} overridden by {source}{listed}"
+
+        self.fork_defaults_report = (
+            f"Fork defaults: {len(layers['applied'])} applied, "
+            f"{part(layers['overridden'], 'settings.json')}, {part(by_env, 'env')}"
+        )
 
     def _load_from_file(self, path: Path) -> None:
         """
@@ -1225,6 +1366,10 @@ class GlobalSettings:
         Args:
             path: Path to the settings JSON file.
         """
+        self._apply_settings_data(self._read_settings_file(path))
+
+    def _read_settings_file(self, path: Path) -> dict[str, Any]:
+        """Read settings.json; a corrupt file is moved aside and reads as {}."""
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -1236,44 +1381,8 @@ class GlobalSettings:
                     f"Settings file version {version} differs from "
                     f"current {SETTINGS_VERSION}, migrating..."
                 )
-
-            # Load each section
-            if "server" in data:
-                self.server = ServerSettings.from_dict(data["server"])
-            if "model" in data:
-                self.model = ModelSettings.from_dict(data["model"])
-            if "memory" in data:
-                self.memory = MemorySettings.from_dict(data["memory"])
-            if "scheduler" in data:
-                self.scheduler = SchedulerSettings.from_dict(data["scheduler"])
-            if "cache" in data:
-                self.cache = CacheSettings.from_dict(data["cache"])
-            if "auth" in data:
-                self.auth = AuthSettings.from_dict(data["auth"])
-            if "mcp" in data:
-                self.mcp = MCPSettings.from_dict(data["mcp"])
-            if "huggingface" in data:
-                self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
-            if "modelscope" in data:
-                self.modelscope = ModelScopeSettings.from_dict(data["modelscope"])
-            if "network" in data:
-                self.network = NetworkSettings.from_dict(data["network"])
-            if "sampling" in data:
-                self.sampling = SamplingSettings.from_dict(data["sampling"])
-            if "logging" in data:
-                self.logging = LoggingSettings.from_dict(data["logging"])
-            if "claude_code" in data:
-                self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
-            if "integrations" in data:
-                self.integrations = IntegrationSettings.from_dict(data["integrations"])
-            if "ui" in data:
-                self.ui = UISettings.from_dict(data["ui"])
-            if "usage" in data:
-                self.usage = UsageSettings.from_dict(data["usage"])
-            if "idle_timeout" in data:
-                self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
-                    data["idle_timeout"]
-                )
+            logger.debug(f"Loaded settings from {path}")
+            return data
 
         except json.JSONDecodeError as e:
             # A corrupt settings file silently reverting the server to
@@ -1296,6 +1405,24 @@ class GlobalSettings:
                 )
         except OSError as e:
             logger.warning(f"Failed to read settings file {path}: {e}")
+        return {}
+
+    def _apply_settings_data(self, data: dict[str, Any]) -> None:
+        """Build each section present in ``data`` with its ``from_dict``."""
+        for section, section_cls in _SETTINGS_SECTIONS.items():
+            if section in data:
+                setattr(self, section, section_cls.from_dict(data[section]))
+
+    def _set_unpersisted(self, section: str, key: str, value: Any) -> None:
+        """Set a value that save() must not write (runtime-only env override)."""
+        entry = self._unpersisted.get((section, key))
+        if entry is not None:
+            persisted = entry[1]
+        else:
+            current = getattr(getattr(self, section), key)
+            persisted = _MISSING if current is None else current
+        setattr(getattr(self, section), key, value)
+        self._unpersisted[(section, key)] = (value, persisted)
 
     def _apply_env_overrides(self) -> None:
         """Apply OMLX_* environment variable overrides."""
@@ -1320,7 +1447,7 @@ class GlobalSettings:
             if policy is None:
                 logger.warning(f"Invalid OMLX_MID_SYSTEM_POLICY value: {raw_policy}")
             else:
-                self.server.mid_system_policy = policy
+                self._set_unpersisted("server", "mid_system_policy", policy)
         if raw_guard := os.getenv("OMLX_THINKING_RETENTION_GUARD_TOKENS"):
             from .api.thinking_retention import normalize_guard_tokens
 
@@ -1330,7 +1457,9 @@ class GlobalSettings:
                     f"Invalid OMLX_THINKING_RETENTION_GUARD_TOKENS value: {raw_guard}"
                 )
             else:
-                self.server.thinking_retention_guard_tokens = guard
+                self._set_unpersisted(
+                    "server", "thinking_retention_guard_tokens", guard
+                )
         if gpu_keep_warm := os.getenv("OMLX_GPU_KEEP_WARM_INTERVAL"):
             try:
                 self.server.gpu_keep_warm_interval = float(gpu_keep_warm)
@@ -1399,6 +1528,9 @@ class GlobalSettings:
                 )
         if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
             self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
+        for attr, env_name in _SCHEDULER_SWITCH_ENV:
+            if raw := os.getenv(env_name):
+                setattr(self.scheduler, attr, raw.strip().lower() in _TRUTHY)
         for env_name, attr in (
             ("OMLX_MAX_PARKS_PER_REQUEST", "max_parks_per_request"),
             (
@@ -1734,6 +1866,14 @@ class GlobalSettings:
             "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
+        for (section, key), (applied, persisted) in self._unpersisted.items():
+            values = data.get(section)
+            if not isinstance(values, dict) or values.get(key, _MISSING) != applied:
+                continue  # changed since it was applied: a user value now
+            if persisted is _MISSING:
+                del values[key]
+            else:
+                values[key] = persisted
 
         self._save_data(data)
 
@@ -1778,9 +1918,7 @@ class GlobalSettings:
     def save_cli_overrides(self, args: Any) -> None:
         """Persist explicit non-secret CLI configuration without freezing env state."""
         persisted = type(self)(base_path=self.base_path)
-        settings_file = self.base_path / "settings.json"
-        if settings_file.exists():
-            persisted._load_from_file(settings_file)
+        persisted._load_persisted_layers(self.base_path / "settings.json")
         persisted._apply_cli_overrides(args, include_api_key=False)
         persisted.save()
 
@@ -2221,6 +2359,56 @@ class GlobalSettings:
             "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
+
+
+# settings.json section name -> settings class.
+_SETTINGS_SECTIONS: dict[str, Any] = {
+    "server": ServerSettings,
+    "model": ModelSettings,
+    "memory": MemorySettings,
+    "scheduler": SchedulerSettings,
+    "cache": CacheSettings,
+    "auth": AuthSettings,
+    "mcp": MCPSettings,
+    "huggingface": HuggingFaceSettings,
+    "modelscope": ModelScopeSettings,
+    "network": NetworkSettings,
+    "sampling": SamplingSettings,
+    "logging": LoggingSettings,
+    "claude_code": ClaudeCodeSettings,
+    "integrations": IntegrationSettings,
+    "ui": UISettings,
+    "usage": UsageSettings,
+    "idle_timeout": ModelIdleTimeoutSettings,
+}
+
+
+def _read_fork_defaults() -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Read the OMLX_DEFAULTS_FILE layer: (sections, problem or None).
+
+    Unset gives ({}, None). A missing or malformed file logs a warning and
+    gives ({}, problem), so every setting falls back to settings.json and the
+    built-in defaults.
+    """
+    raw = os.getenv(FORK_DEFAULTS_ENV)
+    if not raw:
+        return {}, None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _PACKAGE_PARENT / path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        problem = f"Fork defaults file {path} unreadable ({e}); using built-in defaults"
+    else:
+        if isinstance(data, dict) and all(isinstance(v, dict) for v in data.values()):
+            return data, None
+        problem = (
+            f"Fork defaults file {path} must map settings sections to objects; "
+            "using built-in defaults"
+        )
+    logger.warning(problem)
+    return {}, problem
 
 
 # Global singleton instance
