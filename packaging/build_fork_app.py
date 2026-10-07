@@ -55,17 +55,11 @@ PIN_PACKAGES = (
 # in MLX's cache (65-73 GB observed) until the memory guard aborts.
 FORK_MLX_CACHE_LIMIT_GB = "16"
 
-# Combined-context ceiling (tokens) for batched decode in the fork app. Two
-# decoding rows cannot use the fused single-row TurboQuant kernels and
-# dequantize the whole KV every step. Observed live: 45k + 130k (175k) recovered,
-# 2 x 130k (260k) hit memory pressure 12-15 s after the batch formed, so the
-# gate sits between them; a request that would pass it waits and decodes alone.
-FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS = "200000"
-
-# Aging bound (seconds) for the batched-decode gate's backfill. While the gate
-# holds a long request, shorter ones that fit are admitted past it; once the
-# held request has waited this long, backfill stops so it cannot starve.
-FORK_BATCHED_DECODE_HOLD_MAX_S = "120"
+# No batched-decode gate (OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS stays at its
+# default 0). It capped the combined decode context at 200k tokens because two
+# long TurboQuant rows hit memory pressure and the memory guard aborted them.
+# Memory pressure now pauses a decoding row into the SSD cache and resumes it
+# from its exact prefix, so batches are left to the memory enforcer.
 
 FORK_ENV = {
     "OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS": "4",
@@ -77,8 +71,6 @@ FORK_ENV = {
     # the chunked path: decode keeps running and the prefill can be parked.
     "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": "true",
     "OMLX_MLX_CACHE_LIMIT_GB": FORK_MLX_CACHE_LIMIT_GB,
-    "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS": FORK_MAX_BATCHED_DECODE_CONTEXT_TOKENS,
-    "OMLX_BATCHED_DECODE_HOLD_MAX_S": FORK_BATCHED_DECODE_HOLD_MAX_S,
     # Append-only mid-transcript system updates: pi sends prompt changes as
     # mid-transcript system messages; folding them into the system head breaks
     # the prefix cache for the whole conversation.
