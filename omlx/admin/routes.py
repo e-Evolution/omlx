@@ -4573,7 +4573,27 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    return _global_settings_response(global_settings)
+    response = _global_settings_response(global_settings)
+    response["memory"]["memory_scheduling_effective"] = _memory_scheduling_effective()
+    return response
+
+
+def _memory_scheduling_effective() -> dict[str, Any] | None:
+    """The live enforcer's resolved memory scheduling: enabled and why.
+
+    ``memory.memory_scheduling`` is the configured mode; this is what the
+    enforcer resolved it to against the guard, tier and ceiling (and pushes
+    to every scheduler). None when no enforcer runs.
+    """
+    from ..server import _server_state
+
+    enforcer = getattr(_server_state, "process_memory_enforcer", None)
+    if enforcer is None:
+        return None
+    return {
+        "enabled": bool(enforcer.memory_scheduling_enabled),
+        "reason": str(enforcer.memory_scheduling_reason),
+    }
 
 
 @router.get("/api/global-settings/defaults")
@@ -5892,6 +5912,7 @@ async def update_global_settings(
         "success": True,
         "message": message,
         "runtime_applied": runtime_applied,
+        "memory_scheduling_effective": _memory_scheduling_effective(),
     }
 
 
