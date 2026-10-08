@@ -105,6 +105,7 @@ from .speculative.vlm_mtp import (
     run_vlm_mtp_decode,
     vlm_mtp_positioned_sampling_available,
 )
+from .utils.env_flags import env_flag_on
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
@@ -1749,8 +1750,7 @@ def _media_text_suffix_chunked_enabled() -> bool:
     prefills its text suffix through the chunked text path (decode fairness,
     parkable). The fork's packaged app turns it on.
     """
-    raw = os.getenv("OMLX_MEDIA_TEXT_SUFFIX_CHUNKED", "")
-    return raw.strip().lower() in ("true", "1", "yes", "on")
+    return env_flag_on(os.getenv("OMLX_MEDIA_TEXT_SUFFIX_CHUNKED"))
 
 
 def _captured_rope_delta(request: Any) -> float | None:

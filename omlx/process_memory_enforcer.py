@@ -42,6 +42,7 @@ import mlx.core as mx
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
+from .utils.env_flags import env_flag_on
 from .utils.image import clear_image_decode_cache
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.proc_memory import (
@@ -1780,8 +1781,7 @@ class ProcessMemoryEnforcer:
         Off keeps the legacy abort-all on the non-emergency hard path. The
         fork's packaged app turns it on.
         """
-        raw = os.getenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM", "")
-        return raw.strip().lower() in ("true", "1", "yes", "on")
+        return env_flag_on(os.getenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM"))
 
     async def _abort_single_victim(self, engine: Any, model_id: str) -> Any:
         """Abort the one request freeing the most memory; None means fall back.

@@ -353,3 +353,55 @@ def test_switch_env_leaves_runtime_readers_off_when_disabled(tmp_path, defaults_
     assert "OMLX_MEMORY_ABORT_SINGLE_VICTIM" not in scheduler_switch_env(
         settings.scheduler
     )
+
+
+# ------------------------------------------------------ shared truthy set
+
+SWITCH_ENV = [
+    ("memory_pressure_park", "OMLX_MEMORY_PRESSURE_PARK"),
+    ("memory_abort_single_victim", "OMLX_MEMORY_ABORT_SINGLE_VICTIM"),
+    ("media_text_suffix_chunked", "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED"),
+]
+
+
+def _runtime_readers():
+    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+    from omlx.scheduler import _media_text_suffix_chunked_enabled
+
+    return {
+        "OMLX_MEMORY_ABORT_SINGLE_VICTIM": (
+            ProcessMemoryEnforcer._abort_single_victim_enabled
+        ),
+        "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED": _media_text_suffix_chunked_enabled,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("on", True),
+        (" On ", True),
+        ("yes", True),
+        ("1", True),
+        ("TRUE", True),
+        ("off", False),
+        ("0", False),
+        ("no", False),
+    ],
+)
+@pytest.mark.parametrize("attr, env_name", SWITCH_ENV, ids=[e for _a, e in SWITCH_ENV])
+def test_every_scheduler_switch_env_reads_the_same_truthy_set(
+    tmp_path, clean_env, attr, env_name, raw, expected
+):
+    clean_env.setenv(env_name, raw)
+    settings = GlobalSettings.load(base_path=_base(tmp_path))
+    assert getattr(settings.scheduler, attr) is expected
+    reader = _runtime_readers().get(env_name)
+    if reader is not None:
+        assert reader() is expected
+
+
+def test_the_truthy_set_is_shared():
+    from omlx.utils.env_flags import TRUTHY_ENV_VALUES
+
+    assert frozenset({"1", "true", "yes", "on"}) == TRUTHY_ENV_VALUES

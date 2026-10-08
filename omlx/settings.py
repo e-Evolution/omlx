@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from .config import parse_size
+from .utils.env_flags import env_flag_on
 
 if TYPE_CHECKING:
     from .scheduler import SchedulerConfig
@@ -532,7 +533,6 @@ _SCHEDULER_SWITCH_ENV: tuple[tuple[str, str], ...] = (
     ("memory_abort_single_victim", "OMLX_MEMORY_ABORT_SINGLE_VICTIM"),
     ("media_text_suffix_chunked", "OMLX_MEDIA_TEXT_SUFFIX_CHUNKED"),
 )
-_TRUTHY = ("true", "1", "yes", "on")
 
 
 def scheduler_switch_env(scheduler: SchedulerSettings) -> dict[str, str]:
@@ -1567,10 +1567,10 @@ class GlobalSettings:
                     f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
                 )
         if park := os.getenv("OMLX_MEMORY_PRESSURE_PARK"):
-            self.scheduler.memory_pressure_park = park.lower() in ("true", "1", "yes")
+            self.scheduler.memory_pressure_park = env_flag_on(park)
         for attr, env_name in _SCHEDULER_SWITCH_ENV:
             if raw := os.getenv(env_name):
-                setattr(self.scheduler, attr, raw.strip().lower() in _TRUTHY)
+                setattr(self.scheduler, attr, env_flag_on(raw))
         for env_name, attr in (
             ("OMLX_MAX_PARKS_PER_REQUEST", "max_parks_per_request"),
             (

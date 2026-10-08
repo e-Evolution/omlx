@@ -86,6 +86,10 @@ The two `scheduler.*` switches that runtime code reads from the environment
 `OMLX_MEMORY_ABORT_SINGLE_VICTIM` / `OMLX_MEDIA_TEXT_SUFFIX_CHUNKED` by
 `omlx serve` when enabled.
 
+These two env vars and `OMLX_MEMORY_PRESSURE_PARK` share one truthy set
+(`omlx/utils/env_flags.py`): `true`, `1`, `yes` or `on`, case and surrounding
+spaces ignored; any other value is off.
+
 The server log shows one startup line, for example
 `Fork defaults: 7 applied, 1 overridden by settings.json (memory.memory_scheduling), 0 overridden by env`.
 A missing or malformed defaults file logs a warning and every setting falls
