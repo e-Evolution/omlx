@@ -71,13 +71,16 @@ def single_victim_on(monkeypatch):
 @pytest.fixture
 def enforcer(mock_engine_pool):  # noqa: F811
     # Ceiling 100 GB, soft 85 GB, hard watermark 95 GB: hard is not an
-    # emergency until usage passes the ceiling by the emergency margin.
-    return _make_enforcer(
+    # emergency until usage passes the ceiling by the emergency margin. The
+    # physical cap is not binding (200 GB), whatever the host's memory.
+    enforcer = _make_enforcer(
         mock_engine_pool,
         ceiling=100 * GB,
         soft_threshold=0.85,
         hard_threshold=0.95,
     )
+    enforcer._get_abort_limit_bytes = lambda: 200 * GB
+    return enforcer
 
 
 # --- Resume line and anti-thrash (scheduler unit) --------------------------
@@ -271,6 +274,9 @@ class TestEnforcerLeavesTheSoloRequestAlone:
 
     @pytest.mark.asyncio
     async def test_the_emergency_brake_still_aborts_it(self, enforcer):
+        # The emergency brake measures against the physical cap (#4312); here
+        # it is the ceiling.
+        enforcer._get_abort_limit_bytes = lambda: 100 * GB
         scheduler = _SoloScheduler([_victim("a", kept=0)], solo="a")
         engine = _engine(scheduler)
         _busy(enforcer, engine)
