@@ -224,9 +224,11 @@ class _CapacityEstimate:
 
     ``required_bytes`` is weights + exact KV of context plus max_tokens +
     the prefill transient, compared against ``capacity_bytes`` (the tighter
-    of the admission line and the prefill safety cap).
+    of the admission line and the prefill safety cap) plus
+    ``hot_cache_credit_bytes``, the hot cache that would be released for the
+    request (#4252; only the gate checks count it, never the hint).
     ``max_viable_context_tokens`` is the largest context plus max_tokens
-    that fits alone.
+    that fits alone without that credit.
     """
 
     required_bytes: int
@@ -236,10 +238,11 @@ class _CapacityEstimate:
     requested_context_tokens: int
     requested_max_tokens: int
     max_viable_context_tokens: int
+    hot_cache_credit_bytes: int = 0
 
     @property
     def fits_alone(self) -> bool:
-        return self.required_bytes <= self.capacity_bytes
+        return self.required_bytes - self.hot_cache_credit_bytes <= self.capacity_bytes
 
     def fields(self) -> dict[str, int]:
         return {
@@ -14322,6 +14325,7 @@ class Scheduler:
         capacity = self._capacity_estimate(
             context_tokens=prompt_tokens,
             max_tokens=getattr(request.sampling_params, "max_tokens", 0),
+            count_hot_cache=True,
         )
         if capacity is not None and not capacity.fits_alone:
             return _PreflightRejection(
@@ -14848,11 +14852,27 @@ class Scheduler:
         )
         return int(est.estimated) if est is not None else int(weights)
 
+    def _capacity_hot_cache_credit(self, context_tokens: int) -> int:
+        """Hot cache released for a request of ``context_tokens``.
+
+        Upstream's route preflight credit (#4252), with the request's own
+        prefix bounded by the exact KV of its whole context, as there.
+        """
+        est = self._admission_estimate(
+            num_prompt_tokens=context_tokens, cached_tokens=0, current=0
+        )
+        own_prefix = int(est.kv_exact) if est is not None else 0
+        try:
+            return max(0, int(self._releasable_hot_cache_credit(own_prefix)))
+        except Exception:  # noqa: BLE001 - no credit is the strict answer
+            return 0
+
     def _capacity_estimate(
         self,
         *,
         context_tokens: int,
         max_tokens: int | None,
+        count_hot_cache: bool = False,
     ) -> _CapacityEstimate | None:
         """Whether ``context_tokens + max_tokens`` fits with nothing else running.
 
@@ -14860,6 +14880,11 @@ class Scheduler:
         weights or KV dimensions unknown, or memory scheduling off. Without
         an estimate there is no never-fits error, no fits-later wait, no solo
         admission and no capacity hint: the upstream current-usage preflight.
+
+        ``count_hot_cache`` (the gate checks) credits the hot cache that would
+        be released for the request when it is over the line otherwise, the
+        same credit upstream's route preflight counts (#4252), so a request
+        the hot cache can make room for is never a permanent never-fits 400.
         """
         if not self._memory_scheduling_on():
             return None
@@ -14881,8 +14906,13 @@ class Scheduler:
             return None
         context = max(0, int(context_tokens or 0))
         output = max(0, int(max_tokens or 0))
+        required = self._required_alone_bytes(context + output, weights)
+        credit = 0
+        if count_hot_cache and required > capacity:
+            credit = self._capacity_hot_cache_credit(context)
         return _CapacityEstimate(
-            required_bytes=self._required_alone_bytes(context + output, weights),
+            required_bytes=required,
+            hot_cache_credit_bytes=credit,
             capacity_bytes=capacity,
             weights_bytes=weights,
             kv_bytes_per_token=int(
@@ -15049,6 +15079,7 @@ class Scheduler:
         capacity = self._capacity_estimate(
             context_tokens=num_prompt_tokens,
             max_tokens=max_tokens,
+            count_hot_cache=True,
         )
         if capacity is not None and not capacity.fits_alone:
             message = self._never_fits_message(capacity)
@@ -15163,6 +15194,7 @@ class Scheduler:
         capacity = self._capacity_estimate(
             context_tokens=num_prompt_tokens,
             max_tokens=max_tokens,
+            count_hot_cache=True,
         )
         if capacity is not None and not capacity.fits_alone:
             return None  # evicting cannot help; preflight_or_raise rejects it
