@@ -359,6 +359,65 @@ def test_off_with_park_a_parked_solo_keeps_the_progress_clock(pressured, clock):
     )
 
 
+def test_off_with_park_the_fixed_clock_restarts_when_the_hold_ends(pressured, clock):
+    """The clock switch is monotone: when the park hold ends while the head
+    is still blocked, upstream's fixed clock starts at that moment, not at
+    when the head first blocked (which would fail it at once)."""
+    scheduler, _head, solo = pressured
+    scheduler._memory_scheduling = False
+    scheduler.config.memory_pressure_park = True
+    timeout = scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S
+    scheduler._solo_request_id = solo.request_id
+    assert _schedule(scheduler) == []
+    for _ in range(3):
+        clock.advance(timeout - 1)
+        scheduler._note_admission_progress()  # the solo request emits a token
+        assert _schedule(scheduler) == []
+    clock.advance(timeout - 1)  # no progress since: idle just under timeout
+    scheduler._solo_request_id = None  # the hold ends; the head still blocks
+    assert _schedule(scheduler) == []
+    clock.advance(timeout - 1)
+    assert _schedule(scheduler) == []
+    clock.advance(1)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_code == "memory_admission_stalled"
+    assert "no_progress_seconds" not in failed.error_metadata
+
+
+def test_off_with_park_store_cache_fixed_clock_restarts_when_the_hold_ends(
+    pressured, clock
+):
+    scheduler, head, running = pressured
+    scheduler._memory_scheduling = False
+    scheduler.config.memory_pressure_park = True
+    del scheduler.running[running.request_id]
+    scheduler._admission_paused = False
+    gate = _StoreCacheGate(cap=1)
+    gate.note_submitted()
+    scheduler._store_cache_gate = gate
+    parked = progress_tests._request("parked")
+    parked.parked = True
+    scheduler.waiting.append(parked)  # a parked request behind the head
+    scheduler.requests[parked.request_id] = parked
+    timeout = scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S
+    assert _schedule(scheduler) == []
+    for _ in range(3):
+        clock.advance(timeout - 1)
+        scheduler._note_admission_progress()  # a drained write
+        assert _schedule(scheduler) == []
+    scheduler.waiting.remove(parked)  # the hold ends; the head still blocks
+    del scheduler.requests[parked.request_id]
+    assert scheduler.waiting[0] is head
+    clock.advance(1)
+    assert _schedule(scheduler) == []
+    clock.advance(timeout - 1)
+    assert _schedule(scheduler) == []
+    clock.advance(1)
+    (failed,) = _schedule(scheduler)
+    assert failed.error_code == "store_cache_admission_stalled"
+    assert "no_progress_seconds" not in failed.error_metadata
+
+
 def test_off_store_cache_backpressure_uses_the_fixed_timeout(
     pressured,
     clock,
