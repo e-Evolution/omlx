@@ -179,37 +179,6 @@ def _filter_state(state, indices):
     raise TypeError(f"Unsupported state type: {type(state)!r}")
 
 
-def _map_state_arrays(state, fn):
-    """Apply ``fn`` to every token-axis array of a state (shape [B, H, T(, X)])."""
-    if state is None:
-        return None
-    if isinstance(state, TurboQuantMSEState):
-        return TurboQuantMSEState(fn(state.norms), fn(state.indices))
-    if isinstance(state, TurboQuantProdState):
-        return TurboQuantProdState(
-            fn(state.norms),
-            fn(state.mse_indices),
-            fn(state.residual_norms),
-            fn(state.qjl_signs),
-        )
-    if isinstance(state, TurboQuantPolarState):
-        return TurboQuantPolarState(
-            fn(state.radii), tuple(fn(level) for level in state.level_indices)
-        )
-    if isinstance(state, TurboQuantPolarProdState):
-        return TurboQuantPolarProdState(
-            fn(state.norms),
-            _map_state_arrays(state.polar_state, fn),
-            fn(state.residual_norms),
-            fn(state.qjl_signs),
-        )
-    if isinstance(state, TurboQuantSplitState):
-        return TurboQuantSplitState(
-            _map_state_arrays(state.low, fn), _map_state_arrays(state.high, fn)
-        )
-    raise TypeError(f"Unsupported state type: {type(state)!r}")
-
-
 def _concat_state_batch(states):
     """Concatenate a list of states along batch dimension (axis 0)."""
     if not states:

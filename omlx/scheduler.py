@@ -6986,10 +6986,10 @@ class Scheduler:
         # if even prefill_min_chunk_tokens would exceed the cap; #1405
         # cleanup paths in _schedule_waiting / _advance_chunked_prefills
         # convert that into a finish_reason="error" output for the client.
-        # Media requests reach it only on the text-suffix route; they are
-        # priced like the admission estimate (not text-only).
+        # Media requests reach it only on the text-suffix route; the route
+        # check prices those chunks like text (gathered), as the admission
+        # estimate does.
         qwen4_accounting = Scheduler._qwen4_prefill_accounting_enabled(self)
-        cache_tokens = state.base_size + state.tokens_processed
 
         def qwen4_route(query_tokens: int) -> bool:
             return qwen4_accounting and self._qwen4_text_gathered_pricing(
