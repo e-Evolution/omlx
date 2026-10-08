@@ -1315,10 +1315,19 @@ class GlobalSettings:
 
         A defaults-file key applies only when settings.json lacks it; it goes
         through the same ``from_dict`` validation and is recorded as
-        unpersisted. Returns what was applied/overridden for the report.
+        unpersisted. Each key is validated on its own first: one its section
+        rejects is skipped with a warning, so settings.json and the other
+        defaults still load, and one its section coerces is applied as
+        coerced and named in a warning. Returns what was applied, rejected
+        and overridden for the report.
         """
         data = self._read_settings_file(settings_file) if settings_file.exists() else {}
-        layers: dict[str, Any] = {"applied": {}, "overridden": [], "problem": None}
+        layers: dict[str, Any] = {
+            "applied": {},
+            "rejected": [],
+            "overridden": [],
+            "problem": None,
+        }
         defaults, layers["problem"] = _read_fork_defaults()
         merged = {k: (dict(v) if isinstance(v, dict) else v) for k, v in data.items()}
         applied_keys: list[tuple[str, str]] = []
@@ -1336,12 +1345,26 @@ class GlobalSettings:
                     logger.warning(f"Fork defaults: unknown setting {section}.{key}")
                 elif key in target:
                     layers["overridden"].append(f"{section}.{key}")
+                elif (
+                    problem := _section_value_problem(section, key, value)
+                ) is not None:
+                    logger.warning(
+                        f"Fork defaults: {section}.{key}={value!r} {problem}; "
+                        "skipped"
+                    )
+                    layers["rejected"].append(f"{section}.{key}")
                 else:
                     target[key] = value
                     applied_keys.append((section, key))
         self._apply_settings_data(merged)
         for section, key in applied_keys:
             value = getattr(getattr(self, section), key)
+            given = defaults[section][key]
+            if _setting_as_saved(getattr(self, section), key, value) != given:
+                logger.warning(
+                    f"Fork defaults: {section}.{key}={given!r} was applied as "
+                    f"{value!r}"
+                )
             layers["applied"][(section, key)] = value
             self._unpersisted[(section, key)] = (value, _MISSING)
         return layers
@@ -1352,7 +1375,7 @@ class GlobalSettings:
             self.fork_defaults_report = layers["problem"]
             self.fork_defaults_report_level = logging.WARNING
             return
-        if not layers["applied"] and not layers["overridden"]:
+        if not (layers["applied"] or layers["overridden"] or layers["rejected"]):
             return
         by_env = [
             f"{section}.{key}"
@@ -1364,8 +1387,15 @@ class GlobalSettings:
             listed = f" ({', '.join(names)})" if names else ""
             return f"{len(names)} overridden by {source}{listed}"
 
+        rejected = ""
+        if layers["rejected"]:
+            rejected = (
+                f"{len(layers['rejected'])} rejected "
+                f"({', '.join(layers['rejected'])}), "
+            )
+            self.fork_defaults_report_level = logging.WARNING
         self.fork_defaults_report = (
-            f"Fork defaults: {len(layers['applied'])} applied, "
+            f"Fork defaults: {len(layers['applied'])} applied, {rejected}"
             f"{part(layers['overridden'], 'settings.json')}, {part(by_env, 'env')}"
         )
 
@@ -2397,6 +2427,24 @@ _SETTINGS_SECTIONS: dict[str, Any] = {
     "usage": UsageSettings,
     "idle_timeout": ModelIdleTimeoutSettings,
 }
+
+
+def _section_value_problem(section: str, key: str, value: Any) -> str | None:
+    """Why ``section``'s ``from_dict`` rejects ``{key: value}``, or None."""
+    try:
+        _SETTINGS_SECTIONS[section].from_dict({key: value})
+    except Exception as e:  # noqa: BLE001 - any failure rejects the value
+        return f"rejected ({type(e).__name__}: {e})"
+    return None
+
+
+def _setting_as_saved(section_obj: Any, key: str, value: Any) -> Any:
+    """``key`` as the section's ``to_dict`` writes it (nested values as
+    plain data), or ``value`` when ``to_dict`` leaves it out."""
+    try:
+        return section_obj.to_dict().get(key, value)
+    except Exception:  # noqa: BLE001 - compare the attribute instead
+        return value
 
 
 def _read_fork_defaults() -> tuple[dict[str, dict[str, Any]], str | None]:

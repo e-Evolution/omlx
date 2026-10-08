@@ -89,7 +89,11 @@ The two `scheduler.*` switches that runtime code reads from the environment
 The server log shows one startup line, for example
 `Fork defaults: 7 applied, 1 overridden by settings.json (memory.memory_scheduling), 0 overridden by env`.
 A missing or malformed defaults file logs a warning and every setting falls
-back to `settings.json` and the built-in defaults.
+back to `settings.json` and the built-in defaults. A value its section rejects
+(for example `memory.soft_threshold: "high"`) is skipped with a warning and the
+startup line counts it as rejected; `settings.json` and the other defaults
+still load. A value its section coerces (a non-boolean switch reads as off) is
+applied as coerced and named in a warning.
 
 ### Override a fork default
 

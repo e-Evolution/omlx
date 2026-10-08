@@ -166,6 +166,63 @@ def test_unknown_section_or_key_is_skipped_with_a_warning(tmp_path, clean_env, c
     assert "no_such_section" in caplog.text
 
 
+def test_a_default_rejected_by_its_section_is_skipped_with_a_warning(
+    tmp_path, clean_env, caplog
+):
+    """A well-formed file with one value a section's from_dict rejects skips
+    that key only: settings.json and the other defaults still load."""
+    path = tmp_path / "d.json"
+    path.write_text(
+        json.dumps(
+            {
+                "memory": {"soft_threshold": "high", "mlx_cache_limit_gb": 16.0},
+                "scheduler": {"memory_pressure_park": True},
+            }
+        )
+    )
+    clean_env.setenv("OMLX_DEFAULTS_FILE", str(path))
+    base = _base(tmp_path, {"scheduler": {"prefill_progress_commit_blocks": 2}})
+    with caplog.at_level(logging.WARNING, logger="omlx.settings"):
+        settings = GlobalSettings.load(base_path=base)
+    assert settings.memory.soft_threshold == 0.85
+    assert settings.memory.mlx_cache_limit_gb == 16.0
+    assert settings.scheduler.memory_pressure_park is True
+    assert settings.scheduler.prefill_progress_commit_blocks == 2
+    assert "memory.soft_threshold" in caplog.text
+    assert settings.fork_defaults_report == (
+        "Fork defaults: 2 applied, 1 rejected (memory.soft_threshold), "
+        "0 overridden by settings.json, 0 overridden by env"
+    )
+    assert settings.fork_defaults_report_level == logging.WARNING
+    # The rejected default is never saved either.
+    settings.save()
+    saved = json.loads((base / "settings.json").read_text())
+    assert saved["memory"]["soft_threshold"] == 0.85
+
+
+def test_a_default_its_section_coerces_is_flagged(tmp_path, clean_env, caplog):
+    """from_dict silently coerces some values (a non-boolean switch reads as
+    off); the defaults layer names them instead of applying them unflagged."""
+    path = tmp_path / "d.json"
+    path.write_text(
+        json.dumps(
+            {
+                "scheduler": {
+                    "memory_pressure_park": "yes",
+                    "prefill_progress_commit_blocks": 4,
+                }
+            }
+        )
+    )
+    clean_env.setenv("OMLX_DEFAULTS_FILE", str(path))
+    with caplog.at_level(logging.WARNING, logger="omlx.settings"):
+        settings = GlobalSettings.load(base_path=_base(tmp_path))
+    assert settings.scheduler.memory_pressure_park is False
+    assert settings.scheduler.prefill_progress_commit_blocks == 4
+    assert "scheduler.memory_pressure_park='yes' was applied as False" in caplog.text
+    assert "prefill_progress_commit_blocks" not in caplog.text
+
+
 def test_relative_path_resolves_next_to_the_omlx_package(
     tmp_path, clean_env, monkeypatch
 ):
