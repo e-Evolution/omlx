@@ -231,6 +231,93 @@ def test_a_never_fits_request_does_not_ask_for_an_eviction(gated):
     )
 
 
+# --- Hot-cache credit (#4252) ---------------------------------------------------
+
+
+def _over_by(scheduler, extra_tokens=20_000):
+    """A context over the max viable one and the bytes it is over by."""
+    context = scheduler.max_viable_context_tokens() + extra_tokens
+    cap = scheduler._capacity_estimate(context_tokens=context, max_tokens=0)
+    assert not cap.fits_alone
+    return context, cap.required_bytes - cap.capacity_bytes
+
+
+def _hot_cache_credit(monkeypatch, scheduler, credit):
+    seen = []
+
+    def credit_fn(own_prefix_bytes):
+        seen.append(own_prefix_bytes)
+        return credit
+
+    monkeypatch.setattr(scheduler, "_releasable_hot_cache_credit", credit_fn)
+    return seen
+
+
+def test_never_fits_counts_the_releasable_hot_cache(gated, monkeypatch):
+    """Upstream's route preflight admits a request the hot cache can make
+    room for (#4252), so it is not a permanent never-fits 400."""
+    scheduler, _usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    seen = _hot_cache_credit(monkeypatch, scheduler, over + GB)
+    scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+    # The request's own cached prefix stays protected, as in upstream.
+    assert seen and all(own > 0 for own in seen)
+
+
+def test_never_fits_beyond_the_hot_cache_credit_is_still_rejected(gated, monkeypatch):
+    scheduler, _usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    _hot_cache_credit(monkeypatch, scheduler, over // 2)
+    with pytest.raises(ContextExceedsCapacityError) as info:
+        scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+    # The 400 body keeps the credit-free numbers.
+    fields = info.value.capacity_fields
+    assert fields["required_bytes"] - fields["capacity_bytes"] == over
+
+
+def test_in_stream_never_fits_counts_the_releasable_hot_cache(gated, monkeypatch):
+    """The in-stream check must not reject what the route preflight let in."""
+    scheduler, _usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    request = _make_request(context)
+    request.sampling_params.max_tokens = 0
+    _hot_cache_credit(monkeypatch, scheduler, over // 2)
+    rejection = scheduler._preflight_memory_check(request)
+    assert rejection is not None and rejection.capacity is not None
+    _hot_cache_credit(monkeypatch, scheduler, over + GB)
+    rejection = scheduler._preflight_memory_check(request)
+    assert rejection is None or rejection.capacity is None
+
+
+def test_eviction_request_is_priced_when_the_hot_cache_makes_it_fit(gated, monkeypatch):
+    scheduler, usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    usage[0] = 99 * GB
+    _hot_cache_credit(monkeypatch, scheduler, over // 2)
+    assert (
+        scheduler.preflight_eviction_request(num_prompt_tokens=context, max_tokens=0)
+        is None
+    )
+    _hot_cache_credit(monkeypatch, scheduler, over + GB)
+    assert (
+        scheduler.preflight_eviction_request(num_prompt_tokens=context, max_tokens=0)
+        is not None
+    )
+
+
+def test_capacity_hint_does_not_count_the_hot_cache(gated, monkeypatch):
+    """The header and endpoint stay a static, credit-free bound."""
+    scheduler, _usage, _admitted = gated
+    first = scheduler.max_viable_context_tokens()
+    scheduler._max_viable_cache = None
+    _hot_cache_credit(monkeypatch, scheduler, 50 * GB)
+    assert scheduler.max_viable_context_tokens() == first
+    assert (
+        scheduler.capacity_snapshot(context_tokens=first + 20_000)["required_bytes"]
+        > scheduler.capacity_snapshot()["capacity_bytes"]
+    )
+
+
 # --- In-stream admission --------------------------------------------------------
 
 
