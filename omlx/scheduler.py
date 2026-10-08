@@ -2755,6 +2755,10 @@ class Scheduler:
         # Last time any request made progress (see _note_admission_progress);
         # the admission-stall clocks run from it. None until the first one.
         self._admission_progress_at: float | None = None
+        # The progress clock as last observed, and when it last turned off
+        # (see _observe_progress_clock).
+        self._progress_clock_was_on: bool = False
+        self._progress_clock_off_at: float | None = None
         # Last "Admission waiting for memory" line (head id, time).
         self._admission_wait_logged: tuple[str, float] | None = None
         # EWMA estimator of per-token chunk transient bytes, used by
@@ -6119,17 +6123,35 @@ class Scheduler:
             return True
         return any(request.parked for request in self.waiting)
 
-    def _admission_idle_since(self, blocked_since: float) -> float:
+    def _observe_progress_clock(self, now: float) -> bool:
+        """``_progress_clock_on`` at ``now``, recording when it turns off.
+
+        The stall checks call this once per step, so a park hold that ends
+        is seen as the clock turning off at the first check after it.
+        """
+        on = self._progress_clock_on()
+        if self._progress_clock_was_on and not on:
+            self._progress_clock_off_at = now
+        self._progress_clock_was_on = on
+        return on
+
+    def _admission_idle_since(
+        self, blocked_since: float, progress_clock: bool
+    ) -> float:
         """Start of the current no-progress stretch for a blocked head.
 
-        Without the progress clock (``_progress_clock_on``) the clock is
+        With the progress clock, the last progress. Without it the clock is
         upstream's: it runs from when the head first blocked, whatever else
-        progresses.
+        progresses, but never from before the progress clock last turned
+        off. A head still blocked when a park hold ends then gets the full
+        fixed timeout from that moment instead of failing at once on time
+        it spent waiting through the hold.
         """
-        progress = self._admission_progress_at
-        if progress is None or not self._progress_clock_on():
-            return blocked_since
-        return max(blocked_since, progress)
+        if progress_clock:
+            progress = self._admission_progress_at
+            return blocked_since if progress is None else max(blocked_since, progress)
+        off_at = self._progress_clock_off_at
+        return blocked_since if off_at is None else max(blocked_since, off_at)
 
     def _deliberate_memory_hold(self) -> bool:
         """Whether memory is being scheduled on purpose: a solo request runs,
@@ -6181,8 +6203,8 @@ class Scheduler:
             # client's own timeouts apply.
             self._clear_memory_admission_blocker(request_id)
             return None
-        progress_clock = self._progress_clock_on()
         now = time.monotonic()
+        progress_clock = self._observe_progress_clock(now)
         if request_id != self._memory_admission_blocked_request_id:
             self._memory_admission_blocked_request_id = request_id
             self._memory_admission_blocked_since = now
@@ -6201,7 +6223,7 @@ class Scheduler:
                 float(getattr(self.config, "admission_no_progress_timeout_s", 600.0)),
             )
         idle_for = now - self._admission_idle_since(
-            self._memory_admission_blocked_since
+            self._memory_admission_blocked_since, progress_clock
         )
         if idle_for < timeout:
             if progress_clock:
@@ -6271,8 +6293,8 @@ class Scheduler:
         if request.parked:
             self._clear_store_cache_admission_blocker(request_id)
             return None
-        progress_clock = self._progress_clock_on()
         now = time.monotonic()
+        progress_clock = self._observe_progress_clock(now)
         if request_id != self._store_cache_admission_blocked_request_id:
             self._store_cache_admission_blocked_request_id = request_id
             self._store_cache_admission_blocked_since = now
@@ -6289,7 +6311,7 @@ class Scheduler:
             Scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S,
         )
         idle_for = now - self._admission_idle_since(
-            self._store_cache_admission_blocked_since
+            self._store_cache_admission_blocked_since, progress_clock
         )
         if idle_for < timeout:
             if progress_clock:
