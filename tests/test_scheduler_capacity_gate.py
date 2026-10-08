@@ -282,13 +282,108 @@ def test_never_fits_counts_the_releasable_hot_cache(gated, monkeypatch):
 
 def test_never_fits_beyond_the_hot_cache_credit_is_still_rejected(gated, monkeypatch):
     scheduler, _usage, _admitted = gated
+    base = scheduler._capacity_limit_bytes()
     context, over = _over_by(scheduler)
     _hot_cache_credit(monkeypatch, scheduler, over // 2)
     with pytest.raises(ContextExceedsCapacityError) as info:
         scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
-    # The 400 body keeps the credit-free numbers.
+    # The 400 body reports the line the gate compared against: the capacity
+    # line raised by the hot cache the request would release.
     fields = info.value.capacity_fields
-    assert fields["required_bytes"] - fields["capacity_bytes"] == over
+    assert fields["capacity_bytes"] == base + over // 2
+    assert fields["required_bytes"] - fields["capacity_bytes"] == over - over // 2
+    assert "of hot cache it would release" in str(info.value)
+
+
+@pytest.mark.parametrize("credit_of_over", [0.5, 2.0])
+def test_gate_estimate_fits_alone_agrees_with_its_max_viable_context(
+    gated, monkeypatch, credit_of_over
+):
+    """One estimate never says it fits alone above its own max viable context."""
+    scheduler, _usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    _hot_cache_credit(monkeypatch, scheduler, int(over * credit_of_over))
+    cap = scheduler._capacity_estimate(
+        context_tokens=context, max_tokens=0, count_hot_cache=True
+    )
+    assert cap.fits_alone == (context <= cap.max_viable_context_tokens)
+    assert cap.fits_alone == (cap.required_bytes <= cap.capacity_bytes)
+    assert cap.fits_alone is (credit_of_over > 1)
+
+
+def test_never_fits_400_names_the_largest_request_the_gate_admits(gated, monkeypatch):
+    """The 400 body's max_viable_context_tokens is the gate's own boundary."""
+    scheduler, _usage, _admitted = gated
+    context, over = _over_by(scheduler)
+    _hot_cache_credit(monkeypatch, scheduler, over // 2)
+    with pytest.raises(ContextExceedsCapacityError) as info:
+        scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+    best = info.value.capacity_fields["max_viable_context_tokens"]
+    assert best < context
+    scheduler.preflight_or_raise(num_prompt_tokens=best, max_tokens=0)
+    with pytest.raises(ContextExceedsCapacityError):
+        scheduler.preflight_or_raise(num_prompt_tokens=best + 1, max_tokens=0)
+
+
+def _real_hot_cache(scheduler, monkeypatch, context, *, releasable, reserved=None):
+    """Hot cache holding the request's own prefix (its KV) plus ``releasable``
+    bytes of other blocks, read by the real ``_releasable_hot_cache_credit``."""
+    own = scheduler._admission_estimate(
+        num_prompt_tokens=context, cached_tokens=0, current=0
+    ).kv_exact
+    held = own + releasable
+    scheduler._memory_hot_cache_reserved_bytes = reserved or held
+    monkeypatch.setattr(scheduler, "_hot_cache_cpu_bytes", lambda: held)
+    return own
+
+
+def test_never_fits_credits_only_hot_cache_that_can_be_released(gated, monkeypatch):
+    """Main's limits subtract the hot-cache reservation and its eviction ladder
+    releases cold blocks and raises the limit (#4252), so main runs a request
+    the released hot cache makes room for. The request's own prefix stays
+    protected: a resident hot cache holding only that prefix earns no credit,
+    and a request over the line by more than the released bytes is a 400."""
+    scheduler, usage, _admitted = gated
+    usage[0] = scheduler._model_weights_bytes()  # nothing else running
+    context, over = _over_by(scheduler, extra_tokens=5_000)
+    factor = scheduler._hot_cache_limit_factor()
+    assert 0.5 < factor <= 1
+
+    _real_hot_cache(scheduler, monkeypatch, context, releasable=2 * over)
+    scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+
+    _real_hot_cache(scheduler, monkeypatch, context, releasable=over // 4)
+    with pytest.raises(ContextExceedsCapacityError):
+        scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+
+    _real_hot_cache(scheduler, monkeypatch, context, releasable=0, reserved=50 * GB)
+    with pytest.raises(ContextExceedsCapacityError):
+        scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+
+
+def test_current_usage_check_still_credits_the_hot_cache_as_main(gated, monkeypatch):
+    """With memory scheduling on, a request that fits alone but whose peak
+    on the current usage is over the admission line by less than the
+    releasable hot cache passes the route preflight, as on main (#4252)."""
+    scheduler, usage, _admitted = gated
+    context = scheduler.max_viable_context_tokens() // 2
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=context, cached_tokens=0, current=0
+    )
+    over = 2 * GB
+    # Over the capacity line (the tighter of the admission line and the
+    # safety cap) by ``over`` on the current usage.
+    usage[0] = scheduler._capacity_limit_bytes() - est.estimated + over
+    _real_hot_cache(scheduler, monkeypatch, context, releasable=4 * over)
+    scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+    assert (
+        scheduler.preflight_eviction_request(num_prompt_tokens=context, max_tokens=0)
+        is None
+    )
+    _real_hot_cache(scheduler, monkeypatch, context, releasable=0)
+    with pytest.raises(PrefillMemoryExceededError) as info:
+        scheduler.preflight_or_raise(num_prompt_tokens=context, max_tokens=0)
+    assert type(info.value) is PrefillMemoryExceededError  # not never-fits
 
 
 def test_in_stream_never_fits_counts_the_releasable_hot_cache(gated, monkeypatch):

@@ -223,12 +223,14 @@ class _CapacityEstimate:
     """Whether a request fits this model's memory with nothing else running.
 
     ``required_bytes`` is weights + exact KV of context plus max_tokens +
-    the prefill transient, compared against ``capacity_bytes`` (the tighter
-    of the admission line and the prefill safety cap) plus
-    ``hot_cache_credit_bytes``, the hot cache that would be released for the
-    request (#4252; only the gate checks count it, never the hint).
-    ``max_viable_context_tokens`` is the largest context plus max_tokens
-    that fits alone without that credit.
+    the prefill transient, compared against ``capacity_bytes``: the tighter
+    of the admission line and the prefill safety cap, raised by
+    ``hot_cache_credit_bytes`` in the gate checks. Those lines subtract the
+    hot-cache reservation and rise as the eviction ladder releases cold
+    blocks (#4252), so the gate credits what would be released for the
+    request; the hint never does. ``max_viable_context_tokens`` is the
+    largest context plus max_tokens that fits under that same
+    ``capacity_bytes``, so it always agrees with ``fits_alone``.
     """
 
     required_bytes: int
@@ -242,7 +244,7 @@ class _CapacityEstimate:
 
     @property
     def fits_alone(self) -> bool:
-        return self.required_bytes - self.hot_cache_credit_bytes <= self.capacity_bytes
+        return self.required_bytes <= self.capacity_bytes
 
     def fields(self) -> dict[str, int]:
         return {
@@ -14881,19 +14883,22 @@ class Scheduler:
         an estimate there is no never-fits error, no fits-later wait, no solo
         admission and no capacity hint: the upstream current-usage preflight.
 
-        ``count_hot_cache`` (the gate checks) credits the hot cache that would
-        be released for the request when it is over the line otherwise, the
-        same credit upstream's route preflight counts (#4252), so a request
-        the hot cache can make room for is never a permanent never-fits 400.
+        ``count_hot_cache`` (the gate checks) raises the capacity line by the
+        hot cache that would be released for the request when it is over the
+        line otherwise. The line subtracts the hot-cache reservation, and
+        upstream's eviction ladder releases cold blocks and raises it (#4252),
+        so a request the released hot cache makes room for is never a
+        permanent never-fits 400. The 400 body reports that raised line and
+        the max viable context under it.
         """
         if not self._memory_scheduling_on():
             return None
         monitor = self.memory_monitor
         if monitor is None:
             return None
-        capacity = self._capacity_limit_bytes()
+        line = self._capacity_limit_bytes()
         weights = self._model_weights_bytes()
-        if capacity <= 0 or weights <= 0:
+        if line <= 0 or weights <= 0:
             return None
         if (
             self._admission_estimate(
@@ -14908,8 +14913,9 @@ class Scheduler:
         output = max(0, int(max_tokens or 0))
         required = self._required_alone_bytes(context + output, weights)
         credit = 0
-        if count_hot_cache and required > capacity:
+        if count_hot_cache and required > line:
             credit = self._capacity_hot_cache_credit(context)
+        capacity = line + credit
         return _CapacityEstimate(
             required_bytes=required,
             hot_cache_credit_bytes=credit,
@@ -15009,14 +15015,21 @@ class Scheduler:
             fmt=format_bytes,
             tail=["compact or shorten the context", "lower max_tokens"],
         )
+        hot_cache = (
+            f" (including {format_bytes(capacity.hot_cache_credit_bytes)} of "
+            "hot cache it would release)"
+            if capacity.hot_cache_credit_bytes > 0
+            else ""
+        )
         return (
             f"Request needs ~{format_bytes(capacity.required_bytes)} "
             f"(weights {format_bytes(capacity.weights_bytes)} + KV and "
             f"transient for {capacity.requested_context_tokens} context + "
             f"{capacity.requested_max_tokens} max tokens) but this model's "
             f"memory capacity under the {binding_str} ceiling is "
-            f"{format_bytes(capacity.capacity_bytes)} even with nothing else "
-            f"running; at most {capacity.max_viable_context_tokens} tokens of "
+            f"{format_bytes(capacity.capacity_bytes)}{hot_cache} even with "
+            f"nothing else running; at most "
+            f"{capacity.max_viable_context_tokens} tokens of "
             f"context plus max_tokens fit. {advice}."
         )
 
