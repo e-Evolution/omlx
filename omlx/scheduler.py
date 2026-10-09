@@ -13280,6 +13280,10 @@ class Scheduler:
         committed = table.num_tokens if table else 0
         self._prefill_states.pop(rid, None)
         self.prefilling = deque(r for r in self.prefilling if r.request_id != rid)
+        # Its committed blocks are resumed work, not a cache hit (#4383).
+        request.park_cache_hit_tokens = max(
+            0, (request.cached_tokens or 0) - request.prefill_resumed_tokens
+        )
         self._reset_request_for_reprefill(request)
         request.parked = True
         request.parked_at = time.monotonic()
@@ -14212,6 +14216,7 @@ class Scheduler:
         request.prompt_cache = None
         request.block_table = None
         request.cached_tokens = 0
+        request.prefill_resumed_tokens = 0
         request.shared_prefix_blocks = 0
         request.remaining_tokens = request.prompt_token_ids
         request.specprefill_indices = None
@@ -14920,6 +14925,11 @@ class Scheduler:
             # #2183/#2197 chunk-view and #2235 batch-KV-mutation fixes.
             with mx.stream(self._stream):
                 self._prepare_prefix_cache_for_request(request)
+            if request.park_cache_hit_tokens is not None:
+                # Blocks it committed before a park are resumed work (#4383).
+                request.prefill_resumed_tokens = max(
+                    0, (request.cached_tokens or 0) - request.park_cache_hit_tokens
+                )
             if request.parked:
                 self._finish_park_resume(request)
 

@@ -534,6 +534,9 @@ def test_a_deferred_request_releases_its_prefix_restore_and_readmits(
 
         def prepare(request):
             real_prepare(request)
+            if not restores:
+                # As a once-parked request's re-admission sets it (#4383).
+                request.prefill_resumed_tokens = 1
             restores.append(request.cached_tokens)
 
         monkeypatch.setattr(scheduler, "_prepare_prefix_cache_for_request", prepare)
@@ -552,6 +555,7 @@ def test_a_deferred_request_releases_its_prefix_restore_and_readmits(
         assert later.prompt_cache is None
         assert later.block_table is None
         assert later.cached_tokens == 0
+        assert later.prefill_resumed_tokens == 0
         assert rig.paged.get_block_table("later") is None
         assert "later" not in scheduler._prefix_cache_prepared
 

@@ -431,6 +431,63 @@ def test_resume_restores_the_committed_boundary_and_matches_an_uninterrupted_run
         rig.close()
 
 
+def test_a_resumed_park_reports_only_its_original_prefix_hit_as_cached(
+    tmp_path, mock_tokenizer
+):
+    """#4383: blocks the request committed itself are resumed work, not cache.
+
+    The re-admission lookup restores them (``cached_tokens`` counts every KV
+    token), but usage reports only what the first lookup found: none for a
+    cold prompt, through a second park as well.
+    """
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        old, young = prefill_two(rig)
+        assert young.cached_tokens == 0
+        for park in (1, 2):
+            rig.scheduler.request_park_prefill()
+            step(rig)
+            rig.drain()
+            assert young.parked and young.park_count == park
+            finish_ok_polls(rig, 3)
+            step_until(rig, lambda: "young" in prefilling_ids(rig))
+            assert young.cached_tokens >= park * BLOCK
+            assert young.prefill_resumed_tokens == young.cached_tokens
+            if park == 1:
+                step_until(rig, lambda: rig.table_tokens("young") >= 2 * BLOCK)
+        outputs = run_to_completion(rig, [old, young])
+        finished = [o for o in outputs if o.request_id == "young" and o.finished]
+        assert finished and not finished[-1].error
+        assert finished[-1].cached_tokens == 0
+    finally:
+        rig.close()
+
+
+def test_a_resumed_park_keeps_a_genuine_prefix_hit_as_cached(tmp_path, mock_tokenizer):
+    rig = make_rig(tmp_path, mock_tokenizer)
+    try:
+        warm = submit(rig, "warm", PROMPT_B[: 3 * BLOCK + 1], arrival=0.5)
+        run_to_completion(rig, [warm])
+        old, young = prefill_two(rig)
+        hit = young.cached_tokens
+        assert hit >= 2 * BLOCK
+        step_until(rig, lambda: rig.table_tokens("young") >= hit + BLOCK)
+        rig.scheduler.request_park_prefill()
+        step(rig)
+        rig.drain()
+        assert young.parked
+        finish_ok_polls(rig, 3)
+        step_until(rig, lambda: "young" in prefilling_ids(rig))
+        assert young.cached_tokens >= hit + BLOCK
+        assert young.prefill_resumed_tokens == young.cached_tokens - hit
+        outputs = run_to_completion(rig, [old, young])
+        finished = [o for o in outputs if o.request_id == "young" and o.finished]
+        assert finished and not finished[-1].error
+        assert finished[-1].cached_tokens == hit
+    finally:
+        rig.close()
+
+
 def test_the_cold_retry_guard_is_bypassed_for_a_parked_request(
     tmp_path, mock_tokenizer
 ):
