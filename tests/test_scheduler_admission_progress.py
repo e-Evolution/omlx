@@ -374,6 +374,7 @@ def test_a_deferred_head_waits_under_the_long_bound(pressured, clock):
         admitted_ids=frozenset({"run"}),
         free_bytes=None,
         retry_at=clock.now + 10_000,
+        store_jobs=0,
     )
     assert _schedule(scheduler) == []
     clock.advance(scheduler._MEMORY_ADMISSION_STALL_TIMEOUT_S * 3)
