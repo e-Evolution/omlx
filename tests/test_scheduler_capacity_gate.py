@@ -207,6 +207,22 @@ def test_fits_alone_but_not_now_on_an_idle_scheduler_keeps_the_old_rejection(gat
     assert not isinstance(info.value, ContextExceedsCapacityError)
 
 
+def test_fits_alone_but_not_now_waits_while_a_finished_requests_store_drains(gated):
+    """R3: right after a request finishes, the store-cache pipeline still owns
+    its KV, so the reading still holds it. That memory comes back when the
+    write drains, so the request waits (route and in-stream share this)."""
+    scheduler, usage, admitted = gated
+    usage[0] = 99 * GB
+    admitted[0] = 0
+    gate = scheduler_module._StoreCacheGate(cap=3)
+    gate.note_submitted()
+    scheduler._store_cache_gate = gate
+    scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+    gate.note_done()  # drained: nothing comes back any more
+    with pytest.raises(PrefillMemoryExceededError):
+        scheduler.preflight_or_raise(num_prompt_tokens=50_000, max_tokens=1_000)
+
+
 def test_unknown_capacity_keeps_the_old_rejection(gated):
     scheduler, usage, admitted = gated
     scheduler._weights_bytes = None  # MagicMock model: weights unknown

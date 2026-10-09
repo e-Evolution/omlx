@@ -341,6 +341,8 @@ class _DeferredAdmissionWait:
     retry_at: float
     free_bytes: int | None
     admitted_ids: frozenset[str]
+    # Post-completion store jobs still owning a finished request's KV.
+    store_jobs: int = 0
 
 
 @dataclass
@@ -13721,6 +13723,9 @@ class Scheduler:
         """Re-admission of a parked request: its fresh lookup holds the blocks."""
         self._unpin_parked(request.request_id)
         request.parked = False
+        # A park is a deliberate wait: eviction retries spent before it do not
+        # count against the re-admission (as after a fits-later wait).
+        request.prefill_eviction_retries = 0
         self._polls_since_park = None
         # One resume per hysteresis window: consume the ok streak.
         self._ok_polls = 0
@@ -14353,11 +14358,8 @@ class Scheduler:
 
         # A request resumed after an eviction pause keeps its prompt cache.
         # Capacity reserved there already holds part of the KV priced below.
-        current = max(
-            0,
-            self._current_usage_bytes()
-            - _reserved_spare_bytes(getattr(request, "prompt_cache", None)),
-        )
+        reserved = _reserved_spare_bytes(getattr(request, "prompt_cache", None))
+        current = max(0, self._current_usage_bytes() - reserved)
         est = self._admission_estimate(
             num_prompt_tokens=prompt_tokens,
             cached_tokens=cached_tokens,
@@ -14365,6 +14367,16 @@ class Scheduler:
         )
         if est is None:
             return None  # can't estimate, skip
+        reclaimed = self._remeasure_lone_head(capacity, est)
+        if reclaimed is not None:
+            current = max(0, reclaimed - reserved)
+            est = self._admission_estimate(
+                num_prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+                current=current,
+            )
+            if est is None:
+                return None
 
         hard_limit = self._admission_limit_bytes()
         peak = est.kv_exact + est.transient
@@ -14670,9 +14682,55 @@ class Scheduler:
 
     def _fits_later(self, capacity: "_CapacityEstimate | None") -> bool:
         """A request that fits alone waits instead of failing only while
-        admitted rows hold memory that comes back when they finish. Queued
-        requests hold none, so they never justify waiting."""
-        return capacity is not None and self._num_admitted_requests() > 0
+        memory that comes back is held: admitted rows (freed when they
+        finish) or a finished request's KV still owned by the store-cache
+        pipeline (freed when its write drains). Queued requests hold none,
+        so they never justify waiting."""
+        if capacity is None:
+            return False
+        return self._num_admitted_requests() > 0 or self._store_cache_jobs() > 0
+
+    def _store_cache_jobs(self) -> int:
+        """Post-completion store jobs that still own a finished request's KV.
+
+        The gate counts submissions until ``_drain_pending_async_removes``
+        drops the cache references; a deferred remove without a gate counts
+        too. Right after a request finishes this memory is still in the usage
+        reading (R3: re-checked 9 ms after the write-through was dispatched),
+        so a preflight charges it although it comes back."""
+        gate = getattr(self, "_store_cache_gate", None)
+        in_flight = gate.in_flight if gate is not None else 0
+        pending = len(getattr(self, "_pending_async_removes", None) or ())
+        return max(in_flight, pending)
+
+    def _remeasure_lone_head(
+        self,
+        capacity: "_CapacityEstimate | None",
+        est: "_AdmissionEstimate",
+    ) -> int | None:
+        """Usage after a reclaim, for a lone head the reading would refuse.
+
+        With nothing admitted, a request that fits alone and whose estimate is
+        over the admission line or the prefill safety cap may be priced on a
+        reading that lags a finished request's release: pooled Metal buffers
+        that only a reclaim returns (R3: 6.21 GB freed 0.1 s after such a
+        head was rejected). Nothing runs beside it, so the pool is cleared
+        here, on the scheduler thread, before any decision. None when the
+        head is not such a case (fork memory scheduling only: no capacity
+        estimate otherwise).
+        """
+        if capacity is None or not capacity.fits_alone:
+            return None
+        if self._num_admitted_requests():
+            return None
+        lines = [
+            v
+            for v in (self._admission_limit_bytes(), self._prefill_abort_cap())
+            if v > 0
+        ]
+        if not lines or est.estimated <= min(lines):
+            return None
+        return self._reclaim_prefill_headroom()
 
     def _release_deferred_admission(self, request: "Request") -> None:
         """Undo this admission attempt for a request that waits (fits later).
@@ -14724,24 +14782,59 @@ class Scheduler:
             retry_at=time.monotonic() + _deferred_admission_backoff_s(attempts),
             free_bytes=self._park_free_bytes(),
             admitted_ids=self._admitted_request_ids(),
+            store_jobs=self._store_cache_jobs(),
         )
+
+    def _deferred_wait_ended(self, wait: _DeferredAdmissionWait) -> bool:
+        """Whether memory a fits-later head waited on came back: a store write
+        it waited on drained, or a row it waited on left (finished, aborted
+        or paused). Measured against the recorded picture only, so a picture
+        refreshed by ``_end_deferred_wait`` does not end again by itself."""
+        if self._store_cache_jobs() < wait.store_jobs:
+            return True
+        return not wait.admitted_ids <= self._admitted_request_ids()
+
+    def _end_deferred_wait(self, head: "Request") -> None:
+        """Start a new admission attempt for a head whose wait ended.
+
+        Eviction retries spent while it waited (the ladder could not make
+        room beside the rows it waited on) do not count against the attempt
+        that follows: R3's head spent both beside a running request and was
+        then rejected as the lone head with no retry left. The record stays
+        (the head keeps its hold, e.g. behind a pending teardown), now holding
+        the current picture and a due retry, so the eviction pause that may
+        follow is neither held nor renewed again. A retry on backoff or a
+        free-memory rise beside the same rows keeps the spent budget (no
+        ladder pass on every retry).
+        """
+        wait = self._deferred_admissions.get(head.request_id)
+        if wait is None or not self._deferred_wait_ended(wait):
+            return
+        self._deferred_admissions[head.request_id] = _DeferredAdmissionWait(
+            attempts=wait.attempts,
+            retry_at=time.monotonic(),
+            free_bytes=wait.free_bytes,
+            admitted_ids=self._admitted_request_ids(),
+            store_jobs=self._store_cache_jobs(),
+        )
+        head.prefill_eviction_retries = 0
 
     def _deferred_admission_holds(self, head: "Request") -> bool:
         """Whether a deferred fits-later ``head`` waits instead of retrying.
 
-        It retries once the memory picture changed since it deferred: no row
-        is admitted any more (the fits-later wait no longer applies), a row
-        it waited on left (finished, aborted or paused), free memory rose by
-        more than ``DEFERRED_ADMISSION_FREE_DELTA_FRACTION`` of the admission
-        line, or its backoff expired. The record stays, so a new deferral
-        doubles the backoff.
+        It retries once nothing is admitted or draining any more (the
+        fits-later wait no longer applies), the memory it waited on came back
+        (see ``_deferred_wait_ended``), free memory rose by more than
+        ``DEFERRED_ADMISSION_FREE_DELTA_FRACTION`` of the admission line, or
+        its backoff expired. The record stays, so a new deferral doubles the
+        backoff.
         """
         wait = self._deferred_admissions.get(head.request_id)
         if wait is None:
             return False
-        if not self._num_admitted_requests():
+        if not self._num_admitted_requests() and not self._store_cache_jobs():
             return False
-        if not wait.admitted_ids <= self._admitted_request_ids():
+        if self._deferred_wait_ended(wait):
             return False
         free = self._park_free_bytes()
         if free is not None and wait.free_bytes is not None:
@@ -15322,6 +15415,7 @@ class Scheduler:
                 if stalled is not None:
                     rejected_outputs.append(stalled)
                 break
+            self._end_deferred_wait(self.waiting[0])
 
             admitted = self._num_admitted_requests()
             if self._admission_paused and admitted:
