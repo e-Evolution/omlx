@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the pure logic of benchmarks/unattended (no servers)."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -3034,3 +3035,358 @@ class TestC7TextOnlyDivergence:
             },
         }
         assert bm.classify_c7_identity(rows, 2) == "identity_tokens_ok"
+
+
+# --------------------------------------------------------------------------
+# R3: venv source runs (web UI package, plain settings) and packed-prefill park
+# --------------------------------------------------------------------------
+
+
+def _web_tree(root):
+    src = _source_tree(root)
+    (src / "apps" / "omlx-web" / "omlx_web").mkdir(parents=True)
+    (src / "apps" / "omlx-web" / "omlx_web" / "__init__.py").write_text("")
+    return src
+
+
+class TestSourceRuntimeWebUi:
+    """#4359 split the web UI into apps/omlx-web (package omlx_web)."""
+
+    def test_pythonpath_adds_the_web_ui_package_of_the_tree(self, tmp_path):
+        src = _web_tree(tmp_path / "src")
+        env = bp.source_runtime_env({"PYTHONPATH": "/elsewhere"}, src)
+        assert env["PYTHONPATH"] == f"{src}{os.pathsep}{src / 'apps' / 'omlx-web'}"
+
+    def test_a_tree_without_the_split_keeps_only_the_tree(self, tmp_path):
+        src = _source_tree(tmp_path / "src")
+        assert bp.source_runtime_env({}, src)["PYTHONPATH"] == str(src)
+
+    def test_probe_reports_the_web_ui_package(self):
+        assert "omlx_web" in bp._IMPORT_PROBE
+
+    def test_verify_refuses_a_web_ui_package_from_another_tree(self, tmp_path):
+        import json
+        import subprocess
+
+        src = _web_tree(tmp_path / "src")
+        other = tmp_path / "old" / "omlx_web" / "__init__.py"
+
+        def fake_run(cmd, **kw):
+            out = {
+                "omlx": str(src / "omlx" / "__init__.py"),
+                "omlx_web": str(other),
+                "versions": {},
+            }
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(out), "")
+
+        with pytest.raises(RuntimeError, match="omlx_web"):
+            bp.verify_source_import(Path("/v/bin/python"), src, {}, run=fake_run)
+
+    def test_verify_accepts_the_tree_web_ui_package(self, tmp_path):
+        import json
+        import subprocess
+
+        src = _web_tree(tmp_path / "src")
+        web = src / "apps" / "omlx-web" / "omlx_web" / "__init__.py"
+
+        def fake_run(cmd, **kw):
+            out = {"omlx": str(src / "omlx" / "__init__.py"), "omlx_web": str(web), "versions": {}}
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(out), "")
+
+        probe = bp.verify_source_import(Path("/v/bin/python"), src, {}, run=fake_run)
+        assert probe["omlx_web"] == str(web)
+
+
+REAL_LIKE_SETTINGS = {
+    "server": {"port": 8001, "mid_system_policy": "inline_note", "thinking_retention_guard_tokens": 20000,
+               "log_level": "info"},
+    "memory": {"memory_guard_tier": "aggressive", "mlx_cache_limit_gb": 16.0, "memory_scheduling": "on",
+               "hard_threshold": 0.95},
+    "scheduler": {
+        "max_concurrent_requests": 5,
+        "chunked_prefill": True,
+        "prefill_progress_commit_blocks": 4,
+        "memory_pressure_park": True,
+        "max_parks_per_request": 3,
+        "max_decode_pauses_per_request": 8,
+        "admission_no_progress_timeout_s": 600.0,
+        "park_resume_ok_polls": 3,
+        "max_batched_decode_context_tokens": 0,
+        "batched_decode_hold_max_s": 120.0,
+        "memory_abort_single_victim": True,
+        "media_text_suffix_chunked": True,
+    },
+    "cache": {"enabled": True, "hot_cache_max_size": "32GB"},
+    "auth": {"api_key": "secret"},
+}
+
+FORK_KEYS = {
+    "server": {"mid_system_policy", "thinking_retention_guard_tokens"},
+    "memory": {"mlx_cache_limit_gb", "memory_scheduling"},
+    "scheduler": {
+        "prefill_progress_commit_blocks",
+        "memory_pressure_park",
+        "max_parks_per_request",
+        "max_decode_pauses_per_request",
+        "admission_no_progress_timeout_s",
+        "park_resume_ok_polls",
+        "max_batched_decode_context_tokens",
+        "batched_decode_hold_max_s",
+        "memory_abort_single_victim",
+        "media_text_suffix_chunked",
+    },
+}
+
+
+class TestPlainSettings:
+    """OMLX_BENCH_PLAIN_SETTINGS=1: a fork-family runtime with no fork settings (main)."""
+
+    def test_flag_parsing(self):
+        assert bp.bench_plain_settings({}) is False
+        for v in ("1", "true", " On ", "yes"):
+            assert bp.bench_plain_settings({"OMLX_BENCH_PLAIN_SETTINGS": v}) is True
+        assert bp.bench_plain_settings({"OMLX_BENCH_PLAIN_SETTINGS": "0"}) is False
+
+    def test_plain_build_strips_every_fork_key_and_keeps_the_rest(self):
+        s = bp.build_settings(REAL_LIKE_SETTINGS, "fork", 8002, "/c", 3, {}, plain=True)
+        for section, keys in FORK_KEYS.items():
+            assert not (keys & set(s[section])), (section, keys & set(s[section]))
+        assert s["scheduler"]["chunked_prefill"] is True
+        assert s["memory"]["hard_threshold"] == 0.95
+        assert s["cache"]["hot_cache_max_size"] == "32GB"
+        assert s["scheduler"]["max_concurrent_requests"] == 3
+
+    def test_upstream_strips_the_same_keys(self):
+        s = bp.build_settings(REAL_LIKE_SETTINGS, "upstream", 8002, "/c", 3, {})
+        for section, keys in FORK_KEYS.items():
+            assert not (keys & set(s[section]))
+
+    def test_plain_server_has_no_fork_feature_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OMLX_BENCH_PLAIN_SETTINGS", "1")
+        srv = bp.Server("fork", "C7", 8002, 3, tmp_path, False)
+        assert srv.plain is True
+        assert not (set(bp.FORK_ON_ENV) & set(srv.env))
+        assert srv.runtime_info()["plain_settings"] is True
+
+    def test_plain_p3_does_not_set_the_fork_batched_gate(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OMLX_BENCH_PLAIN_SETTINGS", "1")
+        srv = bp.Server("fork", "P3", 8002, 3, tmp_path, False)
+        assert "OMLX_MAX_BATCHED_DECODE_CONTEXT_TOKENS" not in srv.env
+
+    def test_default_server_is_not_plain(self, tmp_path):
+        srv = bp.Server("fork", "C7", 8002, 3, tmp_path, False)
+        assert srv.plain is False
+        assert srv.env["OMLX_MEMORY_PRESSURE_PARK"] == "true"
+
+    def test_setup_record_of_the_derived_settings_has_no_secrets(self):
+        rec = bp.settings_record(REAL_LIKE_SETTINGS)
+        assert set(rec) == {"server", "memory", "scheduler", "cache"}
+        assert rec["scheduler"]["prefill_progress_commit_blocks"] == 4
+        assert "auth" not in rec
+
+
+PP_LOG = """\
+2026-10-09 10:00:00,000 - omlx.scheduler - DEBUG - [-] - [memcheck:chunked_step] rid=rid-a n=1024 processed=1024/130000 current=30.000GB soft=30.800GB hard=35.200GB OVER_SOFT
+2026-10-09 10:00:01,000 - omlx.scheduler - DEBUG - [-] - [memcheck:packed_step] rid=rid-a,rid-b n=1024 processed=90000/130000 current=33.000GB soft=30.800GB hard=35.200GB OVER_SOFT
+2026-10-09 10:00:02,000 - omlx.scheduler - DEBUG - [-] - [memcheck:packed_step] rid=rid-a,rid-b n=1024 processed=91000/130000 current=35.500GB soft=30.800GB hard=35.200GB OVER_HARD
+2026-10-09 10:00:02,500 - omlx.process_memory_enforcer - INFO - [-] - Memory pressure level: soft -> hard (current=35.5GB, soft=30.8GB, hard=35.2GB, ceiling=44.0GB)
+2026-10-09 10:00:03,000 - omlx.scheduler - INFO - [-] - Parked request rid-b at 81920 tokens committed (park 1/3), reason: memory pressure
+2026-10-09 10:01:00,000 - omlx.scheduler - INFO - [-] - Resuming parked request rid-b: need 12.0 GB fits in free 14.0 GB
+2026-10-09 10:01:01,000 - omlx.scheduler - INFO - [-] - Resumed parked request rid-b: cached=81920
+"""
+
+
+class TestPackedParkEvidence:
+    def test_packed_steps_parse_rows_and_size(self):
+        steps = bm.parse_packed_steps(PP_LOG)
+        assert len(steps) == 2
+        assert steps[0]["rids"] == ["rid-a", "rid-b"] and steps[0]["n"] == 1024
+        assert steps[1]["over_hard"] is True
+
+    def test_park_of_a_row_in_the_last_packed_step_counts_as_during_packing(self):
+        ev = bm.packed_park_evidence(PP_LOG)
+        assert ev["packed_steps"] == 2
+        assert ev["max_rows"] == 2
+        assert ev["parks"] == 1 and ev["resumes"] == 1
+        assert ev["parks_during_packing"] == ["rid-b"]
+        assert ev["resumed_after_packed_park"] == ["rid-b"]
+
+    def test_park_of_a_row_that_never_packed_does_not_count(self):
+        log = PP_LOG.replace("Parked request rid-b", "Parked request rid-z").replace(
+            "Resumed parked request rid-b", "Resumed parked request rid-z"
+        )
+        ev = bm.packed_park_evidence(log)
+        assert ev["parks"] == 1
+        assert ev["parks_during_packing"] == []
+
+    def test_a_park_before_any_packed_step_does_not_count(self):
+        park = PP_LOG.splitlines()[4]
+        log = park.replace("10:00:03", "09:59:59") + "\n" + PP_LOG
+        ev = bm.packed_park_evidence(log)
+        assert ev["parks"] == 2
+        assert ev["parks_during_packing"] == ["rid-b"]
+
+
+def _pp_summary(**over):
+    s = {
+        "aborted_requests": 0,
+        "packed": {"packed_steps": 5, "parks": 1, "resumes": 1, "parks_during_packing": ["r"],
+                   "resumed_after_packed_park": ["r"]},
+        "identity": {"checked": 2, "identical": 2, "bug": 0},
+        "long_completed": 2,
+    }
+    s.update(over)
+    return s
+
+
+class TestClassifyPackedPark:
+    def test_ok(self):
+        assert bm.classify_packed_park(_pp_summary()) == "packed_park_ok"
+
+    def test_aborts_first(self):
+        assert bm.classify_packed_park(_pp_summary(aborted_requests=1)) == "aborts"
+
+    def test_no_packing(self):
+        s = _pp_summary(packed={"packed_steps": 0, "parks": 1, "resumes": 1,
+                                "parks_during_packing": [], "resumed_after_packed_park": []})
+        assert bm.classify_packed_park(s) == "no_packing"
+
+    def test_no_park(self):
+        s = _pp_summary(packed={"packed_steps": 3, "parks": 0, "resumes": 0,
+                                "parks_during_packing": [], "resumed_after_packed_park": []})
+        assert bm.classify_packed_park(s) == "no_park"
+
+    def test_park_outside_packing(self):
+        s = _pp_summary(packed={"packed_steps": 3, "parks": 1, "resumes": 1,
+                                "parks_during_packing": [], "resumed_after_packed_park": []})
+        assert bm.classify_packed_park(s) == "park_not_during_packing"
+
+    def test_not_resumed(self):
+        s = _pp_summary(packed={"packed_steps": 3, "parks": 1, "resumes": 0,
+                                "parks_during_packing": ["r"], "resumed_after_packed_park": []})
+        assert bm.classify_packed_park(s) == "parked_not_resumed"
+
+    def test_identity_must_cover_both_long_prompts(self):
+        s = _pp_summary(identity={"checked": 2, "identical": 1, "bug": 0})
+        assert bm.classify_packed_park(s) == "identity_diverged"
+        s = _pp_summary(identity={"checked": 0, "identical": 0, "bug": 0})
+        assert bm.classify_packed_park(s) == "identity_missing"
+
+
+class TestPackedParkDefaults:
+    def test_defaults(self):
+        d = bm.c7_defaults("packed-park")
+        assert d["requests"] == 2
+        assert d["ceiling_gb"] == 44.0 and d["hard_threshold"] == 0.8
+        assert d["max_tokens"] == 256
+        assert d["contender_tokens"] > 0 and d["contender_max_tokens"] > 0
+        assert d["contender_lead_s"] > 0
+
+    def test_registered(self):
+        assert "packed-park" in bp.C7_SCENARIOS
+
+
+class TestScenarioPackedPark:
+    def _ctx(self, tmp_path, refs_only=False, log=PP_LOG, fail=()):
+        import argparse
+        import asyncio
+
+        calls = []
+        starts = []
+
+        class Srv:
+            base_url = "http://x"
+            dump_dir = None
+            out = tmp_path
+
+            def log_size(self):
+                return 0
+
+            def log_since(self, off):
+                return log
+
+            def headers(self):
+                return {}
+
+        class Corpus:
+            def prompt(self, seed, n):
+                return f"PROMPT[{seed}:{n}]"
+
+        class Ctx:
+            server = Srv()
+            corpus = Corpus()
+            client = None
+            args = argparse.Namespace(
+                c7_scenario="packed-park",
+                c7_requests=2,
+                c7_stagger_s=0.0,
+                c7_max_tokens=256,
+                c7_no_identity=False,
+                c7_refs_only=refs_only,
+                c7_refs_from=None,
+                c7_contender_tokens=8000,
+                c7_contender_max_tokens=6000,
+                c7_contender_lead_s=0.0,
+                p7_ceiling_gb=44.0,
+                settle_s=0.0,
+                smoke=False,
+            )
+
+            def n(self, nominal):
+                return nominal
+
+            def mt(self, nominal):
+                return nominal
+
+            def seed(self, *parts):
+                return "|".join(map(str, parts))
+
+            async def chat(self, prompt, max_tokens, sampling=None, **kw):
+                name = kw["name"]
+                calls.append((name, prompt, max_tokens, sampling))
+                starts.append(name)
+                ptok = {"req0": 130000, "req1": 115000}.get(name, 8000)
+                return _c7req(name, ptok, ok=name not in fail, text="alpha beta")
+
+        return Ctx(), calls, asyncio
+
+    def test_refs_only_runs_each_long_prompt_alone_without_contender(self, tmp_path):
+        ctx, calls, asyncio = self._ctx(tmp_path, refs_only=True, log="")
+        sc = asyncio.run(bp.scenario_c7(ctx))
+        assert [c[0] for c in calls] == ["req0", "req1"]
+        assert all(c[2] == 256 and c[3] == bp.SAMPLING_GREEDY for c in calls)
+        assert sc["summary"]["verdict"] == "refs_ok"
+        assert (tmp_path / "references.json").exists()
+
+    def test_pressure_run_starts_the_contender_first_then_both_long_prompts(self, tmp_path):
+        ctx, calls, asyncio = self._ctx(tmp_path, refs_only=True, log="")
+        asyncio.run(bp.scenario_c7(ctx))  # references.json in tmp_path
+        ctx2, calls2, _ = self._ctx(tmp_path)
+        ctx2.args.c7_refs_from = str(tmp_path)
+        sc = asyncio.run(bp.scenario_c7(ctx2))
+        names = [c[0] for c in calls2]
+        assert names[0] == "contender" and sorted(names[1:]) == ["req0", "req1"]
+        contender = calls2[0]
+        assert contender[2] == 6000 and contender[3] == bp.SAMPLING_GREEDY
+        assert "8000" in contender[1]
+        # The long prompts are the reference prompts.
+        assert {c[1] for c in calls2[1:]} == {c[1] for c in calls}
+        sm = sc["summary"]
+        assert sm["packed"]["parks_during_packing"] == ["rid-b"]
+        assert sm["identity"]["checked"] == 2 and sm["identity"]["identical"] == 2
+        assert sm["verdict"] == "packed_park_ok"
+        assert bp.scenario_ok("C7", sc) is True
+
+    def test_a_failed_long_prompt_fails_the_scenario(self, tmp_path):
+        ctx, _, asyncio = self._ctx(tmp_path, refs_only=True, log="")
+        asyncio.run(bp.scenario_c7(ctx))
+        ctx2, _, _ = self._ctx(tmp_path, fail={"req1"})
+        ctx2.args.c7_refs_from = str(tmp_path)
+        sc = asyncio.run(bp.scenario_c7(ctx2))
+        assert sc["summary"]["verdict"] == "aborts"
+        assert bp.scenario_ok("C7", sc) is False
+
+    def test_pressure_run_needs_references(self, tmp_path):
+        ctx, _, asyncio = self._ctx(tmp_path)
+        with pytest.raises(ValueError, match="refs"):
+            asyncio.run(bp.scenario_c7(ctx))

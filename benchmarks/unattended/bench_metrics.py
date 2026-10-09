@@ -810,6 +810,21 @@ C7_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_tokens": 2000,
         "requests": 3,
     },
+    # R3: two long prompts prefill together (packed prefill, upstream #4361)
+    # while a short contender decodes: decode contention is what makes the
+    # scheduler share one forward between them. At 44 GB (hard line 35.2 GB)
+    # each prompt fits alone, but their KV together crosses the line late in
+    # the prefill, so a park and resume happens while the rows are packed.
+    "packed-park": {
+        "ceiling_gb": 44.0,
+        "hard_threshold": 0.8,
+        "stagger_s": 0.5,
+        "max_tokens": 256,
+        "requests": 2,
+        "contender_tokens": 8000,
+        "contender_max_tokens": 6000,
+        "contender_lead_s": 5.0,
+    },
 }
 
 
@@ -826,6 +841,9 @@ def classify_c7(scenario: str, s: dict[str, Any]) -> str:
     if scenario == "identity":
         # Set by the scenario from classify_c7_identity (or the refs verdict).
         return "identity_pending"
+    if scenario == "packed-park":
+        # Set by the scenario from classify_packed_park (or the refs verdict).
+        return "packed_park_pending"
     if scenario not in ("decode", "image-decode", "image-prefill"):
         raise ValueError(f"unknown C7 scenario: {scenario!r}")
     if s.get("aborted_requests", 0) > 0:
@@ -1027,6 +1045,103 @@ def classify_c7_identity(rows: dict[str, dict[str, Any]], expected: int) -> str:
     if after and all(c == "noise" for c in classes) and len(after) == len(diverged):
         return "identity_noise"
     return "identity_inconclusive"
+
+
+# --------------------------------------------------------------------------
+# R3: packed-prefill park (upstream #4361 packed prefill under park pressure)
+# --------------------------------------------------------------------------
+# scheduler.py _check_post_prefill_memory logs (DEBUG, only above the soft
+# watermark) "[memcheck:packed_step] rid=<a>,<b> ..." after a forward that
+# packed several prefill rows, "[memcheck:chunked_step] rid=<a> ..." after a
+# single-row chunk. The server must run with log level debug for these.
+_RE_MEMCHECK = re.compile(
+    r"\[memcheck:(packed_step|chunked_step)\] rid=(\S+) n=(\d+) "
+    r"processed=(\d+)/(\d+) current=([\d.]+)GB .* (OVER_HARD|OVER_SOFT)"
+)
+
+
+def parse_packed_steps(text: str) -> list[dict[str, Any]]:
+    """Packed prefill forwards seen in a DEBUG server log, in order."""
+    out: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        m = _RE_MEMCHECK.search(line)
+        if not m or m.group(1) != "packed_step":
+            continue
+        out.append(
+            {
+                "ts": _log_ts(line),
+                "rids": m.group(2).split(","),
+                "n": int(m.group(3)),
+                "processed": int(m.group(4)),
+                "total": int(m.group(5)),
+                "current_gb": float(m.group(6)),
+                "over_hard": m.group(7) == "OVER_HARD",
+            }
+        )
+    return out
+
+
+def packed_park_evidence(text: str) -> dict[str, Any]:
+    """Did a prefill park hit a row while it was packed with another one?
+
+    A park counts as during packing when the parked request is a row of the
+    last packed forward logged before the park line. A resume counts when a
+    "Resumed parked request" line for that request follows its park.
+    """
+    steps: list[dict[str, Any]] = []
+    parks: list[dict[str, Any]] = []
+    resumes: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        m = _RE_MEMCHECK.search(line)
+        if m and m.group(1) == "packed_step":
+            steps.extend(parse_packed_steps(line))
+            continue
+        m = _RE_EV_PARKED.search(line)
+        if m:
+            last = steps[-1]["rids"] if steps else []
+            parks.append({"rid": m.group(1), "during_packing": m.group(1) in last})
+            continue
+        m = _RE_EV_RESUMED.search(line)
+        if m:
+            resumes.append({"rid": m.group(1), "after": [p["rid"] for p in parks]})
+    during = [p["rid"] for p in parks if p["during_packing"]]
+    resumed = [
+        rid
+        for rid in dict.fromkeys(during)
+        if any(r["rid"] == rid and rid in r["after"] for r in resumes)
+    ]
+    return {
+        "packed_steps": len(steps),
+        "max_rows": max((len(s["rids"]) for s in steps), default=0),
+        "packed_rids": sorted({rid for s in steps for rid in s["rids"]}),
+        "packed_over_hard": sum(1 for s in steps if s["over_hard"]),
+        "parks": len(parks),
+        "resumes": len(resumes),
+        "parks_during_packing": during,
+        "resumed_after_packed_park": resumed,
+    }
+
+
+def classify_packed_park(s: dict[str, Any]) -> str:
+    """One-word outcome of the packed-park scenario (summary + packed evidence)."""
+    if s.get("aborted_requests", 0) > 0:
+        return "aborts"
+    p = s.get("packed") or {}
+    if not p.get("packed_steps"):
+        return "no_packing"
+    if not p.get("parks"):
+        return "no_park"
+    if not p.get("parks_during_packing"):
+        return "park_not_during_packing"
+    if len(p.get("resumed_after_packed_park") or []) < len(set(p["parks_during_packing"])):
+        return "parked_not_resumed"
+    ident = s.get("identity") or {}
+    expected = s.get("long_completed", 0)
+    if not ident.get("checked") or ident["checked"] < expected:
+        return "identity_missing"
+    if ident.get("identical", 0) < ident["checked"]:
+        return "identity_diverged"
+    return "packed_park_ok"
 
 
 def p7_default_ceiling_gb(

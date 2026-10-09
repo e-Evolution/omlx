@@ -95,17 +95,26 @@ P3_PHASES = ("cold", "alone_restored", "batched")
 # Controls run after the comparison: B=1 restored again (run-to-run
 # determinism) and B=1 forced through the ragged B>1 attention kernel.
 P3_CONTROL_PHASES = ("alone_restored2", "ragged_b1")
-# settings.json keys that only exist in the fork (stripped for upstream).
+# settings.json keys that only exist in the fork (stripped for upstream and
+# for plain-settings runs of a source tree, OMLX_BENCH_PLAIN_SETTINGS).
 FORK_ONLY_SETTINGS = {
     "scheduler": [
         "prefill_progress_commit_blocks",
         "memory_pressure_park",
         "max_parks_per_request",
+        "max_decode_pauses_per_request",
+        "admission_no_progress_timeout_s",
         "park_resume_ok_polls",
         "max_batched_decode_context_tokens",
+        "batched_decode_hold_max_s",
+        "memory_abort_single_victim",
+        "media_text_suffix_chunked",
     ],
-    "memory": ["mlx_cache_limit_gb"],
+    "memory": ["mlx_cache_limit_gb", "memory_scheduling"],
+    "server": ["mid_system_policy", "thinking_retention_guard_tokens"],
 }
+# Sections of the derived settings.json copied into each run record.
+SETTINGS_RECORD_SECTIONS = ("server", "memory", "scheduler", "cache")
 
 SAMPLING_DEFAULT = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
 SAMPLING_GREEDY = {"temperature": 0.0, "top_p": 1.0, "top_k": 1}
@@ -167,7 +176,26 @@ def bench_fork_repo(environ: Any = None) -> Path:
     return path
 
 
+def bench_plain_settings(environ: Any = None) -> bool:
+    """``OMLX_BENCH_PLAIN_SETTINGS``: serve a fork-family variant with no fork
+    settings (no fork feature env, fork-only settings.json keys stripped), for
+    a source tree that is not the fork (upstream ``main``)."""
+    raw = (environ if environ is not None else os.environ).get(
+        "OMLX_BENCH_PLAIN_SETTINGS", ""
+    )
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def settings_record(settings: dict[str, Any]) -> dict[str, Any]:
+    """The derived settings.json sections a run used (no auth, no secrets)."""
+    return {
+        k: copy.deepcopy(settings.get(k, {})) for k in SETTINGS_RECORD_SECTIONS
+    }
+
+
 LIVE_APP_PORT = 8001
+# The web UI package moved to <tree>/apps/omlx-web (upstream #4359).
+WEB_UI_DIR = Path("apps") / "omlx-web"
 _IMPORT_PROBE = (
     "import importlib.metadata as md, json, omlx\n"
     "v = {}\n"
@@ -176,7 +204,12 @@ _IMPORT_PROBE = (
     "        v[d] = md.version(d)\n"
     "    except md.PackageNotFoundError:\n"
     "        v[d] = None\n"
-    "print(json.dumps({'omlx': omlx.__file__, 'versions': v}))\n"
+    "try:\n"
+    "    import omlx_web\n"
+    "    web = omlx_web.__file__\n"
+    "except ImportError:\n"
+    "    web = None\n"
+    "print(json.dumps({'omlx': omlx.__file__, 'omlx_web': web, 'versions': v}))\n"
 )
 
 
@@ -205,9 +238,13 @@ def bench_source_runtime(environ: Any = None) -> tuple[Path, Path] | None:
 
 
 def source_runtime_env(base: dict[str, str], source: Path) -> dict[str, str]:
-    """Server env for the venv runtime: only ``source`` on PYTHONPATH."""
+    """Server env for the venv runtime: only ``source`` (and its web UI
+    package dir, when the tree has one) on PYTHONPATH."""
     env = {k: v for k, v in base.items() if k != "PYTHONHOME"}
-    env["PYTHONPATH"] = str(source)
+    paths = [str(source)]
+    if (source / WEB_UI_DIR).is_dir():
+        paths.append(str(source / WEB_UI_DIR))
+    env["PYTHONPATH"] = os.pathsep.join(paths)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
@@ -233,6 +270,11 @@ def verify_source_import(
     got = Path(probe["omlx"]).resolve()
     if not got.is_relative_to(source / "omlx"):
         raise RuntimeError(f"{python} imports omlx from {got}, not from {source}")
+    web_dir = source / WEB_UI_DIR / "omlx_web"
+    if web_dir.is_dir():
+        web = probe.get("omlx_web")
+        if not web or not Path(web).resolve().is_relative_to(web_dir.resolve()):
+            raise RuntimeError(f"{python} imports omlx_web from {web}, not from {web_dir}")
     return probe
 
 
@@ -283,8 +325,13 @@ def build_settings(
     cache_dir: str,
     max_concurrent: int,
     env: dict[str, str],
+    plain: bool = False,
 ) -> dict[str, Any]:
-    """Derive an isolated settings.json from a copy of the real one."""
+    """Derive an isolated settings.json from a copy of the real one.
+
+    ``plain`` (and ``upstream``) strip every fork-only key: the server then
+    runs on its own built-in defaults for them.
+    """
     s = copy.deepcopy(real)
     s.setdefault("server", {})["port"] = port
     s["server"]["auto_start_on_launch"] = True
@@ -293,7 +340,7 @@ def build_settings(
     s.setdefault("memory", {})["memory_guard_tier"] = "aggressive"
     s["memory"]["prefill_memory_guard"] = True
     s.setdefault("scheduler", {})["max_concurrent_requests"] = max_concurrent
-    if variant == "upstream":
+    if variant == "upstream" or plain:
         for section, keys in FORK_ONLY_SETTINGS.items():
             for key in keys:
                 s.get(section, {}).pop(key, None)
@@ -397,7 +444,9 @@ class Server:
         tag = f"{variant}-{premise}"
         self.base = BENCH_BASE_ROOT / tag
         self.cache_dir = f"{CACHE_ROOT}/{tag}"
-        self.env = variant_env(variant, premise, batched_limit)
+        # Plain settings: a fork-family runtime serving a non-fork tree.
+        self.plain = variant != "upstream" and bench_plain_settings()
+        self.env = {} if self.plain else variant_env(variant, premise, batched_limit)
         if variant != "upstream":
             self.env.update(bench_extra_env())
         self.env.update(debug_env(variant, premise, self.base))
@@ -427,7 +476,13 @@ class Server:
         self._rmtree_guarded(self.cache_dir, [CACHE_ROOT])
         Path(self.cache_dir).mkdir(parents=True)
         self.settings = build_settings(
-            real, self.variant, self.port, self.cache_dir, self.max_concurrent, self.env
+            real,
+            self.variant,
+            self.port,
+            self.cache_dir,
+            self.max_concurrent,
+            self.env,
+            plain=self.plain,
         )
         if self.settings_override:
             self.settings = bm.deep_merge(self.settings, self.settings_override)
@@ -495,9 +550,11 @@ class Server:
 
     def runtime_info(self) -> dict[str, Any]:
         """Which interpreter and omlx sources serve this variant (run record)."""
+        plain = {"plain_settings": self.plain}
         if self.source_runtime is not None:
             python, source = self.source_runtime
             return {
+                **plain,
                 "mode": "source-venv",
                 "python": str(python),
                 "source": str(source),
@@ -508,10 +565,10 @@ class Server:
                 "probe": self.runtime_probe,
             }
         if self.variant == "upstream":
-            return {"mode": "app", "cli": str(UPSTREAM_CLI)}
+            return {**plain, "mode": "app", "cli": str(UPSTREAM_CLI)}
         if os.environ.get("OMLX_BENCH_FORK_RUNTIME", "app") == "venv":
-            return {"mode": "venv", "cli": str(FORK_BIN)}
-        return {"mode": "app-overlay", "source": str(bench_fork_repo())}
+            return {**plain, "mode": "venv", "cli": str(FORK_BIN)}
+        return {**plain, "mode": "app-overlay", "source": str(bench_fork_repo())}
 
     def pids(self) -> list[int]:
         if self.proc is None:
@@ -1126,7 +1183,17 @@ async def scenario_p7(ctx: Ctx) -> dict[str, Any]:
     }
 
 
-C7_SCENARIOS = ("decode", "image-decode", "image-prefill", "never-fits", "identity")
+C7_SCENARIOS = (
+    "decode",
+    "image-decode",
+    "image-prefill",
+    "never-fits",
+    "identity",
+    "packed-park",
+)
+# The packed-park contender must still be decoding while the long prompts
+# prefill: a copy task keeps a greedy reply long.
+C7_CONTENDER_SUFFIX = "\n\nThen reproduce the code above exactly, line by line, from the first line to the last."
 FORCE_DECODE_PAUSE_ENV = "OMLX_DEBUG_FORCE_DECODE_PAUSE_AT"
 
 
@@ -1170,9 +1237,12 @@ def resolve_c7_args(args: argparse.Namespace) -> argparse.Namespace:
         ("c7_stagger_s", "stagger_s"),
         ("c7_max_tokens", "max_tokens"),
         ("c7_requests", "requests"),
+        ("c7_contender_tokens", "contender_tokens"),
+        ("c7_contender_max_tokens", "contender_max_tokens"),
+        ("c7_contender_lead_s", "contender_lead_s"),
     ):
         if getattr(args, attr, None) is None:
-            setattr(args, attr, d[key])
+            setattr(args, attr, d.get(key))
     return args
 
 
@@ -1526,6 +1596,100 @@ async def _c7_never_fits(ctx: Ctx) -> dict[str, Any]:
     }
 
 
+async def _c7_packed_park(ctx: Ctx) -> dict[str, Any]:
+    """R3: a prefill park while two long prompts share packed forwards.
+
+    A short contender decodes first (decode contention makes the scheduler
+    pack prefill rows into one forward, upstream #4361), then the two long
+    prompts arrive together under the low ceiling. Each long prompt is
+    compared with its alone reference (``--c7-refs-only`` first, then
+    ``--c7-refs-from``). Packed forwards are read from the DEBUG
+    ``[memcheck:packed_step]`` lines, so the server needs log level debug.
+    """
+    a = ctx.args
+    mt = ctx.mt(a.c7_max_tokens)
+    count = max(1, min(a.c7_requests, len(P7_NOMINAL_TOKENS)))
+    prompts = [
+        ctx.corpus.prompt(ctx.seed("C7", "packed-park", i), ctx.n(P7_NOMINAL_TOKENS[i]))
+        for i in range(count)
+    ]
+    if getattr(a, "c7_refs_only", False):
+        return await _c7_refs_only(ctx, "packed-park", prompts, [], mt)
+    if not getattr(a, "c7_refs_from", None):
+        raise ValueError("C7 packed-park needs --c7-refs-from (run --c7-refs-only first)")
+    data = bm.load_c7_refs(Path(a.c7_refs_from) / "references.json")
+    contender_prompt = (
+        ctx.corpus.prompt(
+            ctx.seed("C7", "packed-park", "contender"), ctx.n(a.c7_contender_tokens)
+        )
+        + C7_CONTENDER_SUFFIX
+    )
+    dump_dir = ctx.server.dump_dir
+    before = bm.dump_listing(dump_dir) if dump_dir else set()
+    off = ctx.server.log_size()
+
+    async def contender() -> dict[str, Any]:
+        return await ctx.chat(
+            contender_prompt,
+            ctx.mt(a.c7_contender_max_tokens),
+            SAMPLING_GREEDY,
+            name="contender",
+            keep_chunks=True,
+        )
+
+    async def long_prompt(i: int) -> dict[str, Any]:
+        await asyncio.sleep(a.c7_contender_lead_s + i * a.c7_stagger_s)
+        return await ctx.chat(
+            prompts[i],
+            mt,
+            SAMPLING_GREEDY,
+            name=f"req{i}",
+            keep_text=True,
+            keep_chunks=True,
+        )
+
+    t = time.time()
+    results = list(
+        await asyncio.gather(contender(), *[long_prompt(i) for i in range(count)])
+    )
+    wall = round(time.time() - t, 2)
+    log_text = ctx.server.log_since(off)
+    events = bm.parse_c7_events(log_text)
+    longs = results[1:]
+    lps: dict[str, list[dict]] = {}
+    _c7_attach_lp(ctx, lps, before, longs)
+    identity = bm.identity_against_refs(data["refs"], longs, lps, paused=set())
+    for v in identity.values():
+        v["ref_ceiling_gb"] = data.get("ceiling_gb")
+    summary = bm.summarize_c7(
+        "packed-park", results, events, identity=identity, wall_s=wall
+    )
+    summary["packed"] = bm.packed_park_evidence(log_text)
+    summary["long_completed"] = sum(1 for r in longs if r.get("ok"))
+    summary["contender_ok"] = bool(results[0].get("ok"))
+    summary["verdict"] = bm.classify_packed_park(summary)
+    for r in results:
+        for k in ("text", "chunk_times", "chunk_chars"):
+            r.pop(k, None)
+    return {
+        "scenario": "packed-park",
+        "ceiling_gb": a.p7_ceiling_gb,
+        "stagger_s": a.c7_stagger_s,
+        "max_tokens": mt,
+        "contender": {
+            "prompt_tokens_nominal": a.c7_contender_tokens,
+            "max_tokens": a.c7_contender_max_tokens,
+            "lead_s": a.c7_contender_lead_s,
+        },
+        "warm": [],
+        "requests": results,
+        "references": [],
+        "identity": identity,
+        "wall_s": wall,
+        "summary": summary,
+    }
+
+
 async def scenario_c7(ctx: Ctx) -> dict[str, Any]:
     """C7: pause-resume cycle validation (see the C7 run plan in the field report).
 
@@ -1538,6 +1702,8 @@ async def scenario_c7(ctx: Ctx) -> dict[str, Any]:
     kind = ctx.args.c7_scenario
     if kind == "never-fits":
         return await _c7_never_fits(ctx)
+    if kind == "packed-park":
+        return await _c7_packed_park(ctx)
     if kind in C7_SCENARIOS:
         return await _c7_pressure(ctx, kind)
     raise ValueError(f"unknown C7 scenario: {kind!r}")
@@ -1649,6 +1815,8 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
         "server_command": [Path(server.command()[0]).name, *server.command()[1:]],
         "server_runtime": server.runtime_info() if hasattr(server, "runtime_info") else None,
         "feature_env": server.env,
+        "plain_settings": getattr(server, "plain", False),
+        "derived_settings": settings_record(st),
         "max_concurrent_requests": server.max_concurrent,
         "cache": {
             "ssd_cache_dir": server.cache_dir,
@@ -1692,6 +1860,9 @@ def collect_setup(args: argparse.Namespace, server: Server) -> dict[str, Any]:
                 "c7_refs_from",
                 "c7_force_pause_at",
                 "c7_force_offsets",
+                "c7_contender_tokens",
+                "c7_contender_max_tokens",
+                "c7_contender_lead_s",
             )
         }
         if server.premise == "C7"
@@ -1915,6 +2086,24 @@ def main(argv: list[str] | None = None) -> int:
         help="C7 identity (D6): start the fork server with the test-only knob "
         "OMLX_DEBUG_FORCE_DECODE_PAUSE_AT; 'auto' = an early offset plus each "
         "reference prompt's next 2048-token block edge (needs --c7-refs-from)",
+    )
+    ap.add_argument(
+        "--c7-contender-tokens",
+        type=int,
+        default=None,
+        help="C7 packed-park: prompt tokens of the short decoding contender",
+    )
+    ap.add_argument(
+        "--c7-contender-max-tokens",
+        type=int,
+        default=None,
+        help="C7 packed-park: max_tokens of the contender (it must outlast the prefills)",
+    )
+    ap.add_argument(
+        "--c7-contender-lead-s",
+        type=float,
+        default=None,
+        help="C7 packed-park: seconds between the contender and the long prompts",
     )
     ap.add_argument(
         "--p7-mode",
