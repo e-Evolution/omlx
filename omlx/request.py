@@ -273,6 +273,10 @@ class Request:
     park_times: list[float] = field(default_factory=list)
     # Prompt tokens a prefill park left committed in the prefix cache.
     park_committed_tokens: int = 0
+    # Prompt tokens the request's own lookups found before its first park.
+    # A re-admission restores its committed blocks too; only these count as
+    # cached in usage, the rest is resumed prefill (#4383).
+    park_cache_hit_tokens: int | None = None
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None
