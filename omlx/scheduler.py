@@ -14786,13 +14786,15 @@ class Scheduler:
         )
 
     def _deferred_wait_ended(self, wait: _DeferredAdmissionWait) -> bool:
-        """Whether memory a fits-later head waited on came back: a store write
-        it waited on drained, or a row it waited on left (finished, aborted
-        or paused). Measured against the recorded picture only, so a picture
+        """Whether memory a fits-later head waited on came back: a row it
+        waited on left (finished, aborted or paused), or, for a head that
+        waited on no row (only on store writes), a write drained. Beside rows
+        it waits on, a drain is some earlier request's write, not what blocks
+        it. Measured against the recorded picture only, so a picture
         refreshed by ``_end_deferred_wait`` does not end again by itself."""
-        if self._store_cache_jobs() < wait.store_jobs:
+        if not wait.admitted_ids <= self._admitted_request_ids():
             return True
-        return not wait.admitted_ids <= self._admitted_request_ids()
+        return not wait.admitted_ids and self._store_cache_jobs() < wait.store_jobs
 
     def _end_deferred_wait(self, head: "Request") -> None:
         """Start a new admission attempt for a head whose wait ended.
