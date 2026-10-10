@@ -2501,6 +2501,10 @@ class Scheduler:
         # must steer the user to that knob instead of "close other apps".
         self._memory_guard_tier: str = "balanced"
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
+        # Memory scheduling: resolved by ProcessMemoryEnforcer from
+        # memory.memory_scheduling. The admission features that plan against
+        # a fixed memory budget consult it; off keeps upstream admission.
+        self._memory_scheduling: bool = False
         # Set to True by ProcessMemoryEnforcer when phys_footprint crosses
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
@@ -5883,6 +5887,10 @@ class Scheduler:
         self._throttle_notified_requests.discard(request_id)
         self._clear_memory_admission_blocker(request_id)
         self._clear_store_cache_admission_blocker(request_id)
+
+    def _memory_scheduling_on(self) -> bool:
+        """Whether memory scheduling is on (see ``_memory_scheduling``)."""
+        return getattr(self, "_memory_scheduling", False) is True
 
     def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
         """Fail one head-of-line request after persistent memory admission stall."""

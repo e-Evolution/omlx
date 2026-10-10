@@ -596,6 +596,7 @@ async def lifespan(app: FastAPI):
             prefill_safe_zone_ratio=memory_settings.prefill_safe_zone_ratio,
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
             abort_single_victim=memory_settings.abort_single_victim,
+            memory_scheduling=memory_settings.memory_scheduling,
         )
         _server_state.process_memory_enforcer = enforcer
         _server_state.engine_pool._process_memory_enforcer = enforcer

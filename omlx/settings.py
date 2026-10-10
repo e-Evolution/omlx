@@ -589,6 +589,15 @@ class CacheSettings:
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
 VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"}
+# memory.memory_scheduling: "auto" turns memory scheduling on only with an
+# explicit ceiling (custom tier); "on" and "off" force it.
+VALID_MEMORY_SCHEDULING_MODES: tuple[str, ...] = ("auto", "on", "off")
+
+
+def normalize_memory_scheduling(value: Any) -> str | None:
+    """Lower-cased mode, or None when ``value`` is not a known mode."""
+    mode = str(value).strip().lower()
+    return mode if mode in VALID_MEMORY_SCHEDULING_MODES else None
 
 # KV cache storage formats `splash serve --kv-format` accepts.
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
@@ -621,6 +630,13 @@ class MemorySettings:
     # On the non-emergency hard path with nothing parkable, abort only the
     # live request holding the most KV instead of every request.
     abort_single_victim: bool = False
+    # Memory scheduling: the never-fits 400 and capacity hint, the fits-later
+    # wait (with the solo admission) and the progress-based admission-stall
+    # clock. They plan against a fixed memory budget, so "auto" turns them on
+    # only when the guard is on and an explicit ceiling is set (custom tier).
+    # "on" forces them on (still needs the guard), "off" keeps upstream
+    # admission. Resolved by the ProcessMemoryEnforcer.
+    memory_scheduling: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -633,6 +649,7 @@ class MemorySettings:
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
             "abort_single_victim": self.abort_single_victim,
+            "memory_scheduling": self.memory_scheduling,
         }
 
     @classmethod
@@ -652,6 +669,10 @@ class MemorySettings:
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
             abort_single_victim=data.get("abort_single_victim") is True,
+            memory_scheduling=normalize_memory_scheduling(
+                data.get("memory_scheduling", "auto")
+            )
+            or "auto",
         )
 
 
@@ -1311,6 +1332,15 @@ class GlobalSettings:
                     f"Invalid OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS value: "
                     f"{commit_blocks}"
                 )
+        if raw := os.getenv("OMLX_MEMORY_SCHEDULING"):
+            mode = normalize_memory_scheduling(raw)
+            if mode is not None:
+                self.memory.memory_scheduling = mode
+            else:
+                logger.warning(
+                    f"Invalid OMLX_MEMORY_SCHEDULING value: {raw} "
+                    f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
+                )
         if single := os.getenv("OMLX_MEMORY_ABORT_SINGLE_VICTIM"):
             self.memory.abort_single_victim = single.lower() in ("true", "1", "yes")
         if media := os.getenv("OMLX_MEDIA_TEXT_SUFFIX_CHUNKED"):
@@ -1814,6 +1844,12 @@ class GlobalSettings:
             errors.append(
                 "memory_guard_custom_ceiling_gb must be > 0 when "
                 "memory_guard_tier is 'custom'"
+            )
+
+        if normalize_memory_scheduling(self.memory.memory_scheduling) is None:
+            errors.append(
+                f"Invalid memory_scheduling: {self.memory.memory_scheduling!r} "
+                f"(must be one of {', '.join(VALID_MEMORY_SCHEDULING_MODES)})"
             )
 
         if not 0.5 <= self.memory.prefill_safe_zone_ratio <= 0.99:
