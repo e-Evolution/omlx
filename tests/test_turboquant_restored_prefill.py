@@ -325,3 +325,36 @@ def test_dense_prefix_that_does_not_fit_keeps_quantized_path(harness, path, capl
         r.getMessage().startswith("Kept restored TurboQuant prefix quantized")
         for r in caplog.records
     )
+
+
+@pytest.mark.parametrize("path", ["external", "resumable"])
+def test_all_turboquant_layout_takes_dense_dtype_from_the_embedding(harness, path):
+    """With no plain KV layer left (skip-last off), use the activation dtype.
+
+    The admission estimate reads the activation dtype from ``model.dtype`` or
+    the embedding weight; the dense prefix must use the same dtype a cold
+    prefill writes.
+    """
+    scheduler = harness.scheduler
+    scheduler._turboquant_skip_last = False
+    model = scheduler.model
+    model.dtype = None
+    model.model.embed_tokens.weight = mx.zeros((4, DIM), dtype=mx.float16)
+    restored = _restored_cache()[0]
+    dense_dtypes = []
+    forward = model.side_effect
+
+    def recording_forward(tokens, *, cache, **kwargs):
+        dense_dtypes.append(
+            [c.keys.dtype for c in cache if type(c) is KVCache and c.keys is not None]
+        )
+        forward(tokens, cache=cache, **kwargs)
+
+    model.side_effect = recording_forward
+
+    decode_cache = _run_prefill(scheduler, path, [restored], 2 * STEP + 1)
+
+    assert harness.seen == [["KVCache"], ["KVCache"]]
+    assert dense_dtypes[0] == [mx.float16]
+    assert decode_cache[0] is restored
+    assert decode_cache[0].offset == PREFIX + 2 * STEP
