@@ -139,6 +139,34 @@ def test_a_backoff_retry_beside_the_same_rows_gets_no_fresh_budget(
         rig.close()
 
 
+def test_an_unrelated_store_drain_beside_the_same_rows_gets_no_fresh_budget(
+    tmp_path, mock_tokenizer, monkeypatch
+):
+    """An earlier request's store write in flight at deferral is not what the
+    head waits on: its drain, while the rows it waits on still run, does not
+    end the wait or renew the eviction budget."""
+    rig, usage = _guarded_rig(
+        tmp_path, mock_tokenizer, monkeypatch, weights_gb=20, free_gb=50
+    )
+    ladder = _Ladder()
+    try:
+        scheduler = rig.scheduler
+        gate = scheduler_module._StoreCacheGate(cap=3)
+        gate.note_submitted()  # an unrelated earlier request's write
+        scheduler._store_cache_gate = gate
+        later, _admitted = _defer_beside_admitted_work(rig, ladder, monkeypatch, usage)
+        assert scheduler._deferred_admissions["later"].store_jobs == 1
+
+        gate.note_done()  # it drains; req0 still runs
+        outputs = _step(rig, ladder, 6)
+        assert not [o for o in outputs if o.error]
+        assert waiting_ids(rig) == ["later"]
+        assert ladder.calls == ["later", "later"]
+        assert later.prefill_eviction_retries == 2
+    finally:
+        rig.close()
+
+
 def test_a_lone_head_on_a_stale_reading_reclaims_and_rechecks_before_rejecting(
     tmp_path, mock_tokenizer, monkeypatch
 ):
