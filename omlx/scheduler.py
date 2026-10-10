@@ -1710,6 +1710,56 @@ def _grow_kv_capacity(cache_obj: Any, capacity: int) -> list[mx.array]:
     return grown
 
 
+# Set on the dense KVCache that stands in for a restored TurboQuant layer
+# while a suffix prefills (Scheduler._dequantize_restored_turboquant_prefix).
+# Holds the original quantized cache, so the end-of-prefill conversion appends
+# the suffix to the restored prefix codes instead of quantizing them twice.
+_RESTORED_TQ_PREFIX_ATTR = "_omlx_restored_turboquant_prefix"
+
+
+def _dense_kv_template(prompt_cache: list[Any], model: Any) -> tuple[type, Any]:
+    """Return the (KVCache class, dtype) a cold prefill of this model uses.
+
+    Read from a populated plain KV layer (TurboQuant leaves the last one
+    unquantized by default), else from the model dtype. The dtype is None
+    when neither is known.
+    """
+    for c in _iter_leaf_caches(prompt_cache):
+        if type(c) in _STEP_GROWN_KV_CACHE_TYPES and c.keys is not None:
+            return type(c), c.keys.dtype
+    dtype = getattr(model, "dtype", None)
+    return _MLXKVCache, dtype if isinstance(dtype, mx.Dtype) else None
+
+
+def _turboquant_dense_bytes_per_token(cache_obj: Any, dtype: Any) -> int:
+    """Bytes per token of a TurboQuant layer once dequantized to ``dtype``."""
+    keys_state, _ = cache_obj.state
+    shaped = [a for _, a in tree_flatten(keys_state) if a.ndim >= 3]
+    if not shaped:
+        return 0
+    rows = int(shaped[0].shape[0]) * int(shaped[0].shape[1])
+    width = int(cache_obj.key_codec.dim) + int(cache_obj.value_codec.dim)
+    return rows * width * int(dtype.size)
+
+
+def _requantize_onto_restored_prefix(prefix: Any, dense: Any) -> Any:
+    """Append a dense layer's suffix to the TurboQuant cache it replaced.
+
+    The restored prefix codes are kept as they are; only the tokens prefilled
+    after the restore are quantized, with the prefix cache's own codec, as
+    ``TurboQuantKVCache.from_cache`` would quantize them.
+    """
+    start, end = int(prefix.offset), int(dense.offset)
+    if end < start:
+        prefix.trim(start - end)
+    elif end > start:
+        prefix.update_and_fetch(
+            dense.keys[..., start:end, :], dense.values[..., start:end, :]
+        )
+    delattr(dense, _RESTORED_TQ_PREFIX_ATTR)
+    return prefix
+
+
 def _collect_cache_storage_arrays(cache_obj: Any) -> list[mx.array]:
     """Collect concrete backing arrays from cache objects, not state slices."""
     arrays: list[mx.array] = []
@@ -4317,6 +4367,11 @@ class Scheduler:
         hidden states stay exact and quantization error only enters at
         decode-time reads. This is the key difference from #717/#771, which
         quantized on the fly during prefill and corrupted hidden states.
+
+        A dense layer that stood in for a restored TurboQuant layer during a
+        suffix prefill (see _dequantize_restored_turboquant_prefix) goes back
+        to that layer's quantized cache: only the suffix is quantized, and
+        the restored prefix codes are reused unchanged.
         """
         from mlx_lm.models.cache import CacheList, KVCache
         from mlx_vlm.turboquant import TurboQuantKVCache
@@ -4331,6 +4386,13 @@ class Scheduler:
         bits = float(self._turboquant_kv_bits)
         for i, cache_obj in enumerate(prompt_cache):
             if isinstance(cache_obj, (KVCache, _vlm_cache.KVCache)):
+                restored_prefix = getattr(cache_obj, _RESTORED_TQ_PREFIX_ATTR, None)
+                if restored_prefix is not None:
+                    prompt_cache[i] = _requantize_onto_restored_prefix(
+                        restored_prefix, cache_obj
+                    )
+                    converted += 1
+                    continue
                 if i == last_kv_idx:
                     continue
                 prompt_cache[i] = TurboQuantKVCache.from_cache(cache_obj, bits=bits)
@@ -4350,6 +4412,107 @@ class Scheduler:
                 f"TurboQuant: converted {converted}/{len(prompt_cache)} "
                 f"cache layers to {bits}-bit{skip_msg}"
             )
+
+    def _dequantize_restored_turboquant_prefix(
+        self,
+        prompt_cache: list[Any],
+        prefill_tokens: int,
+        request_id: str | None = None,
+    ) -> int:
+        """Prefill a long suffix over a dense copy of a restored TQ prefix.
+
+        A paged-SSD hit restores TurboQuant layers quantized (#1842).
+        Prefilling over them sends every chunk of every TurboQuant layer
+        through the tiled quantized-attention path, whose cost grows with the
+        prefix. Measured on a 27B model, a 36k-token suffix after a 74k
+        restored prefix took 2.4x the cold prefill of the same positions.
+        Each restored layer is dequantized once instead, so the suffix runs
+        the dense SDPA path of a cold prefill and attends exact suffix keys
+        rather than keys quantized on the fly (see
+        _apply_turboquant_kv_convert). The dense layer keeps the quantized
+        cache it replaced, and the end-of-prefill conversion appends the
+        quantized suffix to it, so the prefix is never quantized twice.
+
+        Only a suffix longer than one prefill chunk is converted: the one-off
+        dequantize costs about what the quantized path adds to one chunk, so
+        a short suffix (a chat turn) gains nothing from it. Like the prefill
+        capacity reserve, it is skipped unless the dense layers, sized for
+        the whole prompt, fit under the prefill peak target; the request then
+        keeps the compact quantized prefix.
+
+        Returns the number of layers converted.
+        """
+        if getattr(self, "_turboquant_kv_bits", None) is None or not prompt_cache:
+            return 0
+        restored = [
+            (i, c)
+            for i, c in enumerate(prompt_cache)
+            if type(c).__name__ == "TurboQuantKVCache"
+            and c.keys is not None
+            and c.offset > 0
+        ]
+        if not restored:
+            return 0
+        prefill_tokens = int(prefill_tokens)
+        if prefill_tokens <= self._prefill_step_size_for_progress(0, prefill_tokens):
+            return 0
+        # The end-of-prefill conversion must run, or the layers stay dense.
+        if not self._turboquant_eligible(prompt_cache):
+            return 0
+        dense_type, dtype = _dense_kv_template(prompt_cache, self.model)
+        if dtype is None:
+            return 0
+
+        horizon = _cache_base_sizes(prompt_cache) + prefill_tokens + 1
+        dense_bytes = horizon * sum(
+            _turboquant_dense_bytes_per_token(c, dtype) for _, c in restored
+        )
+        target = Scheduler._prefill_peak_target(self)
+        if target > 0:
+            current = self._current_usage_bytes()
+            floor = 0
+            if Scheduler._prefill_shares_memory(self, request_id):
+                floor = self._admission_transient_bound(
+                    Scheduler._admission_charge_tokens(self, horizon), horizon
+                )
+            if current + dense_bytes + floor > target:
+                logger.info(
+                    "Kept restored TurboQuant prefix quantized for a %d-token "
+                    "suffix: %.2fGB + dense %.2fGB + floor chunk %.2fGB exceeds "
+                    "prefill peak target %.2fGB",
+                    prefill_tokens,
+                    current / 1024**3,
+                    dense_bytes / 1024**3,
+                    floor / 1024**3,
+                    target / 1024**3,
+                )
+                return 0
+
+        started = time.perf_counter()
+        with mx.stream(self._stream):
+            for i, cache_obj in restored:
+                keys, values = cache_obj.dequantize()
+                dense = dense_type()
+                dense.keys = keys.astype(dtype)
+                dense.values = values.astype(dtype)
+                dense.offset = int(cache_obj.offset)
+                mx.eval(dense.keys, dense.values)
+                setattr(dense, _RESTORED_TQ_PREFIX_ATTR, cache_obj)
+                prompt_cache[i] = dense
+                # Return this layer's float32 dequantize buffers before the
+                # next layer allocates its own.
+                _sync_and_clear_cache(self._stream)
+        logger.info(
+            "TurboQuant: dequantized %d restored TurboQuant layers "
+            "(%d tokens) for a %d-token suffix prefill in %.2fs (+%.2fGB "
+            "for the prompt)",
+            len(restored),
+            int(max(c.offset for _, c in restored)),
+            prefill_tokens,
+            time.perf_counter() - started,
+            dense_bytes / 1024**3,
+        )
+        return len(restored)
 
     def _qwen4_prefill_accounting_enabled(self) -> bool:
         monitor = getattr(self, "memory_monitor", None)
@@ -4490,10 +4653,16 @@ class Scheduler:
             prompt_cache = make_prompt_cache(self.model)
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
-        # are quantized once at the end. Restored TurboQuant prefix caches stay
-        # quantized while pre-filling the uncached suffix, then keep using TQ for
-        # decode. Rotating/sliding-window layers remain native pass-through
-        # caches; only full-attention KVCache layers are converted.
+        # are quantized once at the end. A restored TurboQuant prefix is
+        # dequantized once before a suffix longer than one chunk, so the suffix
+        # runs the same dense path; the end-of-prefill conversion appends the
+        # quantized suffix to the restored codes for decode. A shorter suffix
+        # prefills over the quantized prefix. Rotating/sliding-window layers
+        # remain native pass-through caches; only full-attention KVCache layers
+        # are converted.
+        Scheduler._dequantize_restored_turboquant_prefix(
+            self, prompt_cache, n_tokens - 1, request.request_id
+        )
 
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
@@ -6838,6 +7007,11 @@ class Scheduler:
             existing_cache
             if existing_cache is not None
             else make_prompt_cache(self.model)
+        )
+        # Run a long suffix over a dense copy of a restored TurboQuant prefix
+        # (see _do_external_prefill).
+        Scheduler._dequantize_restored_turboquant_prefix(
+            self, prompt_cache, len(tokens) - 1, request.request_id
         )
 
         block_size = self.config.paged_cache_block_size
