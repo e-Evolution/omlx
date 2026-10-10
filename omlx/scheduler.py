@@ -1721,13 +1721,17 @@ def _dense_kv_template(prompt_cache: list[Any], model: Any) -> tuple[type, Any]:
     """Return the (KVCache class, dtype) a cold prefill of this model uses.
 
     Read from a populated plain KV layer (TurboQuant leaves the last one
-    unquantized by default), else from the model dtype. The dtype is None
-    when neither is known.
+    unquantized by default), else from the activation dtype the admission
+    estimate uses: ``model.dtype`` or the embedding weight. The dtype is None
+    when none of them is known.
     """
     for c in _iter_leaf_caches(prompt_cache):
         if type(c) in _STEP_GROWN_KV_CACHE_TYPES and c.keys is not None:
             return type(c), c.keys.dtype
     dtype = getattr(model, "dtype", None)
+    if not isinstance(dtype, mx.Dtype):
+        embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+        dtype = getattr(getattr(embed_tokens, "weight", None), "dtype", None)
     return _MLXKVCache, dtype if isinstance(dtype, mx.Dtype) else None
 
 
