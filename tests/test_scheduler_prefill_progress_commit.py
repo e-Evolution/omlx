@@ -560,6 +560,66 @@ def test_window_of_a_restored_turboquant_prefix_slices_the_packed_state(
         rig.close()
 
 
+def test_resume_over_a_restored_turboquant_prefix_runs_dense_and_commits_its_codes(
+    tmp_path, mock_tokenizer, split
+):
+    """A resumed prefill (park or reissue) takes the dense suffix path.
+
+    The re-admission restores the committed TurboQuant blocks quantized. The
+    remaining suffix spans two chunks, so the restored layer is dequantized
+    once and every suffix chunk runs dense. The blocks committed during the
+    suffix match the decode cache the epilogue builds, whose prefix codes are
+    the restored ones.
+    """
+    import omlx.turboquant_kv  # noqa: F401
+
+    rig = _Rig(tmp_path, mock_tokenizer, split=split, commit_blocks=1, tq_bits=4)
+    try:
+        scheduler = rig.scheduler
+        _, state = rig.start("r1", PROMPT)
+        rig.step(state, 2)
+        assert scheduler._do_abort_request("r1")
+        rig.drain()
+
+        request = Request(
+            request_id="r2",
+            prompt=list(PROMPT),
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        scheduler.add_request(request)
+        scheduler.waiting.clear()
+        table, remaining = rig.prefix.fetch_cache("r2", list(PROMPT))
+        assert table is not None and table.num_tokens == 2 * BLOCK
+        restored = rig.prefix.reconstruct_cache(table)
+        assert type(restored[1]).__name__ == "TurboQuantKVCache"
+        quantized = restored[1]
+        prefix_codes = [mx.array(a) for a in _packed(quantized)]
+        request.cached_tokens = table.num_tokens
+        request.remaining_tokens = list(remaining)
+
+        state = scheduler._begin_prefill(request, list(remaining), restored)
+        assert type(state.cache[1]).__name__ == "KVCache"
+        assert state.cache[1].offset == 2 * BLOCK
+        rig.step(state, 2)
+        assert rig.table_tokens("r2") == 4 * BLOCK
+
+        scheduler._apply_turboquant_kv_convert(state.cache)
+        decode_layer = state.cache[1]
+        assert decode_layer is quantized
+        assert decode_layer.offset == 4 * BLOCK
+        decode_codes = _packed(decode_layer)
+        for want, got in zip(prefix_codes, decode_codes, strict=True):
+            assert mx.array_equal(want, got[:, :, : 2 * BLOCK]).item()
+
+        committed, _ = rig.probe(PROMPT)
+        assert committed is not None and committed.num_tokens == 4 * BLOCK
+        reloaded = rig.prefix.reconstruct_cache(committed)
+        for want, got in zip(decode_codes, _packed(reloaded[1]), strict=True):
+            assert mx.array_equal(want[:, :, : 4 * BLOCK], got).item()
+    finally:
+        rig.close()
+
+
 def test_window_refuses_composite_and_unknown_sliceable_layers(
     tmp_path, mock_tokenizer
 ):
