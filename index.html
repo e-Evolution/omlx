@@ -1,0 +1,1029 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Unattended Agents on oMLX and gentle-shell</title>
+<meta name="description" content="A field report on local Qwen coding agents, oMLX and gentle-shell: documentation work on consumer hardware, measured improvements, and evidence limits.">
+<link rel="canonical" href="https://e-evolution.github.io/omlx/">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Unattended Agents on oMLX and gentle-shell">
+<meta property="og:description" content="Can local models on consumer hardware sustain real documentation work? A measured pilot using oMLX, Qwen and gentle-shell.">
+<meta property="og:url" content="https://e-evolution.github.io/omlx/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Unattended Agents on oMLX and gentle-shell">
+<meta name="twitter:description" content="Local inference for documentation work: the results, fixes and limitations of an open-source pilot.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: single reading column (engineering field report), wide tables scroll in place, evidence set in mono */
+:root{
+  --bg:#f6f7f5; --surface:#ffffff; --fg:#1d2321; --muted:#5b6662; --rule:#d9ded9;
+  --accent:#1f6f5c; --accent-soft:#e3efe9; --warn:#9a5b00; --warn-soft:#f6ecdc; --bad:#a23a2e; --good:#2c7a4b;
+  --display:"Newsreader",Georgia,"Times New Roman",serif;
+  --body:"IBM Plex Sans",-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#121615; --surface:#191e1c; --fg:#e4e9e6; --muted:#9aa6a1; --rule:#2c3532;
+  --accent:#6fc2a8; --accent-soft:#1d2d28; --warn:#e0a54f; --warn-soft:#2e2517; --bad:#ec8a7d; --good:#79c99a; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#121615; --surface:#191e1c; --fg:#e4e9e6; --muted:#9aa6a1; --rule:#2c3532;
+  --accent:#6fc2a8; --accent-soft:#1d2d28; --warn:#e0a54f; --warn-soft:#2e2517; --bad:#ec8a7d; --good:#79c99a; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:16px/1.65 var(--body);padding-inline:20px;padding-block:40px 80px}
+main{max-width:860px;margin:0 auto;display:grid;gap:44px}
+header{display:grid;gap:14px}
+.eyebrow{font:500 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+h1{font:600 clamp(32px,5vw,46px)/1.1 var(--display);margin:0;text-wrap:balance}
+h2{font:600 28px/1.2 var(--display);margin:0 0 12px;text-wrap:balance}
+h3{font:600 17px/1.35 var(--body);margin:22px 0 6px}
+p{margin:0 0 12px;max-width:68ch}
+.lede{font-size:18px;color:var(--fg);max-width:64ch}
+.meta{font:13px/1.6 var(--mono);color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px}
+section{display:grid;gap:6px}
+a{color:var(--accent)}
+code{font:0.88em var(--mono);background:var(--accent-soft);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+ul,ol{margin:0 0 12px;padding-left:22px;max-width:68ch}
+li{margin:4px 0}
+.callout{background:var(--surface);border:1px solid var(--rule);border-left:3px solid var(--accent);padding:14px 18px;border-radius:6px;max-width:72ch}
+.callout.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.fig{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:14px 16px;display:grid;gap:4px;min-width:0}
+.fig b{font:600 26px/1.1 var(--display);font-variant-numeric:tabular-nums}
+.fig span{font-size:13px;color:var(--muted)}
+.tbl{overflow-x:auto;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font:600 12px/1.3 var(--body);letter-spacing:.04em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill{display:inline-block;font:500 12px/1.6 var(--mono);padding:0 8px;border-radius:999px;white-space:nowrap}
+.ok{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good)}
+.no{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+.mid{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.timeline{display:grid;gap:0;border-left:2px solid var(--rule);margin-left:6px}
+.step{position:relative;padding:0 0 18px 22px}
+.step::before{content:"";position:absolute;left:-7px;top:8px;width:12px;height:12px;border-radius:50%;background:var(--surface);border:2px solid var(--accent)}
+.step h3{margin:0 0 4px}
+.step p{margin:0;color:var(--fg)}
+pre{font:13px/1.55 var(--mono);background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:12px 14px;overflow-x:auto;margin:0 0 12px}
+footer{font-size:13px;color:var(--muted);border-top:1px solid var(--rule);padding-top:16px}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+/* Field footage figures */
+.media-grid{display:grid;gap:20px;grid-template-columns:1fr;margin:16px 0}
+.media-grid figure{margin:0}
+.media-grid img,.media-grid video{display:block;width:100%;height:auto;border:1px solid var(--rule);border-radius:8px;background:#111}
+.media-grid figcaption{color:var(--muted);font-size:.92em;line-height:1.45;margin-top:8px}
+/* Executive summary, scope note and contents index */
+html{scroll-padding-top:16px}
+@media (prefers-reduced-motion:no-preference){html{scroll-behavior:smooth}}
+.scope{font-size:14px;line-height:1.6;color:var(--muted);max-width:72ch;margin:0}
+.benefits{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin:6px 0 14px}
+.benefit{background:var(--surface);border:1px solid var(--rule);border-top:3px solid var(--accent);border-radius:8px;padding:14px 18px;min-width:0}
+.benefit h3{margin:0 0 8px}
+.benefit ul{margin:0;padding-left:18px}
+.toc{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:16px 18px;display:grid;gap:12px}
+.toc h2{font:500 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin:0}
+.toc-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:10px 28px}
+.toc-label{font:600 13px/1.4 var(--body);color:var(--muted);margin:0 0 4px}
+.toc ul{list-style:none;margin:0;padding:0;font-size:14px;line-height:1.45}
+.toc li{margin:4px 0}
+.toc a{text-decoration:none;overflow-wrap:anywhere}
+.toc a:hover,.toc a:focus-visible{text-decoration:underline}
+.about{display:grid;gap:14px}
+.thanks{color:var(--muted);font-size:15px;line-height:1.6;margin:16px 0 0;max-width:72ch}
+.summary-h{margin:18px 0 8px}
+.brandbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
+.brand-badge{line-height:0}.brand-badge img{display:block;width:180px;max-width:46vw;height:auto}
+.brand-author,.footer-brand{display:inline-flex;line-height:0}
+.brand-author img,.footer-brand img{display:block;width:200px;height:auto;max-width:46vw}
+.footer-brand{margin-bottom:10px}
+.projects{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}
+.project{display:inline-flex;align-items:center;gap:8px;text-decoration:none;color:var(--fg);font-weight:500;font-size:15px;line-height:1;border:1px solid var(--rule);border-radius:999px;padding:4px 14px 4px 4px;background:var(--surface)}
+.project:hover,.project:focus-visible{border-color:var(--accent)}
+.project img{display:block;width:32px;height:32px;border-radius:8px;object-fit:cover}
+.projects-note{flex-basis:100%;margin:0;font-size:12.5px;line-height:1.5;color:var(--muted)}
+main{grid-template-columns:minmax(0,1fr)}
+main>*,header>*,section>*{min-width:0}
+section{grid-template-columns:minmax(0,1fr)}
+pre{max-width:100%;overflow-x:auto}
+/* Progressive disclosure keeps the overview short without discarding evidence. */
+.editorial-details{border:1px solid var(--rule);border-radius:8px;padding:14px 18px;background:var(--surface);min-width:0}
+.editorial-details>summary{cursor:pointer;font-weight:600;color:var(--accent)}
+.editorial-details[open]>summary{margin-bottom:20px}
+.editorial-details section{background:transparent}
+.reading-path{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:14px}
+.skip-link{position:fixed;top:8px;left:8px;z-index:10;transform:translateY(-180%);padding:8px 14px;background:var(--surface);border:1px solid var(--accent)}
+.skip-link:focus{transform:none}
+.back-to-contents{position:fixed;right:12px;bottom:12px;z-index:5;background:var(--surface);border:1px solid var(--rule);border-radius:999px;padding:7px 12px;font-size:13px;text-decoration:none;box-shadow:0 2px 8px #0002}
+a:focus-visible,summary:focus-visible,.tbl:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+@media(max-width:480px){.brand-author img{width:150px;max-width:42vw}.brand-badge img{width:145px;max-width:40vw}.brandbar{flex-wrap:nowrap}.back-to-contents{font-size:12px;padding:6px 10px}}
+</style>
+<link rel="alternate" hreflang="es" href="es.html">
+</head>
+<body>
+<a class="skip-link" href="#introduction">Skip to article</a>
+<a class="back-to-contents" href="#contents" aria-label="Back to the article contents">Contents ↑</a>
+<main>
+<header>
+  <div class="brandbar"><a class="brand-author" href="https://e-evolution.com" title="e-Evolution"><img src="media/logos/e-evolution.png" alt="e-Evolution" width="200" height="75"></a><a class="brand-badge" href="https://github.com/Gentleman-Programming/gentle-ai"><img src="media/logos/built-with-gentle-ai.png" alt="Built with Gentle-AI" width="180" height="78"></a></div>
+  <div class="eyebrow">Field report · oMLX server + gentle-shell harness · Apple M5 Max 128 GB</div>
+  <h1>Unattended Agents on oMLX and gentle-shell</h1>
+  <div class="meta"><span><a href="es.html" hreflang="es" lang="es">Leer en español</a></span></div>
+  <div class="projects" role="group" aria-label="Projects in this report">
+    <a class="project" href="https://github.com/jundot/omlx"><picture><source srcset="media/logos/omlx-dark.svg" media="(prefers-color-scheme: dark)"><img src="media/logos/omlx-light.svg" alt="" width="32" height="32"></picture><span>oMLX</span></a>
+    <a class="project" href="https://github.com/Gentleman-Programming/gentle-shell"><img src="media/logos/gentle-shell.png" alt="" width="32" height="32"><span>gentle-shell</span></a>
+    <p class="projects-note">Logos identify the projects this report is about. It is an independent contribution.</p>
+  </div>
+</header>
+
+<section id="introduction">
+  <h2>Introduction</h2>
+  <p>This article addresses a concrete question: <b>is it possible to complete real work from beginning to end using local models, consumer hardware, and only open-source technology?</b></p>
+  <p>To investigate it, we developed a documentation pilot: turning PDF manuals and older screenshots into wiki documentation, with images of the new ADempiere version and an assistant that answers questions. The implementation combined the oMLX inference server, the Gentle Shell agent harness, and open-weight models from the Qwen family, running on a personal workstation.</p>
+  <p>I am the lead maintainer of <a href="https://github.com/adempiere/adempiere/tree/hotfix/3.9.4.002">ADempiere</a>, an open-source project for ERP, CRM, and SCM. Its official repository provides public access to the source code and development history, giving readers context for the project behind this pilot. I also lead a company specializing in the development, support, and professional maintenance of solutions based on this technology. That experience helped us choose a concrete, useful task with verifiable results.</p>
+  <p>The purpose was not to compare this configuration with frontier models or tools such as Claude Code or Codex, but to establish whether it could complete the proposed work, identify the obstacles, and document the conditions needed to make it possible.</p>
+  <p>Below, I share the experience, the problems encountered, the solutions developed, and the results obtained, together with the limitations of the evidence.</p>
+</section>
+
+<section id="summary">
+  <h2>Executive summary</h2>
+  <p>We tested whether local models on consumer hardware, using open-source tools, could carry out useful documentation work without constant human intervention. The pilot used Qwen models served by oMLX on an Apple M5 Max with 128 GB of memory, with pi and gentle-shell coordinating agents working on an ADempiere wiki.</p>
+  <ul>
+    <li><b>For oMLX:</b> TurboQuant batched-decode and restored-prefix prefill fixes improved measured performance. A proposed pause-and-resume stack kept requests alive under forced memory pressure.</li>
+    <li><b>For gentle-shell:</b> A todo-driven system-prompt rewrite caused substantial cache loss. The tested fix moves todo state into conversation messages to keep the system prompt stable.</li>
+  </ul>
+  <p>With the proposed server and harness fixes applied during the pilot, the project met its objective: the documentation was completed from beginning to end in wiki format, with images of the new ADempiere version and an assistant that answers questions, using local models, consumer hardware and open-source tooling. The benchmarks document improvements in performance, memory use and stability that supported that outcome; they do not independently audit the wiki's content. Historical batch results, newer upstream comparisons and an unpaired live run answer different questions.</p>
+  <p>Results are limited to one Apple consumer workstation configured for local AI and one model family. Upstream merged PR2 as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a> and PR1's fix as <a href="https://github.com/jundot/omlx/pull/4453">#4453</a> on 2026-10-12; the other fixes are proposals, not claims of upstream adoption, and none is a guarantee for smaller machines.</p>
+  <nav class="reading-path" aria-label="Choose a reading path"><a href="#evidence-map">Results and limits</a><a href="#contribution">Proposed contributions</a><a href="#contents">Full contents</a></nav>
+</section>
+
+<details class="editorial-details" id="contribution-overview">
+  <summary>Detailed contributions, benefits and acknowledgements</summary>
+<section>
+  <h2>Contribution overview</h2>
+  <h3 id="summary-contributions" class="summary-h">What we contribute</h3>
+  <div class="benefits">
+    <div class="benefit">
+      <h3>To oMLX</h3>
+      <ul>
+        <li><b>PR1: TurboQuant batched decode.</b> Each left-padded row attends only its own slice, in decode and in MTP verify. A bug fix. Upstream closed it in favor of <a href="https://github.com/jundot/omlx/pull/4453">#4453</a>, which builds the same fix on the <a href="https://github.com/jundot/omlx/pull/4408">#4408</a> kernel and lists us as co-author (merged 2026-10-12). <a href="#pr1-current-main">Details</a></li>
+        <li><b>PR2: prefill after a restored TurboQuant prefix.</b> A long suffix is prefilled over a dense copy of the restored prefix, then re-quantized for decode. A bug fix, merged upstream as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a> (2026-10-12). <a href="#tq-restored-prefill">Details</a></li>
+        <li><b>Pause and resume instead of abort.</b> Under memory pressure a request keeps its prefill progress and parks, decoding rows pause, and both resume when memory frees; a request that can never fit gets a structured error, and image prompts become parkable. Off by default or gated, opened on 2026-10-12 as a stack of 12 pull requests, <a href="https://github.com/jundot/omlx/pull/4478">#4478</a> to <a href="https://github.com/jundot/omlx/pull/4489">#4489</a>. <a href="#park-strategy">Details</a></li>
+        <li><b>Prefix-cache fixes A1 and A2.</b> Mid-conversation system messages no longer rewrite the prompt head (A1), and a client's synthetic messages no longer strip thinking in the middle of an agent loop (A2). Proposed separately, after the bug fixes. <a href="#cache-reuse">Details</a></li>
+        <li><b>Observability and a memory bound.</b> Eviction summary, per-request cache outcome and TTFT breakdown logs, and <code>memory.mlx_cache_limit_gb</code> to bound the Metal buffer cache, as separate later proposals. <a href="#contribution-omlx">Details</a></li>
+      </ul>
+    </div>
+    <div class="benefit">
+      <h3>To gentle-shell</h3>
+      <ul>
+        <li><b>The todo fix (<a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a>).</b> Todo state moves out of the system prompt into hidden conversation messages sent only when the list changes, and the stale reminder fires once, so the system prompt stays byte-stable within a session. One commit, ready on <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a>. <a href="#gentle-shell-fix">Details</a></li>
+        <li><b>A prompt-stability invariant test.</b> It asserts that each request extends the previous one, and can be generalized to every extension that touches the system prompt. <a href="#gentle-shell-proposal">Details</a></li>
+        <li><b>An end-to-end cache check and a payload recorder (optional).</b> They catch prompt rewrites against a local server that reports cached tokens, and make "it got slow" reports reproducible. <a href="#gentle-shell-proposal">Details</a></li>
+        <li><b>Four more harness findings, with evidence.</b> YOLO directive and memory addendum toggles in the system prompt (raised in #1367), the worker role without <code>agent_browser</code>, and squad workers that ignore the pinned model. <a href="#gentle-shell-other">Details</a></li>
+      </ul>
+    </div>
+  </div>
+  <p><b>Why it is worth integrating.</b> Paired benchmarks compared the fork with the upstream version named in each section, one build at a time. Recorded traffic and the live run provide observational evidence, not paired upstream comparisons. Run counts and limitations are stated with each result. Every behaviour change was written test-first; about two thirds of the pause-resume cycle's changed lines are tests. The work is split into small, reviewable pull requests with a stated merge order. Beyond the two bug fixes, every slice of the pause-resume stack is off by default or gated on an explicit memory ceiling, so with every flag off it behaves as <code>main</code> on these paths. The order and shape are proposals; we will adapt them to your preferences.</p>
+    <div class="benefits">
+    <div class="benefit">
+      <h3>Benefits for oMLX</h3>
+      <ul>
+        <li><b>Faster, leaner batched decode (PR1).</b> Batched TurboQuant decode 5–12× faster per row (from about 1.5 tok/s per row on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>); B=3 phase 345 → 66 s with MTP on and 780 → 65 s with MTP off; peak 11–15 GB lower. Upstream's <a href="https://github.com/jundot/omlx/pull/4453">#4453</a>, built from this diagnosis, reports 62–65 tok/s per row with three concurrent requests (maintainer's measurement, Qwen3.6-35B-A3B with TQ4). <a href="#pr1-current-main">Evidence</a></li>
+        <li><b>Restored prefixes no longer slow prefill (PR2).</b> Suffix prefill after a restored TurboQuant prefix: 2.41× → 0.92× of a cold prefill. With the fork's progress commit, a re-issue after a cancel takes 80–82 s instead of 192–193 s. <a href="#tq-restored-prefill">Evidence</a></li>
+        <li><b>Pause instead of abort (opt-in stack, historical C7 run against b7c7929e).</b> Under forced pressure 9 of 9 requests finish with 0 aborts, against 0 of 9; tokens are identical after 12 pauses with MTP off; a request that can never fit gets a structured 400 in 0.1 s. <a href="#c7-final-results">Evidence</a></li>
+        <li><b>No lost work.</b> A cancelled prefill keeps 73,728 committed tokens instead of 0. <a href="#premises">Evidence</a></li>
+        <li><b>Better cache reuse for any client (A1, A2).</b> A2 removes a cause worth about 0.94M re-prefilled tokens in 1.5 days; image turns reach 97.4–99.7% hits. A1 keeps mid-conversation system messages from rewriting the prompt head. <a href="#cache-reuse">Evidence</a></li>
+        <li><b>Bounded memory and observability.</b> <code>mlx_cache_limit_gb</code> bounds the Metal buffer cache (evidence: the P2 peak); the eviction summary, per-request cache outcome and TTFT breakdown support every live measurement here. <a href="#what-was-built">Evidence</a></li>
+      </ul>
+    </div>
+    <div class="benefit">
+      <h3>Benefits for gentle-shell</h3>
+      <ul>
+        <li><b>A byte-stable system prompt.</b> System-prompt rewrites 21 of 61 → 0 of 90 requests; 31 of 31 consecutive turns append-only; re-prefills above 20k tokens from 1–2 per hour to 0. <a href="#gentle-shell-fix">Evidence</a></li>
+        <li><b>Time and compute back.</b> Before the fix, ~1.05M tokens were re-prefilled in ~1.5 days (≈80–85 min of GPU time), and each affected turn waited ≈2–6 min longer. <a href="#gentle-shell-cost">Evidence</a></li>
+        <li><b>Relevant beyond oMLX.</b> Prompt rewrites can also reduce reuse on other local servers and hosted APIs with prefix caching. Actual savings depend on each backend's cache rules and pricing; they were not measured here. <a href="#gentle-shell-cost">Evidence</a></li>
+        <li><b>Small and verified.</b> One commit, 388 changed lines (296 of them tests); 63 todo tests pass; an independent review found no blocking issues; #1924's reminder is kept. <a href="#contribution-gentle-shell">Evidence</a></li>
+        <li><b>Regressions caught early.</b> The fix carries a prompt-stability invariant test for the todo tool, which can be generalized to every extension that touches the system prompt. <a href="#gentle-shell-proposal">Proposal</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout"><b>What we ask next.</b> oMLX: PR2 was merged as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a> and PR1's fix went in as <a href="https://github.com/jundot/omlx/pull/4453">#4453</a> (both 2026-10-12). Next, a review of the pause-resume stack, opened in merge order as <a href="https://github.com/jundot/omlx/pull/4478">#4478</a> (ready for review) to <a href="https://github.com/jundot/omlx/pull/4489">#4489</a> (drafts) and announced in Ideas discussion <a href="https://github.com/jundot/omlx/discussions/4440">#4440</a>. gentle-shell: <code>status:approved</code> on <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a>, so the fix can go in as a pull request, or be folded into another change if you prefer. Details: <a href="#contribution">Proposed contribution</a>.</div>
+  <p class="thanks">Both projects are open, and that is what let us read the code, measure it and fix what we found. In the same spirit, we would like to give these improvements back rather than keep a private fork. Thank you to <a href="https://github.com/jundot">jundot</a> for oMLX and to <a href="https://github.com/Alan-TheGentleman">Alan-TheGentleman</a> for gentle-shell, and for the great work each of you shares through your project.</p>
+</section>
+</details>
+
+<nav id="contents" class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <div class="toc-groups">
+    <div>
+      <p class="toc-label">For both</p>
+      <ul>
+        <li><a href="#introduction">Introduction</a></li>
+        <li><a href="#summary">Executive summary</a></li>
+        <li><a href="#contribution-overview">Detailed contributions and benefits</a></li>
+        <li><a href="#summary-contributions">What we contribute</a></li>
+        <li><a href="#evidence-map">Results and limits at a glance</a></li>
+        <li><a href="#about">About this report</a></li>
+        <li><a href="#at-a-glance">At a glance</a></li>
+        <li><a href="#use-case">The use case</a></li>
+        <li><a href="#how-it-developed">How it developed</a></li>
+        <li><a href="#live-run">Live production run (fork.5)</a></li>
+        <li><a href="#cache-reuse">The cache-reuse investigation</a></li>
+        <li><a href="#validation">How it was validated</a></li>
+        <li><a href="#source-code">Source code and commit map</a></li>
+        <li><a href="#contribution">Proposed contribution</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="toc-label">oMLX</p>
+      <ul>
+        <li><a href="#premises">Premises and results</a></li>
+        <li><a href="#pr1-current-main">PR1 evidence on newer upstream <code>main</code></a></li>
+        <li><a href="#fork-current-main">The whole fork against <code>main</code> c0b1056b</a></li>
+        <li><a href="#fork-fix-revalidation">Re-validation with the prefill fix</a></li>
+        <li><a href="#tq-restored-prefill">PR2: slow suffix prefill after a restored prefix</a></li>
+        <li><a href="#park-strategy">The strategy: pause, don't abort</a></li>
+        <li><a href="#c7-final-results">Pause-resume final results</a></li>
+        <li><a href="#what-was-built">What was built</a></li>
+        <li><a href="#preserve-thinking"><code>preserve_thinking: true</code>, measured</a></li>
+        <li><a href="#open-findings">Open findings</a></li>
+        <li><a href="#contribution-omlx">Contribution to oMLX</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="toc-label">gentle-shell</p>
+      <ul>
+        <li><a href="#gentle-shell">Making the harness cache-friendly</a></li>
+        <li><a href="#gentle-shell-cost">What it cost on the server</a></li>
+        <li><a href="#gentle-shell-fix">The fix: a stable system prompt</a></li>
+        <li><a href="#gentle-shell-retests">Re-tests on upstream <code>main</code></a></li>
+        <li><a href="#gentle-shell-subagents">Subagents and background jobs</a></li>
+        <li><a href="#gentle-shell-notices">Harness notices and thinking retention</a></li>
+        <li><a href="#gentle-shell-other">Other harness findings</a></li>
+        <li><a href="#gentle-shell-proposal">A proposal for gentle-shell</a></li>
+        <li><a href="#contribution-gentle-shell">Contribution to gentle-shell</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+
+<section id="about" class="about">
+  <h2>About this report</h2>
+  <p class="lede">A field report for the maintainers of two projects: oMLX, the inference server, and gentle-shell, the agent harness. It follows one developer workstation running coding agents unattended: how the work started, how each problem was measured, what was changed in a fork, how it was validated, and which parts we would like to contribute upstream. Both projects were improved with the same method: measure on real traffic, attribute each loss to a cause, fix test-first, and validate against the other side.</p>
+  <p class="scope"><b>Scope.</b> The oMLX work started on v0.7.0 and is now based on v0.7.1.dev1, upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>. This is a field report on specific versions, not a general validation of the current fork or of today's upstream <code>main</code>. The C7 runs and the live production run used upstream oMLX <code>main</code> at <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>, the fork branch at the commits named in each section, and gentle-shell <code>main</code> at <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a>. Two re-validations are newer: the TurboQuant fix (PR1) on upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>, and the whole fork against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a>, which also surfaced a second upstream TurboQuant defect (PR2). The branches proposed upstream are rebased on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>.</p>
+  <div class="meta"><span>Author: victor.perez@e-evolution.com</span><span>Model: Qwen3.8-27B-oQ4e-mtp (4-bit, Lightning MTP, TurboQuant 4-bit KV)</span><span>Client: pi coding agent + gentle-shell harness 4.0.0 (package gentle-pi; commits per test below) + subagents</span><span>oMLX: v0.7.0 → v0.7.1.dev1 (upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>); fork app 0.7.1.dev1-fork.7</span><span>Period: 2026-09-30 → 2026-10-11</span><span>Source code: <a href="https://github.com/e-Evolution/omlx">github.com/e-Evolution/omlx</a> (<a href="#source-code">commit map</a>)</span></div>
+</section>
+
+<section id="evidence-map">
+  <h2>Results and limits at a glance</h2>
+  <p>Read each result with its baseline. Repeated requests within one run are not independent benchmark repetitions. Follow the evidence links for exact settings, logs and commit identities.</p>
+  <div class="tbl" tabindex="0" role="region" aria-label="Evidence matrix, horizontally scrollable"><table>
+    <thead><tr><th>Question</th><th>Baseline and runtime</th><th>Evidence</th><th>Limit</th></tr></thead>
+    <tbody>
+      <tr><td>Was the documentation pilot completed end to end?</td><td>The author's project outcome</td><td>The author confirms that, with the proposed server and harness fixes applied during the pilot, the project completed the wiki documentation with images of the new ADempiere version and an assistant that answers questions, using local models, consumer hardware and open-source tooling.</td><td>Reported completion with the proposed fixes applied, not the original configuration or an upstream release containing them; the benchmarks are not an independent content-quality audit.</td></tr>
+      <tr><td>Do batches finish unattended?</td><td>Historical v0.7.0 comparison</td><td>P5: 3/3 fork batches, 0/3 upstream. <a href="#premises">Evidence</a></td><td>Measures batch completion separately from the final project outcome; not re-run against newer main.</td></tr>
+      <tr><td>Does PR1 improve batched decode?</td><td>main 25aebb3e; same pinned venv</td><td>B=3: 5–12× faster per row; 11–15 GB lower peak. One run per build and MTP setting. <a href="#pr1-current-main">Evidence</a></td><td>No degeneration reproduced on this baseline; outputs are not token-identical to B=1.</td></tr>
+      <tr><td>Does PR2 improve restored-prefix prefill?</td><td>main c0b1056b; pinned venv</td><td>Restored/cold suffix ratio: 2.41× → 0.92×. One run per configuration. <a href="#tq-restored-prefill">Evidence</a></td><td>One model and prompt shape; extra dense-cache memory must fit.</td></tr>
+      <tr><td>Do requests survive pressure after the prefill fix?</td><td>Fork 4aa66150 against main 013bc3f3; same venv</td><td>Text and image decode finish 3/3 on the fork at the compared ceilings; main finishes 0/3. One run per scenario. <a href="#fork-fix-revalidation">Evidence</a></td><td>Forced pressure, not typical load; some other upstream scenarios were not re-run.</td></tr>
+      <tr><td>Does the server sustain real agent traffic?</td><td>Unpaired fork.5 live run; v0.7.0 app runtime</td><td>333 requests; 94.8% of prompt tokens cached; 0 memory aborts. <a href="#live-run">Evidence</a></td><td>Log window 02:00–04:10; no memory pressure, so pause/resume was not exercised.</td></tr>
+      <tr><td>Does the todo fix stabilize prompts?</td><td>Recorded traffic before/after the gentle-shell fix</td><td>System-prompt mutations: 21/61 → 0/90 requests; 31/31 append-only pairs. <a href="#gentle-shell-fix">Evidence</a></td><td>Observational samples with different workloads; not a controlled latency or hosted-cost benchmark.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="at-a-glance">
+  <h2>At a glance</h2>
+  <div class="figs">
+    <div class="fig"><b>116 → 44 GB</b><span>memory peak, 2×130k concurrent (vs upstream main at <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>), 3× faster</span></div>
+    <div class="fig"><b>3/3 vs 0/3</b><span>unattended agent batches finished without a human (vs v0.7.0)</span></div>
+    <div class="fig"><b>97–99.7%</b><span>prefix-cache hit on turns that add a new image</span></div>
+    <div class="fig"><b>~30 s/h</b><span>decode frozen by media prefill with one image session after the cache fixes (n=2). Before the fixes ~1100 s/h was observed on a heavier, overlapping workload, so the two are indicative, not a controlled comparison</span></div>
+    <div class="fig"><b>9/9 vs 0/9</b><span>requests finished under forced memory pressure, 0 aborts with pause and resume (vs upstream main at <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>)</span></div>
+    <div class="fig"><b>5–12×</b><span>faster batched TurboQuant decode per row with PR1 on upstream main <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> (B=3, 20k/45k/135k prompts), 11–15 GB lower peak, one run per build</span></div>
+    <div class="fig"><b>2.41× → 0.92×</b><span>suffix prefill after a restored TurboQuant prefix, against a cold prefill of the same positions, on upstream main <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> with PR2 (36k-token suffix after a 74k prefix, one run)</span></div>
+    <div class="fig"><b>21/61 → 0/90</b><span>recorded requests that rewrote the system prompt, before and after the gentle-shell todo fix (<a href="#gentle-shell">gentle-shell</a>)</span></div>
+    <div class="fig"><b>~1.05M</b><span>tokens re-prefilled in ~1.5 days by system-prompt changes in the harness, ≈80–85 min of GPU time, before the gentle-shell fix</span></div>
+    <div class="fig"><b>0 / 333</b><span>memory aborts across 333 live agent requests at up to 5 concurrent, 94.8% of prompt tokens from cache (fork.5, server log 02:00–04:10)</span></div>
+  </div>
+  <div class="callout warn" style="margin-top:14px"><b>Harness bug found along the way (gentle-shell).</b> In affected parent sessions with open todos, the todo extension rewrites the system prompt on every user prompt, with a stale counter that changes each time. On the tested oMLX setup, these rewrites break prefix reuse from the changed region onward. Other backends may also lose reuse, depending on their cache rules; hosted-provider effects were not measured here. It is still present on upstream <code>main</code> (<a href="https://github.com/e-Evolution/gentle-shell/commit/d42264b4a7913665972c7d4c5b7278459ed105e4">d42264b4</a>, 2026-10-11). A tested fix is ready on <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a>, tracked in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a>. See <a href="#gentle-shell">the gentle-shell section</a>.</div>
+  <div class="callout warn" style="margin-top:14px"><b>Upstream bug found along the way (oMLX).</b> In batched decode with TurboQuant, left-padded short rows attend over zero padding columns, and every padded decode step goes through a slow dequantize-everything path. In synthetic tests the short row's output norm drops to 0.32× of the reference. With Lightning MTP, padded verify forwards also miss the per-row path, and the verify-tail rollback re-quantized the whole batch every cycle; upstream has since fixed the rollback in #3127. A tested fix for the other two defects is ready as our first pull request (PR1).
+    <ul>
+      <li><b>On newer <code>main</code> (<a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>, with its pinned dependencies)</b>, PR1 is primarily a performance fix. A B=3 batch of 20k/45k/135k prompts completes on both trees without degeneration, and PR1 makes batched decode 5–12× faster per row, cuts the B=3 phase from 345 to 66 s (MTP on) and from 780 to 65 s (MTP off), and lowers the peak by 11–15 GB. The correctness signal is weaker: with MTP off, <code>main</code>'s batched rows leave the deterministic B=1 output at about token 1–2, PR1's at about token 8–10. See <a href="#pr1-current-main">the re-validation</a>.</li>
+      <li><b>Historical (<code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> on the v0.7.0 app runtime):</b> the same batch degenerated in one run (4-gram 0.33/0.29/0.18, 121 GB) and aborted in another (6 memory aborts, 120 GB). This does not reproduce on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>.</li>
+    </ul></div>
+</section>
+
+<section id="use-case">
+  <h2>The use case</h2>
+  <p>The setup is one Apple M5 Max (128 GB) serving one local model to several <a href="https://github.com/earendil-works">pi</a> coding-agent sessions. pi runs the <a href="https://github.com/Gentleman-Programming/gentle-shell">gentle-shell harness</a> (package <code>gentle-pi</code>) on top, which adds the agent workflow: orchestration, a todo tool, review integration and subagent delegation. Subagents run as separate pi processes, each with the same harness. The sessions read whole source files and take screenshots. Prompts are large: across 1,260 recorded requests the median was 107k tokens and the p90 168k. Each turn re-sends the growing conversation, so the prefix cache decides whether a turn costs 1 second or several minutes.</p>
+  <p>The goal was simple to state: leave the machine working until every job finishes. That means using free memory for concurrency, never throwing away completed work, and pausing rather than aborting when memory is tight.</p>
+  <div class="media-grid">
+    <figure>
+      <video controls playsinline preload="none" poster="media/omlx-gentle-shell-intellij-load-poster.png" width="960" height="924" aria-label="oMLX dashboard, a gentle-shell terminal and IntelliJ side by side, with oMLX serving four active requests">
+        <source src="media/omlx-gentle-shell-intellij-load.mp4" type="video/mp4">
+        <a href="media/omlx-gentle-shell-intellij-load.gif">View the original screen recording as a GIF</a>.
+      </video>
+      <figcaption>One local oMLX Fork server, two clients: gentle-shell subagents and the IntelliJ AI assistant send requests at the same time, and oMLX serves 3&ndash;4 active requests side by side on Qwen3.8-27B (95.5% cache efficiency). 10&times; speed.</figcaption>
+    </figure>
+  </div>
+  <p>Field illustration from the later <a href="#field-footage">fork.5 recordings</a>, not a benchmark of the original configuration.</p>
+  <h3>What broke on stock v0.7.0</h3>
+  <ul>
+    <li>Several concurrent long prompts reached the memory guard's hard watermark. Requests were <b>aborted mid-prefill</b>, all prefill progress was lost, and the agent stopped waiting for a human.</li>
+    <li>Raising concurrency made things <b>worse</b>. In a 3-request mixed benchmark, concurrent finished in 538 s against 246 s serial, with 6 aborts.</li>
+    <li>When batched decode did run, short rows in a left-padded TurboQuant batch produced <b>degenerate output</b>.</li>
+    <li>Prefix-cache reuse was high on average but <b>collapsed in bursts</b>: single-turn losses of 70k–170k tokens.</li>
+  </ul>
+</section>
+
+<section id="how-it-developed">
+  <h2>How it developed</h2>
+  <div class="timeline">
+    <div class="step"><h3>The question</h3><p>After the 0.7.0 memory-guard tiers landed, the question was whether a request could pause when memory runs out and resume when it frees, instead of aborting. We checked where that belongs, client or server, and settled on both. The pi extension pauses and auto-continues. The server keeps prefill progress and parks instead of aborting.</p></div>
+    <div class="step"><h3>Premises before code</h3><p>We wrote six falsifiable premises (P1–P6), each tied to a benchmark that runs against upstream v0.7.0 on the same machine, model and prompts. Nothing counted as done until its premise passed against upstream.</p></div>
+    <div class="step"><h3>Implementation in small reviewed slices</h3><p>The work was done test-first, with one reviewable commit per behaviour and an independent review on each slice (four review lenses on the high-risk ones). It went into a fork branch off <code>v0.7.0</code> and was packaged as a side-by-side app for daily use.</p></div>
+    <div class="step"><h3>The batching surprise</h3><p>Real concurrent use exposed the padded-attention corruption and very slow batched TurboQuant decode, about 1.5 tok/s per row. Fixing the correctness bug and adding a single-launch ragged kernel brought per-row decode to about 13 tok/s.</p></div>
+    <div class="step"><h3>The cache-reuse investigation</h3><p>Once nothing aborted, the remaining cost was re-prefill. We recorded every request payload with a small client-side recorder and attributed each cache break to a cause. About 2.7M tokens were re-prefilled over roughly 1.5 days. The largest cause was in the gentle-shell harness and two were in the server; all three were fixed.</p></div>
+    <div class="step"><h3>Harness and server, tested together</h3><p>Testing the gentle-shell harness against the running oMLX server, with server-side monitoring, exposed a cache invalidation that neither side showed on its own: while todos were open, the harness rewrote its system prompt on every user prompt. The fix went to gentle-shell, and the method became part of this report (<a href="#gentle-shell">details</a>).</p></div>
+    <div class="step"><h3>Live validation</h3><p>Recorded traffic and daily use helped validate the changes exercised by those workloads. Structured logs (cache outcome, TTFT breakdown, eviction summary) supported the measurements; features tested only in unit or forcing tests are identified separately.</p></div>
+    <div class="step"><h3>Pause and resume, end to end</h3><p>A forcing benchmark showed that the prefill park works but cannot save a batch, because decoding rows and image prompts still aborted. We built the full cycle: decode pause, memory-aware resume, a never-fits error and parkable image prompts. Its first validation run failed in several ways. Each failure was traced in the logs and fixed test-first, until every request finished under forced pressure with 0 aborts.</p></div>
+    <div class="step"><h3>Live production run</h3><p>The packaged fork (0.7.0-fork.5) then served real unattended agent work for 1 h 39 min, with the concurrency limit raised live from 3 to 5. It logged 0 memory aborts and served 94.8% of prompt tokens from the prefix cache. Memory stayed far from the pressure line, so pause and resume never fired.</p></div>
+  </div>
+</section>
+
+<section id="premises">
+  <h2>Premises and results</h2>
+  <p>Start with the newer re-validations below. The original comparisons are retained as historical evidence; they are not measurements of today's upstream version.</p>
+  <details class="editorial-details" id="historical-premises">
+    <summary>Historical comparisons: v0.7.0 and main b7c7929e</summary>
+  <p>All runs used an isolated server on a separate port with a fresh cache directory, the same model and the same prompts. They compared upstream v0.7.0 against the fork.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Premise</th><th>Upstream v0.7.0</th><th>Fork</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>P1 · No lost work (cancel mid-prefill, re-issue)</td><td class="n">0 tokens cached</td><td class="n">73,728 tokens cached</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P2 · 2×~130k concurrent, no aborts</td><td class="n">4 aborts · peak 116 GB</td><td class="n">0 aborts · peak 44 GB</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P3 · Greedy batch correctness (B=3 vs B=1)</td><td>degenerate short rows</td><td>no degeneration; divergences only at bf16 near-ties</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P4 · Concurrency pays (3 mixed requests)</td><td class="n">538 s vs 246 s serial · 6 aborts</td><td class="n">241 s vs 247 s serial · 34.6 vs 29.7 tok/s aggregate</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P5 · Unattended pi batch</td><td class="n">0/3 completed</td><td class="n">3/3 completed</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P6 · Single 110k request, no regression</td><td>baseline</td><td class="n">prefill +1.6% · decode +8.5%</td><td><span class="pill ok">PASS</span></td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">P4's wall-clock criterion is close to run-to-run noise: one of five fork runs missed it by 0.2 s. The aggregate-decode criterion passes with margin.</p>
+  <h3>Re-run against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> (v0.7.0 app runtime)</h3>
+  <p>We rebased the fork onto upstream <code>main</code> (<a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>) and re-ran the premises. Each build ran alone on the machine, through the same runtime (the v0.7.0 app's Python, dependencies and compiled kernels, mlx-vlm 0.7.1), so the two differ only in source.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Premise</th><th><code>main</code></th><th>Fork rebased on <code>main</code></th><th>Reading</th></tr></thead>
+    <tbody>
+      <tr><td>P1 · Re-issue after mid-prefill cancel</td><td class="n">0 cached · 110,031 re-prefilled</td><td class="n">73,728 cached · 36,303 re-prefilled</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P2 · 2×~130k concurrent</td><td class="n">0 aborts · peak 116 GB · 1,427 s</td><td class="n">0 aborts · peak 44 GB · 461 s</td><td><span class="pill ok">PASS</span> <code>main</code> survives, but near the memory ceiling and about 3× slower</td></tr>
+      <tr><td>P3 · Greedy batch correctness (B=3 vs B=1)</td><td>B=3 batch aborted (6 aborts, 120 GB peak); does not reproduce on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a></td><td>no row degenerate; 4-gram ratios 1.00 / 1.00 / 0.99</td><td><span class="pill ok">fork correct</span> divergences at bf16 near-ties</td></tr>
+      <tr><td>P4 · Concurrency pays (3 mixed requests)</td><td class="n">248 s concurrent · 251 s serial · 0 aborts</td><td class="n">227 s concurrent · 224 s serial · 0 aborts</td><td><span class="pill mid">within noise</span> no gain claimed against <code>main</code></td></tr>
+      <tr><td>P6 · Single 110k request</td><td class="n">prefill 755 tok/s · decode 21.1 tok/s</td><td class="n">744 tok/s (−1.4%) · 20.6 tok/s (−2.4%)</td><td><span class="pill ok">within the −5% limit</span></td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">Three points to note. First, <code>main</code> no longer aborts in P2 or P4 the way v0.7.0 did. Second, the fork's concurrency gain in P4 is within noise against <code>main</code>. Third, P5 needs the live agent client, so it was not re-run. The clear wins against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> on this runtime are no lost work (P1), a much lower memory peak and faster completion under concurrency (P2), and batch correctness (P3). P3 was re-run on newer <code>main</code> for PR1, where the picture changes (<a href="#pr1-current-main">below</a>).</p>
+
+  </details>
+  <h3 id="pr1-current-main">Re-validation on newer upstream <code>main</code></h3>
+  <div class="media-grid">
+    <figure>
+      <video controls playsinline preload="none" poster="media/omlx-batched-decode-b5-poster.png" width="960" height="396" aria-label="oMLX dashboard with five requests decoding together">
+        <source src="media/omlx-batched-decode-b5.mp4" type="video/mp4">
+        <a href="media/omlx-batched-decode-b5.gif">View the original screen recording as a GIF</a>.
+      </video>
+      <figcaption>Batched decode for five concurrent requests on one Qwen3.8-27B model (TurboQuant KV), cache efficiency 95.5%. 10&times; speed.</figcaption>
+    </figure>
+  </div>
+  <p>Field illustration of concurrent decode from the <a href="#field-footage">fork.5 recordings</a>. The paired B=3 measurements below are separate evidence; this B=5 clip is not their recording.</p>
+  <p>The evidence above was measured on <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> with the v0.7.0 app runtime. It was re-checked on newer upstream <code>main</code> commits in two rounds: PR1's premise on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> (this subsection), then the whole fork against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> (<a href="#fork-current-main">next subsection</a>). Every branch proposed for upstream is now rebased on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a> (2026-10-10), with its focused tests and CI's command re-run there (<a href="#contribution">Proposed contribution</a>). The upstream commits between <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> and <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a> do not touch the TurboQuant files PR1 changes.</p>
+  <p><b>PR1 on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>.</b> PR1 was rebased on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> at the time, so its premise, P3, was re-run on that tree. <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> and PR1 (<a href="https://github.com/e-Evolution/omlx/commit/61bd8a06bda0fd72b1d71d9912823fc587d29486">61bd8a06</a>, two commits on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>) ran from one venv built from <code>main</code>'s pins: mlx 0.32.3, mlx-vlm 0.7.7, mlx-lm <a href="https://github.com/ml-explore/mlx-lm/commit/94cdcae13b266c337bcaca09b97b9c5a9c0e2cde">94cdcae1</a>, transformers 5.17.0. Only the source tree changed between them. The prompts are about 20k / 45k / 135k tokens, byte-identical to the earlier runs, with 512 new tokens and greedy sampling. Three B=3 rows are restored from the prefix cache, decode together, and are compared with the same prompts restored at B=1. One run per build, one server at a time, with the live app quit.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Build</th><th>MTP</th><th>Aborts</th><th>Peak</th><th>Distinct 4-gram, B=3 (20k / 45k / 135k)</th><th>Batched decode tok/s per row</th><th>B=3 phase</th><th>Run wall</th></tr></thead>
+    <tbody>
+      <tr><td><code>main</code></td><td>on</td><td class="n">0</td><td class="n">117 GB</td><td class="n">1.00 / 1.00 / 0.99</td><td class="n">1.54 / 1.53 / 1.49</td><td class="n">345 s</td><td class="n">1015 s</td></tr>
+      <tr><td>PR1</td><td>on</td><td class="n">0</td><td class="n">102 GB</td><td class="n">1.00 / 1.00 / 0.98</td><td class="n">8.35 / 8.83 / 7.84</td><td class="n">66 s</td><td class="n">682 s</td></tr>
+      <tr><td><code>main</code></td><td>off</td><td class="n">0</td><td class="n">112 GB</td><td class="n">1.00 / 1.00 / 0.98</td><td class="n">0.66 / 0.66 / 0.66</td><td class="n">780 s</td><td class="n">1492 s</td></tr>
+      <tr><td>PR1</td><td>off</td><td class="n">0</td><td class="n">101 GB</td><td class="n">1.00 / 0.99 / 0.98</td><td class="n">8.17 / 8.15 / 8.05</td><td class="n">65 s</td><td class="n">782 s</td></tr>
+    </tbody>
+  </table></div>
+  <ul style="margin-top:10px">
+    <li><b>Performance.</b> Neither tree aborts or degenerates. PR1 makes batched decode 5.4× faster per row with MTP on and 12× faster with MTP off, cuts the B=3 phase from 345 to 66 s and from 780 to 65 s, and lowers the process peak by 11–15 GB. <code>main</code>'s 0.66 tok/s with MTP off is what the microbenchmark predicts: about 86 ms per TurboQuant layer on the padded path, times 15 layers. B=1 decode is about 40 / 29 / 17 tok/s with MTP on, the same on both trees, so batched rows remain slower than single rows.</li>
+    <li><b>Identity against B=1, MTP off.</b> The B=1 reference is deterministic here: a second B=1 run is identical on both trees. <code>main</code>'s batched rows leave it at about token 1–2 on the 20k and 45k rows; PR1's at about token 8–10, and at about token 45 on the 135k row. Neither is token-identical. Upstream has no logprob dump, so these divergences cannot be classified as near-tie noise or as a defect. The earlier departure on <code>main</code> is consistent with padded-row attention, not proven by it.</li>
+    <li><b>Identity, MTP on.</b> Two B=1 runs already differ from each other, so the B=3 divergences say nothing about batching.</li>
+    <li><b>What changed since the earlier evidence.</b> On <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> with the v0.7.0 app runtime (mlx-vlm 0.7.1), <code>main</code> degenerated (4-gram about 0.33 / 0.29 / 0.18 at 121 GB) in one run and aborted (6 memory aborts at 120 GB) in another. Neither reproduces on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>. Two things differ: the 52 upstream commits in between (including #3127's exact rollback and memory-guard and decode-fairness changes) and the runtime. With one run per build, which of the two removed it is unknown.</li>
+  </ul>
+  <div class="callout"><b>Caveats.</b> One run per build, so walls and peaks are single samples. The venv has no compiled custom kernels (there is no Metal toolchain to build them here), so prefill and run walls are slower than in the shipped app, equally for both trees; TurboQuant attention uses JIT Metal kernels and is unaffected, and the B=3 decode comparison runs on the same runtime for both. Identity is judged by text only. Whether the earlier aborts and degeneration went away through upstream commits or through the runtime is unknown.</div>
+
+  <h3 id="fork-current-main">The whole fork against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a></h3>
+  <p>The fork was rebased again, onto upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> (the commit tagged v0.7.1.dev1). Both trees ran from one venv built from <code>main</code>'s pins (mlx 0.32.3, mlx-vlm 0.7.7), one server at a time, with the live app quit. The fork (<a href="https://github.com/e-Evolution/omlx/commit/6fbb3274e656df0ccabc8a330e59fc04866656b6" title="Measured as e24198f5. Published with local paths removed from benchmark defaults; the code is otherwise identical.">6fbb3274</a>) ran with the fork app's settings; <code>main</code> ran with plain settings. The forced-pressure scenarios are the C7 ones (<a href="#park-strategy">below</a>): three greedy prompts of about 130k / 115k / 100k tokens started 0.5 s apart, <code>hard_threshold</code> 0.8, the same custom ceiling for both trees. Pooled-buffer reclaim is always on now, because upstream removed the switch that disabled it. One run per scenario.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Scenario</th><th>Ceiling</th><th>Fork</th><th><code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a></th></tr></thead>
+    <tbody>
+      <tr><td>Text decode</td><td class="n">44 GB</td><td><span class="pill ok">3/3</span> 0 aborts; 2 prefill parks, both resumed</td><td><span class="pill no">0/3</span> abort-all mid-prefill after 25 s</td></tr>
+      <tr><td>Image decode</td><td class="n">42 GB</td><td><span class="pill ok">3/3</span> 0 aborts; 2 decode pauses, both resumed (also 3/3 at 44 GB)</td><td><span class="pill no">0/3</span> two abort-alls and one prefill-guard rejection</td></tr>
+      <tr><td>Image prefill</td><td class="n">44 GB</td><td><span class="pill ok">3/3</span> 0 aborts; 2 prefill parks, both resumed</td><td><span class="pill ok">3/3</span> 0 aborts</td></tr>
+      <tr><td>Never fits (60k prompt, <code>max_tokens</code> 2,000,000)</td><td class="n">42 GB</td><td>400 <code>context_exceeds_capacity</code> in 0.11 s, all 7 fields; capacity endpoint 200; header 288,739</td><td>200; endpoint 404; no header</td></tr>
+    </tbody>
+  </table></div>
+  <ul style="margin-top:10px">
+    <li><b>Identity after a pause, MTP off.</b> Four forced decode pauses per request (12 in total, at output offsets 100, 323, 1044 and 1706) give token-identical output for 3/3 requests.</li>
+    <li><b>Park during a packed prefill.</b> Upstream's packed prefill now prefills concurrent prompts in one forward. A row parked while packed resumed, and all 3 requests finished with 0 aborts. Outputs differ from the alone references only at near-ties (an exact tie and a 0.125-nat margin), and a control at 56 GB without any park diverges at the same tokens. The row that was never parked is token-identical with and without its companion's park.</li>
+    <li><b>A fork defect found and fixed during this round.</b> At 42 GB the first image-decode run rejected a lone request that fits alone, on a memory reading that still held a just-finished request's buffers. The fix re-measures before deciding and renews the request's eviction budget when the rows it waited on leave (strict TDD); the re-run passed at 42 and 44 GB.</li>
+  </ul>
+  <p>Premises, fork against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a>, same venv:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Premise</th><th>Fork</th><th><code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a></th><th>Reading</th></tr></thead>
+    <tbody>
+      <tr><td>P1 · Re-issue after mid-prefill cancel</td><td class="n">73,728 cached · TTFT 198.9 s</td><td class="n">0 cached · TTFT 192.2 s</td><td><span class="pill mid">cache PASS, no TTFT gain</span> on this commit; with the prefill fix the re-issue takes 80–82 s against 192–193 s on <code>main</code> (<a href="#fork-fix-revalidation">re-validation</a>), traced to an upstream defect, <a href="#tq-restored-prefill">fixed below</a></td></tr>
+      <tr><td>P2 · 2×~130k concurrent</td><td class="n">2/2 · 0 aborts · peak 51 GB · 564 s</td><td class="n">2/2 · 0 aborts · peak 116 GB · 870 s</td><td><span class="pill ok">PASS</span> lower peak, faster</td></tr>
+      <tr><td>P3 · B=3 batch, MTP on</td><td class="n">13.0 / 12.2 / 10.9 tok/s per row · peak 58 GB</td><td class="n">1.55 / 1.54 / 1.50 tok/s per row · peak 117 GB</td><td><span class="pill ok">no regression</span> no visible cost from #3127's rollback; the fork carries PR1 and the ragged kernel</td></tr>
+      <tr><td>P4 · Concurrency (3 mixed requests, 2 runs)</td><td class="n">292.4 s concurrent · 287.7 s serial · 12/12</td><td class="n">289.3 s concurrent · 285.9 s serial · 12/12</td><td><span class="pill mid">parity</span> both prefill-bound without compiled kernels</td></tr>
+      <tr><td>P6 · Single 110k request, decode</td><td class="n">22.77 tok/s</td><td class="n">22.61 tok/s</td><td><span class="pill ok">no regression</span> +0.7% at 110k, +4.6% at 20k</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">P6's first measurement (3 runs, 256 decode tokens each, not interleaved) showed the fork's decode 7.1% slower, the same with every fork setting off. It did not reproduce. A re-measurement with 1,024 decode tokens and three interleaved sessions per tree, MTP on, gives the medians in the table, and a per-verify-cycle cost of +0.9% (standard error 1.4%) at 110k after controlling for drafted tokens. With MTP off both trees decode at 16.8–17.0 tok/s at 110k and 24.9–25.4 at 20k. The first gap came from MTP acceptance in a short sample (1.90 against 2.01 tokens per cycle) plus drift between runs that were not interleaved, so it was closed as noise without a bisect.</p>
+  <h3 id="fork-fix-revalidation">Re-validation with the prefill fix: fork <a href="https://github.com/e-Evolution/omlx/commit/4aa661507d900992c9a587b0d8c03c41400aa27b" title="Measured as 4e81e443. Published with local paths removed from benchmark defaults; the code is otherwise identical.">4aa66150</a> against <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a></h3>
+  <p>The runs above predate the <a href="#tq-restored-prefill">restored-prefix prefill fix</a>, which changes how a resumed park or a re-issued request continues over restored TurboQuant blocks. So the forced-pressure scenarios and P1/P2 ran again on the fork with the fix (<a href="https://github.com/e-Evolution/omlx/commit/4aa661507d900992c9a587b0d8c03c41400aa27b" title="Measured as 4e81e443. Published with local paths removed from benchmark defaults; the code is otherwise identical.">4aa66150</a>), against <code>main</code> at <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>, with the same venv, ceilings, prompts and settings. Every resume was checked in the log for the fix's <code>dequantized … restored TurboQuant layers</code> line, or its <code>Kept … quantized</code> fallback, and for the reservation that follows it. One run per scenario.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Scenario</th><th>Ceiling</th><th>Fork + fix</th><th><code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a></th><th>Fix in the log</th></tr></thead>
+    <tbody>
+      <tr><td>Text decode</td><td class="n">44 GB</td><td><span class="pill ok">3/3</span> 0 aborts; 2 prefill parks, both resumed</td><td><span class="pill no">0/3</span> abort-all mid-prefill after 22 s</td><td>not reached: the parks resumed from 0 committed tokens</td></tr>
+      <tr><td>Image decode</td><td class="n">44 / 42 GB</td><td><span class="pill ok">3/3</span> 0 aborts at both; 1 and 2 decode pauses, all resumed</td><td><span class="pill no">0/3</span> two abort-alls, one admission rejection (44 GB)</td><td>not reached: a decode pause resumes its exact cache, with no suffix prefill</td></tr>
+      <tr><td>Image prefill</td><td class="n">44 / 42 GB</td><td><span class="pill ok">3/3</span> 0 aborts at both; at 42 GB one prefill park, resumed solo; wall 640 s (2,132 s before the fix)</td><td>not re-run (no scheduler or TurboQuant change since <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a>)</td><td>7 dequantize lines for the 2,048-token image block restored by each prompt, including the resumed park; reservations across 16 caches</td></tr>
+      <tr><td>Never fits</td><td class="n">42 GB</td><td>400 in 0.11 s, all 7 fields; capacity endpoint 200; header 288,900</td><td>not re-run</td><td>-</td></tr>
+      <tr><td>Packed prefill, MTP off</td><td class="n">44 / 42 GB</td><td><span class="pill ok">3/3</span> 0 aborts; packed, but no park at either ceiling</td><td>-</td><td>not reached (no restore)</td></tr>
+    </tbody>
+  </table></div>
+  <ul style="margin-top:10px">
+    <li><b>Image prefill is where the fix shows.</b> Each image prompt restores a 2,048-token block from the paged cache. Before the fix, that small quantized prefix kept the whole 100k–130k prefill on the quantized path: TTFT 1,797 / 1,267 / 2,130 s with two parks. With the fix: 249 / 460 / 637 s. The dense layers are now in the prefill reservation, so admission runs the prompts one after another. At 42 GB a prompt admitted beside another, both dense, was parked under hard pressure 4.6 s later, resumed alone, dequantized again and completed, with a 37 GB peak. That is a park and resume across the dense step on hardware, with no abort.</li>
+    <li><b>Re-issue after a cancel (P1, 2 runs per tree).</b> The fork keeps 73,728 tokens and re-issues in <b>80.0 and 82.0 s</b>. <code>main</code> keeps nothing and re-issues in 192.0 and 193.0 s, the same as its cold prefill. Before the fix the same fork code took 198.9 s. The log shows <code>dequantized 15 restored TurboQuant layers (73728 tokens) for a 36302-token suffix prefill in 0.42s</code>, then a reservation across 16 caches (+2.22 GB).</li>
+    <li><b>Two concurrent 130k prompts (P2).</b> 2/2, 0 aborts, peak 53 GB, wall 574 s, against 51 GB and 564 s before the fix. No regression; no restore is involved.</li>
+    <li><b>Identity after a pause, MTP off.</b> 12 forced pauses per run, all resumed exactly. Two requests are token-identical; the third departs at a 0.125-nat near-tie. Its drift starts at token 4, before its first pause, after a one-off prefill throttle. The commit before the fix gives the same tokens in the same session (logprob-identical, 2,000/2,000), so neither the fix nor the pause path causes it.</li>
+    <li><b>Packed prefill.</b> Output with pressure equals the no-pressure control (the 42 GB run differs from it at one exact tie), and both depart from the alone references at the same tokens, as before. This session never parked a packed row, so that path was not re-exercised.</li>
+  </ul>
+  <div class="callout"><b>Runtime.</b> These runs used the venv, which has no compiled custom kernels, so the absolute prefill numbers are lower than in the app, equally for both trees. The packaged fork now runs on the official 0.7.1.dev1 app runtime (oMLX Fork 0.7.1.dev1-fork.7, the fork's sources over the official app as donor, mlx 0.32.3 and mlx-vlm 0.7.7), with all five compiled custom kernels loading (5/5).</div>
+</section>
+
+<section id="tq-restored-prefill">
+  <h2>Upstream defect: slow suffix prefill after a restored TurboQuant prefix</h2>
+  <div class="media-grid">
+    <figure>
+      <video controls playsinline preload="none" poster="media/omlx-concurrent-prefill-poster.png" width="960" height="396" aria-label="oMLX dashboard prefilling three prompts while a fourth request generates">
+        <source src="media/omlx-concurrent-prefill.mp4" type="video/mp4">
+        <a href="media/omlx-concurrent-prefill.gif">View the original screen recording as a GIF</a>.
+      </video>
+      <figcaption>Three prompts prefilling in parallel while a fourth request keeps generating tokens. 12&times; speed.</figcaption>
+    </figure>
+  </div>
+  <p>Field illustration of concurrent prefill from the earlier <a href="#field-footage">fork.5 recordings</a>, not a recording of the restored-prefix fix or its paired benchmark below.</p>
+  <p>Tracing P1's missing TTFT gain on <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> led to a second upstream TurboQuant defect. After a paged-SSD prefix hit, the uncached suffix of a prompt prefilled about 2.4× slower per token than a cold prefill of the same positions. It reproduces on <code>main</code>, so it is not a fork bug, and with TurboQuant off the two take the same time.</p>
+  <h3>Mechanism</h3>
+  <ul>
+    <li>A paged-SSD hit restores TurboQuant layers as quantized <code>TurboQuantKVCache</code> objects (#1842), and the scheduler keeps them quantized while it prefills the suffix.</li>
+    <li>Every chunk of every TurboQuant layer then attends to the whole quantized prefix through the tiled quantized-attention path, never dense SDPA, so the cost grows with the prefix length.</li>
+    <li>The prefill capacity reservation reports <code>across 1 caches</code> after such a restore instead of 16, because only the unquantized last layer is a plain <code>KVCache</code> it can plan. That line is a symptom, not the cause.</li>
+  </ul>
+  <h3>Fix</h3>
+  <p>Before a suffix that needs more than one prefill chunk, the scheduler copies the restored TurboQuant layers into dense <code>KVCache</code> layers once, so suffix chunks run the same dense path as a cold prefill. At the end of prefill only the suffix is quantized and appended to the original TurboQuant cache, so the restored prefix codes are reused bit for bit instead of being quantized again. The step runs only when the dense layers, sized for the whole prompt, fit under the prefill peak target, the same gate as the prefill reservation; otherwise it logs that it kept the quantized prefix. A one-chunk suffix, such as a chat turn, keeps the current path. Two commits with 16 tests, on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>.</p>
+  <h3>Results</h3>
+  <p>Qwen3.8-27B, TurboQuant 4-bit KV on 15 of 16 KV layers, one server at a time from the pinned venv. A = 73,787 tokens, stored; B = A + 36,358 tokens with a 73,728-token prefix hit; positions [73,728, 110,086) of B compared with a cold prompt from the same session. One run per configuration.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Run</th><th>Restored suffix</th><th>Cold, same positions</th><th>Ratio</th><th>Reservation after the restore</th></tr></thead>
+    <tbody>
+      <tr><td><code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a>, MTP off</td><td class="n">197.9 s</td><td class="n">82.2 s</td><td class="n"><span class="pill no">2.41×</span></td><td><code>across 1 caches (+0.14GB)</code></td></tr>
+      <tr><td><code>main</code> + fix, MTP off</td><td class="n">87.3 s</td><td class="n">94.7 s</td><td class="n"><span class="pill ok">0.92×</span></td><td><code>across 16 caches (+2.23GB)</code></td></tr>
+      <tr><td>Fork + fix, fork settings, MTP on</td><td class="n">84.8 s</td><td class="n">85.0 s</td><td class="n"><span class="pill ok">1.00×</span></td><td><code>across 16 caches (+2.23GB)</code></td></tr>
+    </tbody>
+  </table></div>
+  <ul style="margin-top:10px">
+    <li><b>TTFT of B:</b> 198.8 s on <code>main</code>, 87.9 s with the fix. The one-off dense copy of 15 layers × 73,728 tokens takes 0.43 s.</li>
+    <li><b>Quality</b> (MTP off, greedy, 512 tokens, per-token logprobs from a local debug hook): cold against cold is identical. Restored output, with or without the fix, departs from cold only at near-ties (a 0.125-nat margin, one bf16 logprob step), at the same tokens, because the quantized prefix itself shifts the distribution. With the fix and without it, the restored outputs agree for the first 239 and 97 tokens, then part at exact ties.</li>
+    <li><b>Memory:</b> the reservation after a restore now plans the dense layers (16 caches, +2.23 GB instead of 1 cache, +0.14 GB), and the memory guards see them as current usage. The prefill peak is 26.29 GB against 25.22 GB for a cold prompt of the same length; the difference is the quantized prefix, about 1 GB, kept until the end of prefill.</li>
+    <li><b>Live smoke on fork.7</b> (compiled kernels): a 41,323-token prompt with 24,576 tokens restored logged <code>dequantized 15 restored TurboQuant layers (24576 tokens) for a 16746-token suffix prefill in 0.16s</code> and a reservation across 16 caches. TTFT was 20.6 s, against 53.9 s for the same prompt cold.</li>
+  </ul>
+  <div class="callout"><b>On hardware under pressure</b> (fork with the fix, forced-pressure runs, <a href="#fork-fix-revalidation">above</a>): image prompts that restore a TurboQuant block, two dense suffix prefills admitted together, and a park and resume across the dense step all completed with 0 aborts. A re-issue after a cancel took 80–82 s against 192–193 s on <code>main</code>. The quantized fallback never fired, and decode-pause resumes never reach the step, because they restore their exact cache. The fix is proposed as a separate small pull request after PR1, independent of the pause-resume stack.</div>
+</section>
+
+<section id="park-strategy">
+  <h2>The strategy: pause, don't abort</h2>
+  <p>The most valuable idea of the project was a change of question. When memory reaches the hard limit, the stock server aborts in-flight requests, which throws away every token they prefilled and generated. We asked whether the server could <b>pause</b> a request instead. The paged SSD cache already existed and makes a pause cheap.</p>
+  <p>The first version, the park, covered only chunked prefill. A forcing benchmark (P7) showed that it works, and also where it stops. The next spike hit a decoding request, which could not be paused, and all three requests were aborted. That led to the full cycle. It pauses and resumes requests in prefill and in decode, image prompts included, and rejects a request that can never fit with a structured error. Below is what the code does, checked against the implementation (<code>omlx/scheduler.py</code>, <code>omlx/process_memory_enforcer.py</code>, <code>omlx/settings.py</code>).</p>
+  <h3>The first version: park a prefill</h3>
+  <ol>
+    <li><b>Save progress while prefilling (D1, <code>prefill_progress_commit_blocks</code>).</b> Every N completed blocks (4 blocks of 2048 tokens in the fork app), the prefilled blocks are stored in the paged SSD cache under the request's own block table. This needs the SSD cache. Without it the commit is skipped and a park resumes cold.</li>
+    <li><b>Park instead of abort (T7, <code>memory_pressure_park</code>).</b> At hard pressure (not emergency, and within a budget of 30 deferral polls), the memory enforcer asks the scheduler to park a victim before it considers an abort. The scheduler drops the victim's live KV cache, which frees the memory. It keeps the client stream, prompt, sampling parameters and arrival time. It pins the committed blocks against eviction, both in the in-memory block pool and in the SSD index. The request stays registered and waiting, and the client gets no error.</li>
+    <li><b>Resume from cold cache.</b> In the first version, a parked request was re-admitted after <code>park_resume_ok_polls</code> (default 3) consecutive <code>ok</code> polls, when the monitor went silent, or when nothing else could be admitted. The re-admission does a normal prefix lookup, which restores the committed blocks, and prefill continues from the last committed boundary. The full cycle replaced this resume rule with a memory-aware one (below).</li>
+  </ol>
+  <div class="callout warn">
+    <b>What the evidence showed before we forced it.</b> The park mechanism is covered by 32 test functions in <code>tests/test_scheduler_park.py</code> plus enforcer tests. Under normal settings it did not fire in our workload:
+    <ul>
+      <li>In P2 the fork finished with 0 aborts and 0 parks.</li>
+      <li>No live log contains a <code>Parked request</code> event.</li>
+      <li>The four live park attempts (2026-10-02) found only decoding requests and fell back to abort.</li>
+    </ul>
+    To test it deterministically we built a forcing benchmark.
+  </div>
+  <h3>Forcing it: the P7 park benchmark</h3>
+  <p>The setup was three concurrent long prompts of about 130k, 115k and 100k tokens, started 0.5 s apart, on an isolated server. It used a low custom memory ceiling (42 GB, hard watermark at 80%), and the pooled-buffer reclaim was disabled so pressure reaches the park decision. We ran it once with text-only prompts and once with an image early in each prompt, on the full fork and on upstream <code>main</code>, one server at a time.</p>
+  <pre>07:04:13  Hard memory pressure: parking a prefill victim on 1 scheduler(s) instead of aborting (poll 1/30)
+07:04:13  Parked request e2f2… at 129024 tokens committed (park 1/3), reason: hard memory pressure
+07:04:14  Resumed parked request e2f2…: cached=129024
+07:04:23  Park skipped for e2f2…: decoding, not in chunked prefill (memory pressure falls back to abort)</pre>
+  <div class="tbl"><table>
+    <thead><tr><th>Variant</th><th>Parks</th><th>Resume</th><th>Outcome</th><th>Re-issue after abort</th></tr></thead>
+    <tbody>
+      <tr><td>Fork, text (2 runs)</td><td class="n">1 per run</td><td class="n">0.5 s, all 129,024 committed tokens restored</td><td>The next spike hit the resumed request while decoding. It could not be parked, and all 3 aborted.</td><td>Warm. Restores of 129,024 tokens logged, 126,976 of 130,029 in a longer run.</td></tr>
+      <tr><td>Fork, image (2 runs)</td><td class="n">0</td><td>n/a</td><td>Skipped every time ("multimodal prompt … prefills in the external loop"), then aborted.</td><td>Warm. Restores of 129,024 and 98,304 tokens logged (about 98% of the prompt).</td></tr>
+      <tr><td><code>main</code>, text</td><td class="n">0</td><td>n/a (no park path)</td><td>2 requests rejected by the prefill preflight (HTTP 400), then re-issued cold.</td><td>Cold (0 cached).</td></tr>
+      <tr><td><code>main</code>, image</td><td class="n">0</td><td>n/a</td><td>3 of 3 aborted, and the cold re-issues aborted too.</td><td>None.</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">P7 proved the path works: a prefilling request was paused, its memory freed, and it resumed from the SSD cache in about half a second with every committed token restored. It did not save a batch, because decoding rows and image prompts still fell back to abort.</p>
+
+  <h3 id="full-cycle">The full cycle</h3>
+  <ol>
+    <li><b>Single victim (C1).</b> When nothing is pausable, abort one victim (largest live KV, newest on ties) instead of all. The enforcer waits for that memory to drain before it picks another. Emergency and model-unload keep abort-all. Opt-in: <code>OMLX_MEMORY_ABORT_SINGLE_VICTIM</code>.</li>
+    <li><b>Decode pause and resume (C2).</b> The pending sampled token is emitted first. The row's KV is extracted and stored as an exact SSD chain, keyed to the request and pinned, and the row leaves the batch while its stream stays open. The sampler, logits processors, stop-sequence position, parser state and remaining <code>max_tokens</code> are stashed. Resume restores the chain and re-inserts the row with no prefill, and the RNG is not reseeded. A singleton Lightning MTP row is first handed to standard decode. Batched MTP, DFlash, VLM-MTP and SpecPrefill rows are excluded.</li>
+    <li><b>Memory-aware resume (C3).</b> A paused request resumes when estimated free memory covers its need: the KV of its final length plus a transient. It never resumes at hard pressure. FIFO among paused requests, and the head-of-line hold reserves the room.</li>
+    <li><b>Never fits vs fits later (C4).</b> If weights + KV(prompt + <code>max_tokens</code>) + transient exceed capacity, the request gets HTTP 400 <code>context_exceeds_capacity</code> with seven numeric fields and <code>retryable: false</code>. A request that fits alone waits instead. <code>GET /v1/omlx/capacity</code> and the <code>X-oMLX-Max-Context-Tokens</code> header expose the numbers.</li>
+    <li><b>Harness compaction (C5, client side).</b> The pi extension compacts and retries on <code>context_exceeds_capacity</code>, and sets its compaction threshold from the capacity endpoint. It has unit tests but no live validation yet.</li>
+    <li><b>Image prompts (C6).</b> A text-only suffix after a cached last image is prefilled in the chunked path, so it can be paused. This route is taken only after checking that the suffix's mRoPE positions are <code>arange + delta</code> on every plane. Opt-in: <code>OMLX_MEDIA_TEXT_SUFFIX_CHUNKED</code>.</li>
+  </ol>
+  <p>Pause and resume are behind <code>memory_pressure_park</code> (default off). The never-fits gate, the fits-later wait and a progress-based admission-stall clock sit behind <code>memory_scheduling</code> (<code>auto</code> | <code>on</code> | <code>off</code>, default <code>auto</code>). <code>auto</code> turns them on only when the memory guard has an explicit ceiling (the <code>custom</code> tier); otherwise admission stays as on <code>main</code>. The C7 runs all set a custom ceiling, so their evidence holds under the default.</p>
+
+  <h3>C7: the extended benchmark, and what failed first</h3>
+  <p>C7 extends P7 to decode-phase pressure, image prompts, a never-fits request and greedy identity after a pause. The target is 0 aborts, with one server at a time and the live app quit. The first run (branch <a href="https://github.com/e-Evolution/omlx/commit/e80eb1f754e52922a88b7133ca5c510a681b4837" title="Measured as f92fbd7c. Published with local paths removed from benchmark defaults; the code is otherwise identical.">e80eb1f7</a>, 42 GB ceiling, hard 0.8, one run per pair) did not meet it:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Scenario</th><th>Branch (first run)</th><th><code>main</code></th></tr></thead>
+    <tbody>
+      <tr><td>Text decode</td><td>0/3. One prefill park and 2 decode pauses, all resumed (260,112 tokens restored), then 1 single-victim abort and 2 admission rejects</td><td>0/3, abort-all</td></tr>
+      <tr><td>Image decode</td><td>0/3, all aborted at once (abort-all)</td><td>0/3, abort-all</td></tr>
+      <tr><td>Image prefill</td><td>1/3; 2 requests failed after 60 s of <code>admission_paused</code></td><td>0/3, abort-all</td></tr>
+      <tr><td>Never fits</td><td>HTTP 200 (gate inactive), capacity <code>available: false</code></td><td>HTTP 200</td></tr>
+      <tr><td>Ceiling probes, text decode</td><td>48 GB: 9 pauses and resumes, then 3 aborts. 52 GB: 2 pauses, 3/3 done. 56 GB: no pause, 3/3 done.</td><td>n/a</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">Every pause logged <code>restored N tokens exactly</code> (stall 1.6–3.5 s), so the mechanics worked. The gaps were in policy and wiring. Each was traced to a root cause in the server logs and fixed test-first, one commit each:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Gap</th><th>Root cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>D1 · pauses thrash into aborts</td><td>The park hold's "nothing admitted" escape released a paused request on the next step without a fit check, so it paused again until the budget ran out.</td><td>Resume line min(admission line − 2%, hard watermark − 5%), anti-thrash rule, solo run with nothing admitted, decode budget 8 (<code><a href="https://github.com/e-Evolution/omlx/commit/5a881160b35321b5bd980c21b16a0ea0c42e75a0" title="Measured as c36b92fb. Published with local paths removed from benchmark defaults; the code is otherwise identical.">5a881160</a></code>)</td></tr>
+      <tr><td>D2 · never-fits gate dead on the VLM engine</td><td><code>nn.Module.parameters()</code> skips the adapter's underscore attribute <code>_vlm_model</code>, so the weights summed to 0 and no estimate existed.</td><td>Size the weights through the adapter (<code><a href="https://github.com/e-Evolution/omlx/commit/e5353d706b35941aba40569ceb211d343f9603ae" title="Measured as f6c601b0. Published with local paths removed from benchmark defaults; the code is otherwise identical.">e5353d70</a></code>)</td></tr>
+      <tr><td>D3 · abort-all during image prefill</td><td>The single-victim selection found no live request, because the external-loop prefill is not in <code>running</code>, and fell back to an abort-all that freed nothing.</td><td>External-loop prefill runs solo, no-live-victim aborts nothing below emergency, one decode pause before the emergency abort-all (<code><a href="https://github.com/e-Evolution/omlx/commit/19aa28ef8c74a6f56715cf865fde65f1e05221a9" title="Measured as 25685e36. Published with local paths removed from benchmark defaults; the code is otherwise identical.">19aa28ef</a></code>, <code><a href="https://github.com/e-Evolution/omlx/commit/31cab33d0f37974afb1740f0902a335ea5a59654" title="Measured as f7dd2bc8. Published with local paths removed from benchmark defaults; the code is otherwise identical.">31cab33d</a></code>)</td></tr>
+      <tr><td>D4 · identity unjudgeable</td><td>The references themselves were aborted at 42 GB.</td><td>References alone at 56 GB, with headroom (bench only)</td></tr>
+      <tr><td>D5 · third request fails after 60–90 s</td><td>The admission-stall clock kept running while other requests made progress (a solo decode, chunk-by-chunk prefill).</td><td>Count only time without progress; 600 s bound for deliberate holds (<code><a href="https://github.com/e-Evolution/omlx/commit/658994608a86869ba43ea972c6e310529c4541cd" title="Measured as 082a870c. Published with local paths removed from benchmark defaults; the code is otherwise identical.">65899460</a></code>)</td></tr>
+      <tr><td>D6 · pause effect not isolated</td><td>Divergences were B=3 vs B=1 batch numerics, some before the first pause.</td><td>Test-only <code>OMLX_DEBUG_FORCE_DECODE_PAUSE_AT</code> for B=1 forced pauses (<code><a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a></code>)</td></tr>
+      <tr><td>D7 · 46 GB image prefill rejected</td><td>With nothing admitted, the current-usage preflight counted memory no admitted request owned: queued vision embeddings plus about 1.9 GB not attributed.</td><td>Admit a lone head that fits under the ceiling alone (<code><a href="https://github.com/e-Evolution/omlx/commit/47c0c70b754d7796057b0a31c130b217298492ce" title="Measured as e80a1842. Published with local paths removed from benchmark defaults; the code is otherwise identical.">47c0c70b</a></code>); wait for a draining store write (<code><a href="https://github.com/e-Evolution/omlx/commit/3b72cde7bbda257bdb9ba4564c24c30e8600f92a" title="Measured as d34413ec. Published with local paths removed from benchmark defaults; the code is otherwise identical.">3b72cde7</a></code>, defensive)</td></tr>
+      <tr><td>D8 · MTP-on divergences after pauses</td><td>Likely MTP verify regrouping after a pause moving bf16 near-ties (hypothesis; not isolated with MTP on).</td><td>Identity re-run with MTP off: tokens identical (bench <code><a href="https://github.com/e-Evolution/omlx/commit/95dd47e8322df6dc5792f151193c3b594da24089" title="Measured as 8aa178c5. Published with local paths removed from benchmark defaults; the code is otherwise identical.">95dd47e8</a></code>)</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">Two intermediate runs show the progression:</p>
+  <ul>
+    <li><b>After D1–D3</b> (<a href="https://github.com/e-Evolution/omlx/commit/31cab33d0f37974afb1740f0902a335ea5a59654" title="Measured as f7dd2bc8. Published with local paths removed from benchmark defaults; the code is otherwise identical.">31cab33d</a>, 48 GB): never-fits passed, image decode finished 3/3 with 0 aborts, and no abort-all fired. But text decode (twice) and image prefill finished 2/3: the third request failed on the admission-stall timeout, which led to D5.</li>
+    <li><b>After D5–D6</b> (<a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a>): text and image decode finished 3/3. Image prefill at 46 GB still finished 2/3, which led to D7.</li>
+  </ul>
+
+  <h3 id="c7-final-results">Final results</h3>
+  <p>Same model, machine and scenarios, one run per pair. <code>main</code> (<a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>) ran the same scenarios at 48 GB. The branch's image-prefill run used 46 GB, which is harsher for the branch.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Scenario</th><th>Branch run</th><th>Completed</th><th>Aborts</th><th>Decode pauses / resumes</th><th>Tokens restored</th><th>Peak</th><th>Max stall</th><th><code>main</code></th></tr></thead>
+    <tbody>
+      <tr><td>Text decode</td><td class="n"><a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a> · 48 GB</td><td class="n"><span class="pill ok">3/3</span></td><td class="n">0</td><td class="n">6 / 6</td><td class="n">691,293</td><td class="n">41 GB</td><td class="n">1.75 s</td><td><span class="pill no">0/3</span> abort-all mid-prefill after 15 s</td></tr>
+      <tr><td>Image decode</td><td class="n"><a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a> · 48 GB</td><td class="n"><span class="pill ok">3/3</span></td><td class="n">0</td><td class="n">5 / 5</td><td class="n">561,494</td><td class="n">43 GB</td><td class="n">1.73 s</td><td><span class="pill no">0/3</span> abort-all, 168 s prefill stall</td></tr>
+      <tr><td>Image prefill</td><td class="n"><a href="https://github.com/e-Evolution/omlx/commit/47c0c70b754d7796057b0a31c130b217298492ce" title="Measured as e80a1842. Published with local paths removed from benchmark defaults; the code is otherwise identical.">47c0c70b</a> · 46 GB</td><td class="n"><span class="pill ok">3/3</span></td><td class="n">0</td><td class="n">1 / 1</td><td class="n">132,102</td><td class="n">42 GB</td><td class="n">1.61 s</td><td><span class="pill no">0/3</span> abort-all, 417 s prefill stall</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px"><b>Never fits</b> (42 GB, <a href="https://github.com/e-Evolution/omlx/commit/31cab33d0f37974afb1740f0902a335ea5a59654" title="Measured as f7dd2bc8. Published with local paths removed from benchmark defaults; the code is otherwise identical.">31cab33d</a>), a 60k-token prompt with <code>max_tokens</code> 2,000,000:</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>Branch</th><th><code>main</code></th></tr></thead>
+    <tbody>
+      <tr><td>Response</td><td>HTTP 400 <code>context_exceeds_capacity</code> in 0.1 s, all 7 fields, <code>retryable: false</code>, no pause or park</td><td>HTTP 200 (stream closed in 0.1 s)</td></tr>
+      <tr><td><code>GET /v1/omlx/capacity</code></td><td>200, <code>available: true</code></td><td>404</td></tr>
+      <tr><td><code>X-oMLX-Max-Context-Tokens</code></td><td class="n">288273</td><td>absent</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px"><b>Greedy identity after a pause.</b> B=1 at 56 GB, so there is no memory pause, and forced decode pauses at output offsets 100, 323, 1044 and 1706. Each test run is compared with a run without pauses.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Run</th><th>Pauses</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>MTP off (<a href="https://github.com/e-Evolution/omlx/commit/47c0c70b754d7796057b0a31c130b217298492ce" title="Measured as e80a1842. Published with local paths removed from benchmark defaults; the code is otherwise identical.">47c0c70b</a>; references on <a href="https://github.com/e-Evolution/omlx/commit/3b72cde7bbda257bdb9ba4564c24c30e8600f92a" title="Measured as d34413ec. Published with local paths removed from benchmark defaults; the code is otherwise identical.">3b72cde7</a>)</td><td class="n">12</td><td><span class="pill ok">identical</span> Tokens identical for 3/3 requests of 2,000 tokens; logprob drift exactly 0.0. One request's streamed text differs at char 1496. Its tokens are equal, and the reference without pauses shows the same quirk around a stray mid-reasoning <code>&lt;think&gt;</code> token: a pre-existing text-assembly issue, not a pause bug.</td></tr>
+      <tr><td>MTP on (<a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a>)</td><td class="n">12</td><td><span class="pill mid">near-ties</span> First divergences at tokens 142, 145 and 179: 42–79 tokens after the first pause and before the second, at margins of 0.125–1.0 nat. With MTP off the same prompts are identical. That points to MTP verify regrouping moving near-ties, but it is a hypothesis: identity with MTP off does not by itself rule out a pause-state effect that only appears with MTP on.</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px"><b>Premises against <code>main</code></b>, measured at <a href="https://github.com/e-Evolution/omlx/commit/e80eb1f754e52922a88b7133ca5c510a681b4837" title="Measured as f92fbd7c. Published with local paths removed from benchmark defaults; the code is otherwise identical.">e80eb1f7</a>, before D1–D8:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Premise</th><th><code>main</code></th><th>Branch</th><th>Reading</th></tr></thead>
+    <tbody>
+      <tr><td>P1 · Re-issue after mid-prefill cancel</td><td class="n">0 cached · 110,031 re-prefilled</td><td class="n">73,728 cached · 36,303 re-prefilled</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P2 · 2×~130k concurrent</td><td class="n">2/2 · 0 aborts · 116 GB · 939 s</td><td class="n">2/2 · 0 aborts · 44 GB · 501 s</td><td><span class="pill ok">PASS</span></td></tr>
+      <tr><td>P3 · Greedy batch (B=3 vs B=1)</td><td>3/3 degenerate (4-gram 0.33 / 0.29 / 0.18), 121 GB, on <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> with the v0.7.0 app runtime; does not reproduce on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> (<a href="#pr1-current-main">re-validation</a>)</td><td>no degeneration (1.00 / 1.00 / 0.99), 55 GB</td><td><span class="pill ok">no regression</span></td></tr>
+      <tr><td>P4 · Concurrency (2 runs)</td><td class="n">0.96× · 12/12 ok</td><td class="n">0.98× · 12/12 ok</td><td><span class="pill mid">equal</span></td></tr>
+      <tr><td>P6 · Single 110k (3 runs, median)</td><td class="n">740.7 tok/s · decode 20.42</td><td class="n">729.5 (−1.5%) · 20.75 (+1.6%)</td><td><span class="pill ok">within noise</span></td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout" style="margin-top:14px">
+    <b>What this proves, and what it does not.</b>
+    <ul>
+      <li>Under forced pressure the branch completes every request in the three scenarios with 0 aborts. Requests are paused and resumed in decode, image prompts included, while <code>main</code> aborts all three in each.</li>
+      <li>A pause is exact: with MTP off, the tokens and logprobs after 12 pauses equal those of an uninterrupted run.</li>
+      <li>A request that can never fit gets a structured answer in 0.1 s that a harness can act on, instead of running into an abort.</li>
+      <li>Limits:
+        <ul>
+          <li>one Mac, one model family, and one run per pair;</li>
+          <li>decode and image decode were measured at <a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d" title="Measured as 85c1f902. Published with local paths removed from benchmark defaults; the code is otherwise identical.">f3c11356</a> and never-fits at <a href="https://github.com/e-Evolution/omlx/commit/31cab33d0f37974afb1740f0902a335ea5a59654" title="Measured as f7dd2bc8. Published with local paths removed from benchmark defaults; the code is otherwise identical.">31cab33d</a>, so those scenarios were not re-run after the last admission fixes;</li>
+          <li>the branch runs also had the fork's Metal cache limit and batched-decode gate on;</li>
+          <li>a pause stalls every row for 1.6–3.5 s while the exact chain is written, because the store is synchronous;</li>
+          <li>the premises must be re-run on the final head, because D1–D8 changed admission after <a href="https://github.com/e-Evolution/omlx/commit/e80eb1f754e52922a88b7133ca5c510a681b4837" title="Measured as f92fbd7c. Published with local paths removed from benchmark defaults; the code is otherwise identical.">e80eb1f7</a>.</li>
+        </ul>
+      </li>
+    </ul>
+  </div>
+
+  <h3>Reproduction commands</h3>
+  <p>The harness is <code>benchmarks/unattended/bench_premises.py</code> on the fork branch <a href="https://github.com/e-Evolution/omlx/tree/bench/p7-park"><code>bench/p7-park</code></a> (<a href="https://github.com/e-Evolution/omlx/commit/95dd47e8322df6dc5792f151193c3b594da24089" title="Measured as 8aa178c5. Published with local paths removed from benchmark defaults; the code is otherwise identical.">95dd47e8</a>). It overlays a checkout's <code>omlx/</code> on the app runtime. Run one oMLX server at a time, with every other instance quit. The <code>fork</code> variant sets <code>OMLX_MEMORY_PRESSURE_PARK=true</code> and <code>OMLX_PREFILL_PROGRESS_COMMIT_BLOCKS=4</code>.</p>
+  <pre># branch build: export once, so every command below gets the same env
+export OMLX_BENCH_FORK_REPO=&lt;pause-resume checkout&gt;
+export OMLX_BENCH_EXTRA_ENV=OMLX_DISABLE_PRESSURE_RECLAIM=1,OMLX_MEMORY_ABORT_SINGLE_VICTIM=true,OMLX_MEDIA_TEXT_SUFFIX_CHUNKED=true
+
+# references for one scenario: alone, 56 GB
+python benchmarks/unattended/bench_premises.py --variant fork --premise C7 \
+  --c7-scenario decode --runs 1 --p7-ceiling-gb 56 --c7-refs-only --out refs/ref-decode
+
+# pressure run: decode | image-decode at 48 GB, image-prefill at 46 GB
+python benchmarks/unattended/bench_premises.py --variant fork --premise C7 \
+  --c7-scenario decode --runs 1 --p7-ceiling-gb 48 --c7-refs-from refs/ref-decode --out out/branch-decode
+
+# never fits
+python benchmarks/unattended/bench_premises.py --variant fork --premise C7 \
+  --c7-scenario never-fits --runs 1 --p7-ceiling-gb 42 --out out/branch-never-fits
+
+# identity with MTP off: references, then forced pauses
+python benchmarks/unattended/bench_premises.py --variant fork-nomtp --premise C7 \
+  --c7-scenario identity --runs 1 --p7-ceiling-gb 56 --c7-refs-only --out out/idrefnm
+python benchmarks/unattended/bench_premises.py --variant fork-nomtp --premise C7 \
+  --c7-scenario identity --runs 1 --p7-ceiling-gb 56 --c7-refs-from out/idrefnm \
+  --c7-force-pause-at auto --out out/idforcenm
+
+# main build: re-export, then run the same scenario commands (with main's own --out paths)
+export OMLX_BENCH_FORK_REPO=&lt;main checkout&gt;
+export OMLX_BENCH_EXTRA_ENV=OMLX_DISABLE_PRESSURE_RECLAIM=1
+
+# unit and rig tests, then upstream's CI selection (needs pytest-xdist, as CI installs it)
+pytest tests/test_scheduler_decode_pause.py tests/test_memory_resume_thrash.py \
+  tests/test_memory_external_prefill.py tests/test_scheduler_capacity_vlm.py \
+  tests/test_scheduler_forced_decode_pause.py tests/test_scheduler_solo_admission.py
+pytest tests/ -m "not slow and not integration" -n 3 --dist loadgroup</pre>
+  <p>Our runs also passed <code>OMLX_BATCHED_DECODE_HOLD_MAX_S=120</code>, <code>OMLX_MID_SYSTEM_POLICY=inline_note</code> and <code>OMLX_THINKING_RETENTION_GUARD_TOKENS=20000</code> to both builds. Those belong to other fork features, and <code>main</code> ignores them. Scenario prompts: about 130k, 115k and 100k tokens, started 0.5 s apart, greedy, <code>max_tokens</code> 2000 (32 for image prefill).</p>
+</section>
+
+<section id="live-run">
+  <h2>Live production run (fork.5)</h2>
+  <p>The C7 results come from forced pressure on an isolated server. We then ran the packaged fork as the daily server for real unattended coding-agent work: pi with the gentle-shell harness, one orchestrator session and four gentle-shell subagents doing browser-driven documentation capture for a documentation project, plus a second, unrelated agent session. Every request went to the local model through the profile pin.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Setup</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Build</td><td>oMLX Fork 0.7.0-fork.5: <a href="https://github.com/e-Evolution/omlx/tree/feat/pause-resume-cycle"><code>feat/pause-resume-cycle</code></a> on upstream <code>main</code> commit <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> (#4148, committed 2026-10-05 16:29:00 +0900), running on the official 0.7.0 app runtime (mlx-vlm 0.7.1; upstream <code>main</code> pins 0.7.4). The packaging script's <code>--allow-pin-mismatch</code> option (<a href="https://github.com/e-Evolution/omlx/commit/5dd56ca5b77ea7d2981deb8575f59e2a518358f8" title="Measured as 0b932a39. Published with local paths removed from benchmark defaults; the code is otherwise identical.">5dd56ca5</a>) makes that explicit: it builds on the older runtime, warns and records the mismatch in the build summary.</td></tr>
+      <tr><td>Model and machine</td><td>Qwen3.8-27B-oQ4e-mtp (TurboQuant 4-bit KV, MTP), M5 Max 128 GB</td></tr>
+      <tr><td>Fork defaults</td><td>Shipped as a bundled defaults file, read as a layer below <code>settings.json</code>, so <code>settings.json</code> or the admin UI overrides them without a rebuild (<a href="https://github.com/e-Evolution/omlx/commit/c31820cb14845ce05d0356e5f91d047e75ee441d" title="Measured as b000a28f. Published with local paths removed from benchmark defaults; the code is otherwise identical.">c31820cb</a>, <a href="https://github.com/e-Evolution/omlx/commit/78291febbc85f7170ea04e718c36d00fa8343906" title="Measured as c9694977. Published with local paths removed from benchmark defaults; the code is otherwise identical.">78291feb</a>). They were previously baked into the app environment. The bundle turns on the prefill progress commit, park and pause, single-victim abort, the cached-media text suffix and <code>memory_scheduling: on</code>.</td></tr>
+      <tr><td>Harness versions</td><td>gentle-shell (package <code>gentle-pi</code> 4.0.0) at upstream <code>main</code> commit <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a>, "Merge pull request #1835" (feat/background-jobs), committed 2026-10-07 01:30:59 +0200, run from a local checkout with <code>gentle-shell.mjs --link</code>. This <code>main</code> does not contain the #1367 todo prompt-cache fix, which was still open. One other session ran the fix branch <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a> (<a href="https://github.com/e-Evolution/gentle-shell/commit/955523df5327349a353519a1a06691b3582a5bd6">955523df</a>, 2026-10-05); its main sessions used a remote provider, so only its subagent reached oMLX.</td></tr>
+      <tr><td>Batched-decode gate</td><td>Removed from the fork app (<a href="https://github.com/e-Evolution/omlx/commit/159673d5278cb1bf86ca32f8436411ccad261f18" title="Measured as 301bde14. Published with local paths removed from benchmark defaults; the code is otherwise identical.">159673d5</a>): decode pauses now resolve memory pressure without losing work, so the 200k combined-context cap only held long requests back while memory was free</td></tr>
+      <tr><td>Fork-only packaging</td><td>The defaults bundle, the gate removal and <code>--allow-pin-mismatch</code> belong to the fork's app packaging only. They are not part of any upstream pull request.</td></tr>
+      <tr><td>Memory guard</td><td>Tier <code>aggressive</code>: ceiling 101.7 GB, soft at 95% and hard at 98% (about 96.6 and 99.7 GB). <code>memory_pressure_park</code> on.</td></tr>
+      <tr><td>Memory scheduling</td><td>On for the whole window, from the fork defaults (verified live: capacity endpoint <code>available: true</code> and the <code>X-oMLX-Max-Context-Tokens</code> header present)</td></tr>
+      <tr><td>Window</td><td>2026-10-07 02:31–04:10 local, about 1 h 39 min, 393 samples every 15 s. <code>max_concurrent_requests</code> was raised live through the admin API, with no restart: 3, then 4 at 03:02:00, then 5 at 03:08:15.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="tbl" style="margin-top:12px"><table>
+    <thead><tr><th>Limit</th><th>Samples</th><th>Open requests (avg / max)</th><th>Waiting (avg)</th><th>Min system free</th><th>Cache efficiency</th></tr></thead>
+    <tbody>
+      <tr><td>3 (02:31–03:02)</td><td class="n">121</td><td class="n">5.2 / 6</td><td class="n">2.2</td><td class="n">42%</td><td class="n">94.5%</td></tr>
+      <tr><td>4 (03:02–03:08)</td><td class="n">25</td><td class="n">4.9 / 5</td><td class="n">0.9</td><td class="n">30%</td><td class="n">94.8%</td></tr>
+      <tr><td>5 (03:08–04:10)</td><td class="n">247</td><td class="n">4.0 / 6</td><td class="n">0.1</td><td class="n">20%</td><td class="n">95.4%</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">Open requests are those with an open stream, running or queued, and waiting are the queued ones (both from <code>/api/status</code>). System free memory comes from macOS <code>memory_pressure</code> and includes the agents' browsers and other apps. Cache efficiency is the dashboard's cumulative figure at the end of each level.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Server log, 02:00–04:10 (includes the 31 min before sampling started at 02:31; the per-level table above covers 02:31–04:10)</th><th>Count</th></tr></thead>
+    <tbody>
+      <tr><td>Requests · prompt tokens · served from the prefix cache</td><td class="n">333 · 14.5M · 94.8%</td></tr>
+      <tr><td>Memory-pressure transitions (soft, hard, emergency)</td><td class="n">0</td></tr>
+      <tr><td>Decode pauses, resumes and parks</td><td class="n">0</td></tr>
+      <tr><td>Solo admissions, admission waits, never-fits 400s</td><td class="n">0</td></tr>
+      <tr><td>Memory aborts</td><td class="n">0</td></tr>
+      <tr><td>Other aborts</td><td>3 at 03:09:01. The orchestrator cancelled 3 subagent tasks, and the server logged stream aborts with no enforcer action.</td></tr>
+      <tr><td>Batched TurboQuant decode</td><td>Ragged single-launch path at B=4 (03:04) and B=5 (03:08). No completion hit the token limit: 320 ended on tool calls and 6 on stop.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="tbl" style="margin-top:12px"><table>
+    <thead><tr><th>Subagent wave</th><th>Sessions</th><th>Requests</th><th>System prompts per session</th><th>Append-only turns</th><th>Per-session cache</th></tr></thead>
+    <tbody>
+      <tr><td>02:28–03:09</td><td class="n">4</td><td class="n">92</td><td class="n">1</td><td class="n">88 of 88</td><td class="n">95.5–98.3%</td></tr>
+      <tr><td>From 03:32 (still running)</td><td class="n">4</td><td class="n">162 by 04:10</td><td class="n">1</td><td class="n">158 of 158</td><td class="n">95.6–98.5% (through 04:14)</td></tr>
+    </tbody>
+  </table></div>
+  <ul style="margin-top:12px">
+    <li><b>Concurrency raised live.</b> At a limit of 5 the queue almost emptied (average waiting 2.2 → 0.1), while cache efficiency held at 94.5–95.4%.</li>
+    <li><b>Batched decode at B=4 and B=5.</b> On upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> with the same v0.7.0 app runtime, P3 at B=3 degenerated or aborted. On newer <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> it completes, but padded batched decode runs at about 1.5 tok/s per row (P3 re-validation).</li>
+    <li><b>Cold starts when a wave arrives at once.</b> Each wave's first requests (about 18k tokens, mostly the shared system prompt) arrived together. Of 8, 5 prefilled cold in parallel (58–129 s) and 3 reused 16,384 shared tokens (87–91%). After that, every subagent turn was append-only.</li>
+    <li><b>Upstream prefill throttle.</b> Upstream's adaptive prefill throttle paused chunked prefills 21 times across 14 requests to resize chunks. The highest process memory it logged was 46.6 GB. These are not the fork's pause and resume.</li>
+    <li><b>Memory scheduling stayed on throughout.</b> The log shows "Memory scheduling: off" lines in groups of four or eight (00:27, 03:02, 03:08, 04:19, including times with no settings change). They come from the admin settings page, which builds four throwaway enforcers (one per memory tier, default mode <code>auto</code>) to preview the tier ceilings; the live enforcer stayed on, which the capacity endpoint and the context header confirm. The misleading lines are fixed in the fork (<a href="https://github.com/e-Evolution/omlx/commit/04bb7899d293cd9afd68ebe54d468f13774b0393" title="Measured as aa06f32e. Published with local paths removed from benchmark defaults; the code is otherwise identical.">04bb7899</a>, proposed upstream with slice G): only the live enforcer logs its state, and the admin settings API reports the effective state as <code>memory_scheduling_effective</code>. The zero solo, admission-wait and never-fits counts therefore reflect a workload that never approached the memory limits, not disabled features.</li>
+  </ul>
+  <div class="callout warn"><b>What this run does not show.</b> The pause-resume cycle was not exercised. Under the <code>aggressive</code> tier, pressure starts at 95% of a 101.7 GB ceiling, and this workload stayed far below it. The evidence for the cycle remains the forced-pressure C7 results above. The next step is a live run with an explicit lower ceiling, for example 45 GB on the <code>custom</code> tier.</div>
+  <h3>Harness findings from the same sessions</h3>
+  <p>The same sessions also surfaced harness-side prompt changes. They are listed in <a href="#gentle-shell-other">the gentle-shell section</a>.</p>
+  <h3 id="field-footage">Field footage: sustained load</h3>
+  <p>Screen recordings from the same night (about 04:28&ndash;04:43, shortly after the measured window), sped up. The oMLX dashboard is shown in its Spanish locale. Terminal and IDE content is pixelated for privacy; the dashboard numbers are as recorded. This was ordinary load, so no pause or resume appears on screen; the pause/resume evidence is the forced-pressure C7 runs above. Use the playback controls to pause, replay or inspect the recordings. The other recordings accompany the use case, batched decode and prefill sections.</p>
+  <div class="media-grid">
+    <figure>
+      <video controls playsinline preload="none" poster="media/omlx-sustained-no-abort-poster.png" width="960" height="882" aria-label="oMLX request list cycling over three minutes while gentle-shell agents and IntelliJ keep working">
+        <source src="media/omlx-sustained-no-abort.mp4" type="video/mp4">
+        <a href="media/omlx-sustained-no-abort.gif">View the original screen recording as a GIF</a>.
+      </video>
+      <figcaption>Over 3 minutes of real work (20&times;), oMLX Fork keeps 3&ndash;4 requests from gentle-shell agents and IntelliJ in flight. Requests finish and new ones start, and no error appears in the visible frames.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="what-was-built">
+  <h2>What was built</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Change</th><th>Problem it addresses</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><b>Prefill progress commit</b> (D1)</td><td>A cancel or abort mid-prefill threw away everything. Progress is now committed to the paged SSD cache every N blocks, for text and media prompts.</td><td>P1</td></tr>
+      <tr><td><b>Park instead of abort</b> (T7)</td><td>Under memory pressure, a chunked prefill is parked (progress already in the SSD cache) and resumed in arrival order instead of being aborted. See <a href="#park-strategy">the strategy</a>.</td><td>Unit tests; P7 (parked at 129,024 tokens, resumed in 0.5 s)</td></tr>
+      <tr><td><b>Pause-resume cycle</b> (C1–C6, D1–D8)</td><td>Decoding rows and image prompts could not be parked, so pressure still aborted everything. Now one request is paused in prefill or decode, saved as an exact SSD chain, and resumed on the same stream when its memory need fits. Never-fits requests get a structured 400 and a capacity endpoint.</td><td>C7: 9/9 completed, 0 aborts (main 0/9); identical tokens after 12 pauses with MTP off</td></tr>
+      <tr><td><b><code>mlx_cache_limit_gb</code></b> (T5a)</td><td>The Metal buffer cache grew without bound and pushed process memory past the hard watermark.</td><td>P2 peak memory</td></tr>
+      <tr><td><b>Batched-decode context gate + backfill/aging</b> (T5b, T12b)</td><td>Two very long rows batched together gain nothing. A held long request no longer blocks short ones, and aging bounds the wait to 120 s.</td><td>P4; a limit sweep showed no gain above 200k combined</td></tr>
+      <tr><td><b>TurboQuant padded-attention fix + ragged kernel</b> (T5d, T5e, T12a, T12c)</td><td>Left-padded short rows attended over padding (correctness), and batched decode was about 1.5 tok/s per row (performance).</td><td>Norm ratio 0.32 → 1.0; per-layer B=3 39.8 → 1.7 ms; P3, P4</td></tr>
+      <tr><td><b><code>inline_note</code> mid-system policy</b> (A1)</td><td>A mid-conversation system update after a tool result fell back to <code>strict</code> and was merged into the leading system message, rewriting the prompt head.</td><td>RED test: first divergence at the end of the system head</td></tr>
+      <tr><td><b>Deterministic thinking retention</b> (A2)</td><td>A client's synthetic "attached image" user message moved the template's <code>last_query_index</code> and stripped thinking mid-loop, breaking the prefix on every image turn.</td><td>10/10 image turns at 97.4–99.7% hit</td></tr>
+      <tr><td><b>Observability</b> (A5)</td><td>Eviction was silent at INFO, there was no per-request cache-outcome reason, and there was no TTFT breakdown.</td><td>Used for every live measurement here</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="cache-reuse">
+  <h2>The cache-reuse investigation</h2>
+  <p>With aborts gone, the cost moved to re-prefill. We attributed every large cache break in the recorded traffic to a cause. The breaks came from the prompt changing in the <i>middle</i>, which invalidates everything after it.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Cause</th><th>Tokens re-prefilled (~1.5 days)</th><th>Where it is fixed</th></tr></thead>
+    <tbody>
+      <tr><td>The harness rewrote the system prompt (todo block with a per-prompt stale counter in affected parent sessions; recorded tool-section changes also included subagent traffic), and the server's <code>strict</code> fallback folded system updates into the system head</td><td class="n">~1.05M</td><td>Harness fix (gentle-shell #1367) + A1 (server)</td></tr>
+      <tr><td>Client's synthetic image message moving <code>last_query_index</code></td><td class="n">~0.94M</td><td>A2 (server)</td></tr>
+      <tr><td>Client compactions</td><td class="n">~0.7M</td><td>Expected</td></tr>
+      <tr><td>Real user messages (the template strips earlier thinking)</td><td class="n">~0.1M</td><td>Kept for quality on the 8-bit model; <code>preserve_thinking: true</code> removes it on the current model (<a href="#preserve-thinking">measured</a>)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The largest cause was in the harness. How it was found, what it cost, the fix and its validation are in <a href="#gentle-shell">the gentle-shell section</a>.</p>
+  <p>The server-side change A1 is complementary. pi also sends system-prompt changes as mid-conversation system messages, and oMLX's <code>strict</code> fallback merged those back into the head. Any client doing the same benefits from A1.</p>
+  <h3 id="preserve-thinking"><code>preserve_thinking: true</code>, measured again</h3>
+  <p><b>The earlier result.</b> On the 8-bit model with DFlash speculative decoding, keeping all past thinking gave near-perfect reuse, but at about 53k tokens of context the model started emitting literal <code>&lt;/think&gt;</code> and raw tool-call XML as text, its draft acceptance fell from 65% to 54%, and the session did not recover. A2 was designed around that result. It keeps thinking only within the current agent loop and strips at real user messages, exactly as the template does with <code>preserve_thinking: false</code>. A deterministic guard strips once when retained loop thinking exceeds N tokens, then stays append-only. The guard is set to 30k.</p>
+  <p><b>The question.</b> With <code>false</code>, every user-role message strips the reasoning of the previous segment, so the prompt shrinks and prefill restarts at the first assistant message of that segment. pi sends harness notices (todo updates, subagent results and wakes, background-job notices) as user-role messages, so they trigger the same strip. That was the last cache loss left in the parent session after the gentle-shell fix. <code>true</code> had never been tested for long on the current model (4-bit oQ4e with Lightning MTP), so we measured it on 2026-10-11.</p>
+  <p><b>Method.</b> The installed fork.7 app was the only server running. The setting was changed at runtime through the admin API (<code>PUT /admin/api/models/&lt;id&gt;/settings</code>, which applies without a reload and persists), after a backup of the model settings. The client was the installed gentle-shell in pi RPC mode. Each pi request was joined to its server log line by its prompt and cached token counts.</p>
+  <ul>
+    <li><b>P1, harness scenario.</b> One parent session with a todo list, a foreground subagent, a background subagent and its wake, a background job and its notice, and two follow-up prompts. <code>true</code> was compared against a <code>false</code> run of the same driver on the same server.</li>
+    <li><b>P2, long realistic session.</b> A fixed script of 27 real coding prompts on a scratch clone of the oMLX fork: read and explain code, find call sites, write and run unit tests, fix them, write a log parser with tests, use git. It made 99 tool calls in each run. The <code>true</code> run used its 110-minute budget after 27 prompts. The <code>false</code> control then ran the same 27 prompts. We counted degeneration markers in assistant text, tool arguments and reasoning: literal <code>&lt;think&gt;</code>/<code>&lt;/think&gt;</code>, <code>&lt;function=</code>, <code>&lt;parameter=</code>, <code>&lt;tool_call&gt;</code>, visible-text repetition loops, length stops and tool-call parse errors. Reasoning repetition-detector signals are reported separately below.</li>
+  </ul>
+  <p>Fixed settings in every run: thinking forced on (budget 3,000 tokens), the 30k retention guard on, MTP on, TurboQuant 4-bit KV, temperature 1.0.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>P2: 27 prompts, same script</th><th><code>true</code></th><th><code>false</code></th></tr></thead>
+    <tbody>
+      <tr><td>Context at prompt 1 → prompt 27</td><td class="n">41.8k → 200.0k</td><td class="n">41.8k → 135.4k</td></tr>
+      <tr><td>User-turn boundaries that reused the whole cached prefix</td><td class="n">26 / 26</td><td class="n">3 / 26</td></tr>
+      <tr><td>Uncached tokens per boundary, mean / max</td><td class="n">893 / 1,870</td><td class="n">4,048 / 15,056</td></tr>
+      <tr><td>Time to first token at a boundary, mean / max</td><td class="n">6.8 / 15.9 s</td><td class="n">8.5 / 31.3 s</td></tr>
+      <tr><td>Prefix-cache hit rate, all requests</td><td class="n">99.1%</td><td class="n">98.1%</td></tr>
+      <tr><td>Summed prefill time</td><td class="n">690 s</td><td class="n">660 s</td></tr>
+      <tr><td>Output tokens / thinking characters kept in context</td><td class="n">106k / 278k</td><td class="n">66k / 115k</td></tr>
+      <tr><td>MTP acceptance (flat across 40k–200k buckets)</td><td class="n">83.9%</td><td class="n">84.1%</td></tr>
+      <tr><td>Decode tok/s, lowest context bucket → highest</td><td class="n">20.8 → 13.8</td><td class="n">23.1 → 15.1</td></tr>
+      <tr><td>Literal markers in text, tool arguments and reasoning; visible-text loops; length stops; parse errors</td><td class="n">0</td><td class="n">0</td></tr>
+      <tr><td>Reasoning repetition-detector signals (unclassified)</td><td class="n">3</td><td class="n">0</td></tr>
+      <tr><td>Tool errors</td><td class="n">2</td><td class="n">7</td></tr>
+      <tr><td>Wall time for the 27 prompts</td><td class="n">6,670 s</td><td class="n">3,773 s</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>Primary-record audit.</b> Recounting <code>tool_errors</code> in <code>preserve-thinking/p2-false-turns.jsonl</code> gives 7, correcting the earlier reported 9. The corresponding <code>p2-true-turns.jsonl</code> contains 3 <code>thinking_loops</code> detector signals; the original summary counted only <code>loops</code> in visible text. The detector flags lines of at least 30 characters repeated at least four times within one message. These signals remain unclassified and may include false positives; they are not confirmed degeneration. The local records were audited without rerunning the experiment and are not currently linked as a public archive.</p>
+  <p>In P1, <code>true</code> made all 11 parent requests full-prefix hits, against 4 block-aligned divergences in 13 with <code>false</code>. The uncached tokens fell from 6,208 to 1,803 and the summed prefill from 17.2 to 8.1 s. The subagent and job sessions behaved the same under both settings.</p>
+  <p><b>Findings.</b></p>
+  <ul>
+    <li><b>No confirmed visible degeneration with <code>true</code> on this model up to 200k context; reasoning repetition signals remain unclassified</b>, about 4× the point where the 8-bit DFlash setup broke. MTP acceptance stayed flat, and spot checks at 90k, 115k, 121k and 196k quoted code and file:line references from context correctly. The one slip was at 125k: the model ran a command in a documentation path quoted in the harness system prompt, then corrected itself on the next call. This is one run per setting at temperature 1.0, so it is evidence, not proof.</li>
+    <li><b>The cache gain is real but small at these segment sizes.</b> <code>true</code> removed every boundary divergence, but each turn here added only 1–15k tokens, so a divergence cost a few seconds. The minutes-long re-prefill seen with <code>false</code> in daily use (about 560 s at 135k) needs a turn that reads tens of thousands of tokens of files before the next user message. This script did not produce one.</li>
+    <li><b><code>true</code> has a cost: the context fills about 1.5× faster</b>, because all reasoning stays in it. The model also reasoned about 2.4× more in that run, and decode slows as context grows. The same 27 prompts took 1.8× longer, and summed prefill was about equal, because <code>true</code> prefilled a much longer context. Part of the extra reasoning may be sampling variance.</li>
+    <li><b>Confound:</b> the 30k retention guard stayed on in both runs. With <code>true</code> it never fired; the prompt never shrank.</li>
+  </ul>
+  <p><b>Decision.</b> No literal degeneration markers were observed with <code>true</code> in this one run on this model; reasoning repetition-detector signals remain unclassified, and these observations do not establish the absence of quality risk. On 2026-10-11 it was switched on in daily use for further observation on workloads where single turns read large files, accepting the measured context-growth and wall-time tradeoffs. The things to watch are degeneration markers, boundary TTFT, how often sessions reach compaction, and wall time per task. The A2 guard stays at 30k as a backstop.</p>
+  <h3>Live result</h3>
+  <ul>
+    <li>Turns adding a new image: 10 of 10 had a 97.4–99.7% hit, so only the new tool result and image were prefilled.</li>
+    <li>Consecutive turns after the client fix: 31 of 31 strictly append-only.</li>
+    <li>Session-level cache efficiency on the dashboard: 95.2–95.3%.</li>
+  </ul>
+</section>
+
+<section id="gentle-shell">
+  <h2>gentle-shell: making the harness cache-friendly</h2>
+  <p>This section is for the gentle-shell maintainers. The largest single cache loss in this report was in the harness, not in oMLX. While todos were open, gentle-shell's todo extension rewrote the system prompt on every user prompt. Over about 1.5 days of real use it caused about 1.05M re-prefilled tokens, roughly 80–85 minutes of GPU time, and turns that took 2–6 minutes instead of seconds. We improved the harness with the same method as the server, and the fix is ready on <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a>, tracked in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a>.</p>
+  <p>The harness's existing tests did not expose the cache cost: the todo tool behaved correctly and no request failed, but some agent turns took minutes instead of seconds. We identified the cause by exercising the harness against a local inference server whose cache behaviour we could observe. Prompt-stability tests can catch the rewrite itself; server measurements establish its operational cost.</p>
+  <h3>The process</h3>
+  <div class="timeline">
+    <div class="step"><h3>The symptom</h3><p>The oMLX dashboard kept showing long prefills, 40k–110k tokens, on agent turns that should have been nearly free, with concurrent requests frozen behind them. Nothing failed and every harness test passed.</p></div>
+    <div class="step"><h3>Server-side evidence</h3><p>oMLX's prefix-cache log states where each request diverges from the closest stored sequence. One session diverged at the same position, about token 37.7k, every few turns. A divergence at a fixed position points to something rewriting the prompt there, not to eviction.</p></div>
+    <div class="step"><h3>Client-side evidence</h3><p>A small pi extension recorded the exact payload of every request. Diffing consecutive requests found the first changed byte inside the system prompt, on the todo addendum's stale counter, at the same token position the server reported.</p></div>
+    <div class="step"><h3>Attribution</h3><p>Doing the same across all recorded sessions attributed about 945k re-prefilled tokens in main sessions and 107k in subagents to system-prompt or tool-section changes, with the todo addendum as the main driver.</p></div>
+    <div class="step"><h3>Fix, test-first</h3><p>Todo state moved out of the system prompt into hidden conversation messages, sent only when the list changes. The stale reminder fires once, with no counter, and the state is re-injected once after a compaction. Tests drive the extension through its public hooks and assert that the system prompt stays byte-stable.</p></div>
+    <div class="step"><h3>Validation on both sides</h3><p>On the client, the requests that rewrote the system prompt went from 21 of 61 to 0 of 90, and 31 of 31 consecutive turns were append-only. On the server, re-prefills above 20k tokens went from 1–2 per hour to 0.</p></div>
+    <div class="step"><h3>Re-tests on upstream <code>main</code></h3><p>Each re-test drove the harness against the live server. One window on <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a> showed no problem because its trigger never fired, and a later re-test on <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a> reproduced it. Our first comment was corrected publicly. The fix was rebased, its 63 todo tests pass, and it passed an independent review.</p></div>
+    <div class="step"><h3>Subagents and background jobs</h3><p>A full harness scenario with the fix (todo list, foreground and background subagents, a background job) kept one system prompt per session in the parent and in every child.</p></div>
+    <div class="step"><h3>The last loss, shared with the server</h3><p>The remaining parent cache losses came from harness notices. pi sends them as user-role messages, and the chat template strips earlier reasoning at every user-role message when <code>preserve_thinking</code> is off. With it on, every parent request reused its whole prefix.</p></div>
+  </div>
+  <h3 id="gentle-shell-cost">What it cost on the server</h3>
+  <p>This is about 1.5 days of real use, all on one machine. Figures marked ≈ are derived from measured rates.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Cost</th><th>Without the harness fix</th><th>How it is derived</th></tr></thead>
+    <tbody>
+      <tr><td>Tokens re-prefilled</td><td class="n">~1.05M</td><td>Divergences attributed to system-prompt or tool-section changes (main sessions plus subagents)</td></tr>
+      <tr><td>GPU time spent re-prefilling</td><td class="n">≈ 80–85 min</td><td>1.05M tokens at the observed average prefill rate of 205–211 tok/s. Deeper contexts are slower, so this is a lower bound.</td></tr>
+      <tr><td>Added wait per affected turn</td><td class="n">≈ 2–6 min</td><td>40k–110k tokens re-prefilled per event at 300–430 tok/s. The rate falls to about 110 tok/s near 170k context.</td></tr>
+      <tr><td>Other requests frozen</td><td class="n">up to 155–158 s per event</td><td>Image-bearing prompts prefill synchronously, so concurrent decode stops for the whole re-prefill.</td></tr>
+      <tr><td>SSD cache writes</td><td class="n">≈ 90 GB</td><td>Re-prefilled blocks are stored again: about 513 blocks × 0.1787 GB per 2048-token block (KV plus GDN sidecar). That churns a 150 GB cache and evicts useful history sooner.</td></tr>
+      <tr><td>Concurrency lost</td><td>held requests wait longer</td><td>Long re-prefills keep the decode lane busy, so the batched-decode gate holds other sessions for longer.</td></tr>
+    </tbody>
+  </table></div>
+  <p>On a hosted API, a changed prefix may reduce cached input and increase latency or cost, depending on that provider's cache rules and pricing. No hosted-provider cache or billing experiment was run here; the measured effects are specific to the tested local setup.</p>
+  <h3>How the invalidation was identified</h3>
+  <ol>
+    <li><b>The symptom on the dashboard.</b> During normal use, the oMLX panel kept showing long prefills (the blue progress bar) on turns that should have been nearly free. One example: 43.2k tokens at about 300 tok/s on an 80k prompt. A concurrent request's decode sat frozen behind it ("last token 46 s ago").</li>
+    <li><b>The server's own diagnosis.</b> The prefix-cache log for that request reads:
+      <pre>prefix cache restore: cached=36864 suffix=43171
+re-prefills 43171 of 80035 tokens; closest stored sequence shares the first 37735</pre>
+      The same session diverged again later at 37,739 tokens. A divergence at the same place every few turns points to something rewriting the prompt at a fixed position, not to eviction.</li>
+    <li><b>Ruling out the server cache.</b> SSD eviction was checked against the losses: the cache holds about 8 hours of history, and none of the large losses lined up with evictions. Model reloads were hours away. The block grid explains at most 2,047 tokens per event.</li>
+    <li><b>The client-side diff.</b> Comparing the recorded payloads of two consecutive requests from that session showed the first difference inside the system message, at character 70,384 of about 104,700. That is roughly token 37.7k, matching the server's divergence point:
+      <pre>  …pending: install dependencies and verify loading.
++ (stale: 2 turns without an update — bring the list up to date now)
+  &lt;/addendum&gt;</pre></li>
+    <li><b>Attribution across sessions.</b> Doing the same across all recorded sessions attributed about 945k re-prefilled tokens in the main sessions and about 107k in subagents to system-prompt or tool-section changes. The todo addendum was the main driver.</li>
+    <li><b>Confirmation.</b> After the fix, the same session's system prompt stopped carrying todo state at 00:26:37. Every later turn was append-only, apart from one expected cache break at the switch.</li>
+  </ol>
+  <h3 id="gentle-shell-fix">The fix: keeping the system prompt stable</h3>
+  <p>The gentle-shell harness appended a todo block to the system prompt on every user prompt. Once the list went stale it added a counter, <code>(stale: N turns without an update …)</code>, that changed on every prompt. The block sat around token 30–35k of a ~41k system prompt, followed by other sections. In affected parent sessions, every tick or todo edit broke reuse of the rest of the system prompt and the conversation after it. This does not apply to every subagent: on the upstream versions examined in the <a href="#gentle-shell-retests">re-tests</a>, children and background jobs with <code>GENTLE_PI_AGENTS_CHILD=1</code> do not load the todo hook. System-prompt or tool-section changes recorded in child traffic must therefore not all be attributed to this hook. Single turns lost 70k–110k tokens of cache this way.</p>
+  <p>We fixed it in the harness. The system prompt is now byte-stable within a session. Todo state travels as a persisted conversation message, sent only when the list actually changes. The stale reminder fires once, with no counter. After a compaction, the state is re-injected once. The fix is tested (45/45 todo tests, with the unrelated failures reproducing on a clean base), was used daily, and is proposed upstream in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">gentle-shell #1367</a>. The validation below ran on the fix branch <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a> at <a href="https://github.com/e-Evolution/gentle-shell/commit/955523df5327349a353519a1a06691b3582a5bd6">955523df</a> (2026-10-05, gentle-shell 4.0.0), not on upstream <code>main</code>.</p>
+  <ul>
+    <li>Recorded requests carrying a system-prompt mutation: 21 of 61 before, 0 of 90 after.</li>
+    <li>Consecutive turns that were strictly append-only after the fix: 31 of 31.</li>
+    <li>Server-side re-prefills above 20k tokens: they went from 1–2 per hour to 0.</li>
+  </ul>
+  <h3 id="gentle-shell-retests">Re-tests on upstream gentle-shell <code>main</code></h3>
+  <p>We re-checked upstream gentle-shell <code>main</code> at <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a> during the live production run and posted the results to <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367#issuecomment-6042203628">#1367</a> on 2026-10-07. Eight subagents sent 344 requests with one system prompt per session; 336 of 336 consecutive pairs were append-only, and per-session prefix-cache hits were 95.5–98.4%. The todo block appeared in no system prompt, and the problem did not recur. For accuracy: <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a> still appends the todo block at <code>before_agent_start</code>, and its trigger (open todos plus a new user prompt) did not occur in this run. The issue stays open for its author and maintainers to decide.</p>
+  <p><b>Re-test on 2026-10-10: the problem is still present on upstream <code>main</code>, and the fix had to be applied.</b> We re-tested gentle-shell <code>main</code> at <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a> with a test that drives the todo extension's public hooks and with a live pi session against oMLX. Upstream <code>main</code> still appends <code>## Todo list</code> and its stale counter to the system prompt in <code>before_agent_start</code> (<code>extensions/gentle-todo.ts</code>). In a session with open todos, every new user prompt changed the system prompt: the block appeared, then the counter went from <code>stale: 2</code> to <code>3</code> and <code>4</code>. Live, the session produced 4 system messages, 3 of them "Updated system prompt section" updates carrying the todo block. Resuming a session also added a todo block (+515 characters) that the opening system prompt never had. The recent reminder change (#1924) adds a request-local reminder message, which is cache-friendly, but the block in the system prompt remains.</p>
+  <p>The trigger is the main (parent) session. gentle-shell subagents and background jobs do not load the todo hook, which is why the earlier subagent-only window showed no change. Each update is sent as a system message, and the Qwen chat template accepts a system message only at the start, so it is folded into the system head right after the base prompt (about 4,050 tokens). Everything after that point has to be prefilled again. The oMLX log of the live run shows it:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Request</th><th>Upstream <code>main</code> <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a>: cached / prompt tokens</th><th>With the fix</th></tr></thead>
+    <tbody>
+      <tr><td>1 (cold)</td><td class="n">0 / 4,090</td><td class="n">2,048 / 4,091</td></tr>
+      <tr><td>2 (tool result)</td><td class="n">4,085 / 4,258</td><td class="n">4,086 / 4,255</td></tr>
+      <tr><td>3 (todo block appears)</td><td class="n">2,048 / 4,351</td><td class="n">4,086 / 4,342</td></tr>
+      <tr><td>4 (<code>stale: 2</code>)</td><td class="n">4,096 / 4,394</td><td class="n">4,337 / 4,507</td></tr>
+      <tr><td>5 (<code>stale: 3</code>)</td><td class="n">4,096 / 4,418</td><td class="n">4,502 / 4,531</td></tr>
+    </tbody>
+  </table></div>
+  <p>The session was short, so each break cost only a few hundred tokens here. In a 100k-token session the same break re-prefills almost the whole conversation on every user prompt while todos are open.</p>
+  <p>The todo list still has to change; the point is where the change goes. The fix does not freeze the todo state. It appends todo updates at the end of the conversation, as hidden messages sent only when the list actually changes, instead of rewriting the system prompt, so the cached prefix is preserved. The stale reminder is sent once, with no counter. We rebased the fix onto <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a> (it keeps #1924's reminder). With it, every request reused its full prefix except the expected re-render of the previous answer, and the 63 todo tests pass. It also passed an independent review with no blocking findings. The re-test, the cache table and the rebased fix (branch <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a>) were posted to <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367#issuecomment-6102456350">#1367</a> on 2026-10-10, correcting the 2026-10-07 comment above.</p>
+  <p><b>Status on 2026-10-11.</b> Upstream <code>main</code> at <a href="https://github.com/e-Evolution/gentle-shell/commit/d42264b4a7913665972c7d4c5b7278459ed105e4">d42264b4</a> still appends the todo block to the system prompt in <code>before_agent_start</code> (<code>appendSystemPromptOnce</code> in <code>extensions/gentle-todo.ts</code>). The fix branch is one commit on <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a>. The same patch applies unchanged to <a href="https://github.com/e-Evolution/gentle-shell/commit/563fede66638a5781e561e4247a13827777bde13">563fede6</a>, where it runs in daily use. It will be rebased onto current <code>main</code> before a pull request is opened.</p>
+  <h3 id="gentle-shell-subagents">Subagents and background jobs</h3>
+  <p>On upstream <code>main</code>, the trigger is the parent session: subagents and background jobs run with <code>GENTLE_PI_AGENTS_CHILD=1</code> and do not load the todo hook. To check the whole harness with the fix, we drove a gentle-shell build that carries the same patch (identical <code>git patch-id</code> to <a href="https://github.com/e-Evolution/gentle-shell/commit/4b92925726462eb6aaac338dc6b63776ce0d7a53">4b929257</a>, applied on upstream <a href="https://github.com/e-Evolution/gentle-shell/commit/563fede66638a5781e561e4247a13827777bde13">563fede6</a>) in pi RPC mode against the live server. One parent session ran a todo list, a foreground subagent, a background subagent and its wake, a background job and its notice, and two follow-up prompts.</p>
+  <ul>
+    <li>The parent kept one system message, the one at session start. Todo snapshots (4) and the subagent and job notices travelled as custom conversation messages.</li>
+    <li>Each child session kept one system message.</li>
+    <li>Of 18 requests, 11 reused the whole cached prefix and 2 were the cold starts of the parent and the first child. The second child started from a 2048-token block boundary of the first child's cache, as expected. The other 4 were parent requests that diverged at a block boundary; none of them was caused by a system-prompt change.</li>
+  </ul>
+  <h3 id="gentle-shell-notices">Harness notices and thinking retention</h3>
+  <p>Those 4 parent divergences happened right after harness notices: a todo update, a subagent result or wake, a job notice. pi sends these as user-role messages, so the Qwen template treats each one as a new user query. With <code>preserve_thinking: false</code> it then strips the reasoning of the previous segment, the prompt shrinks, and prefill restarts at that segment's first assistant message. On the server side, <code>preserve_thinking: true</code> removes the loss: the same scenario had 11 of 11 parent requests reuse their whole prefix, and the uncached tokens fell from 6,208 to 1,803 (<a href="#preserve-thinking">measurement</a>). For harness authors this is worth knowing. A notice that arrives as a user-role message is a cache boundary for templates that strip reasoning at the last user query, so how often notices are sent matters.</p>
+  <h3 id="gentle-shell-other">Other harness findings</h3>
+  <p>Running the harness and the server together during the live production run (fork.5) surfaced more prompt changes that neither side shows on its own. They belong to gentle-shell, not oMLX. The first two are already raised in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a>: the YOLO directive as a follow-up question (related to <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1029">#1029</a>, volatile RDD status in the system prompt), and the memory addendum toggle in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367#issuecomment-6042203628">the 2026-10-07 comment</a>. The last two are not reported yet. On <a href="https://github.com/e-Evolution/gentle-shell/commit/aa2c03896be9866ab0af89bbc621d4c2a8fcf9c2">aa2c0389</a> the todo block is still injected into the system prompt at <code>before_agent_start</code>; it did not fire in this window because no new user prompt arrived while todos were open.</p>
+  <ol>
+    <li>Turning on gentle-shell's YOLO mode injects its directive into the system prompt. In the orchestrator session (2026-10-06 22:53, before this window) that cost one re-prefill of 34,379 tokens: 111.9 s of prefill, against about 1.6 s for the next cache-hit turn.</li>
+    <li>An Engram memory addendum was added to and removed from the second session's system prompt twice, and toggled once in the orchestrator's. Each toggle invalidates the cache from that point on.</li>
+    <li>The <code>gentle-ai-worker</code> role lacked the native <code>agent_browser</code> tool, while the harness guard requires it for browser work.</li>
+    <li>Squad workers launched by a third-party extension did not use the profile's pinned local model. They started on a cloud model and failed for lack of credentials.</li>
+  </ol>
+
+  <h3>Why it matters for harness projects such as gentle-shell</h3>
+  <ul>
+    <li>Prefix and KV caching is how both local servers (oMLX, llama.cpp, vLLM, MLX) and hosted APIs keep long agent sessions affordable. A harness that rewrites an earlier prompt prefix can increase uncached input and latency. The impact depends on each backend's caching rules, pricing and workload.</li>
+    <li>Ordinary todo-behaviour tests missed this interaction. A prompt-stability invariant can catch the rewrite without a server; end-to-end measurements are needed to quantify its cache and latency impact.</li>
+    <li>The same loop separated the causes cleanly: one was in the harness (fixed on a gentle-shell branch; still present on upstream <code>main</code> on 2026-10-10 and 2026-10-11), two were in the server (A1, A2), and the rest were expected (compaction, real user turns).</li>
+  </ul>
+  <h3 id="gentle-shell-proposal">A proposal for gentle-shell</h3>
+  <ul>
+    <li><b>A prompt-stability invariant test.</b> Drive N turns through the harness with fakes, and assert that each rendered request is a strict prefix-extension of the previous one, except at declared boundaries (a real user message, compaction). The #1367 fix already includes the narrow version of this for the todo tool. It could be generalized to every extension that touches the system prompt (RDD status, YOLO directive, memory).</li>
+    <li><b>An optional end-to-end check against a local server.</b> Run a scripted session against a local OpenAI-compatible server that reports cached tokens (oMLX does, through <code>usage.prompt_tokens_details.cached_tokens</code>). Flag any turn whose cached-token count drops below the previous prompt length.</li>
+    <li><b>A recorder mode.</b> An opt-in payload recorder makes this kind of diagnosis reproducible for users who report "it got slow".</li>
+  </ul>
+</section>
+
+<section id="open-findings">
+  <h2>Open findings</h2>
+  <h3>Decode fairness does not cover multimodal prompts</h3>
+  <p>Any request with an image anywhere in its history carries <code>vlm_inputs_embeds</code> and prefills in the synchronous external loop. That happens even when every image is already inside the restored cached prefix and the uncached suffix is pure text. Both chunked branches require <code>vlm_embeds is None</code>, so concurrent decode freezes for the whole prefill: 25–46 s observed, and 155 s on cold 43k prefills. The fix is now built as part of the pause-resume cycle (C6, opt-in <code>OMLX_MEDIA_TEXT_SUFFIX_CHUNKED</code>). It routes a text-only suffix that follows a cached last image through the chunked path, after checking that the suffix positions are <code>t + rope_delta</code> on every mRoPE plane. Tiny-model tests show identical output with the route on and off. Its effect on the decode freezes has not been measured on hardware yet.</p>
+  <h3>TurboQuant decode attention at depth</h3>
+  <p>A regression over 975 single-row requests gives about 250–295 ns per context token per MTP cycle, against roughly 32 ns for a pure KV read at this model's KV size. The intercept is 70–75 ms against a weight roofline near 30 ms. These are estimates from logs. We have not yet done kernel-level profiling.</p>
+  <h3>MTP depth-1 verify uses stock qmm</h3>
+  <p>Depth-1 verify (M=2) runs in 97.5% of cycles, and no verify-qmm route accepts M=2: the routes cover 3–6, 4–8 and 7–24. We estimate 10–20 ms per cycle from this. MTP is still net positive in every context bucket (1.3–1.45×).</p>
+</section>
+
+<section id="validation">
+  <h2>How it was validated</h2>
+  <p class="callout warn"><b>Evidence status.</b> The benchmark figures, traffic counts, test-suite outcomes and pilot completion in this report are reported by the author, not an independent reproduction. A reference audit checked published link destinations, internal anchors, available code and tests, arithmetic, and the measured-to-published commit mapping. Link availability or test-source existence does not prove a run passed. This page does not currently link an immutable archive of the primary run logs, result files and exact configuration for each measurement, or an independent wiki-content audit. PR1's non-identical outputs and PR2's unexercised hardware fallback remain limitations; branch links can move, so use the commit hashes for fixed evidence.</p>
+  <ul>
+    <li><b>Test-first.</b> Each behaviour came with a regression test that failed before the change and passed after. The fork's full suite has 17,063 passed and 439 skipped, plus three environment-only failures (a local asset model without a chat template).</li>
+    <li><b>Independent reviews.</b> Each slice was reviewed separately, with four review lenses on the high-risk slices. Findings fed back as small follow-up commits, for example graceful degradation when a VLM tokenizer has no <code>encode</code>.</li>
+    <li><b>Benchmarks against upstream.</b> The premise harness ran upstream and fork servers in isolation, and checked that the live app was idle. It flagged contaminated runs, discarded them and reran them.</li>
+    <li><b>Recorded-traffic replay.</b> A client-side recorder captures exact provider payloads, and a replayer re-sends them in order to an isolated server to measure reuse per build.</li>
+  </ul>
+  <h3 id="source-code">Source code and commit references</h3>
+  <p>Every commit and branch named in this report links to the fork on GitHub, <a href="https://github.com/e-Evolution/omlx">e-Evolution/omlx</a> (gentle-shell references link to <a href="https://github.com/e-Evolution/gentle-shell">e-Evolution/gentle-shell</a>). Upstream commits are reachable from the fork with the same hashes. The PR branches are <a href="https://github.com/e-Evolution/omlx/tree/fix/turboquant-padded-batched-decode"><code>fix/turboquant-padded-batched-decode</code></a> (PR1) and <a href="https://github.com/e-Evolution/omlx/tree/fix/turboquant-restored-prefix-prefill"><code>fix/turboquant-restored-prefix-prefill</code></a> (PR2).</p>
+  <p>The fork branches were published on 2026-10-11. Before publishing, local machine paths were replaced in benchmark defaults, one test fixture and one docstring (output directory, cache volume name). Comparison of all 17 measured-to-published Git tree pairs found no differences under <code>omlx/</code>. The differences are confined to benchmark path defaults, supporting documentation and examples, the path fixture and the C7 docstring reference. The complete trees are therefore not byte-identical; reproduction requires explicit local path settings. This corroborates source continuity, not the historical measurements themselves. The commit hashes changed. The report shows the published hashes; the table maps each to the hash that was measured, which also appears in the logs. Hovering a published hash shows the same mapping. The earlier PR1 commit 61bd8a06, replaced by the rebased branch, is kept under the tag <a href="https://github.com/e-Evolution/omlx/tree/report/61bd8a06"><code>report/61bd8a06</code></a>.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Published commit</th><th>Measured as</th></tr></thead>
+    <tbody><tr><td><a href="https://github.com/e-Evolution/omlx/commit/658994608a86869ba43ea972c6e310529c4541cd"><code>65899460</code></a></td><td><code>082a870c</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/5dd56ca5b77ea7d2981deb8575f59e2a518358f8"><code>5dd56ca5</code></a></td><td><code>0b932a39</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/19aa28ef8c74a6f56715cf865fde65f1e05221a9"><code>19aa28ef</code></a></td><td><code>25685e36</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/159673d5278cb1bf86ca32f8436411ccad261f18"><code>159673d5</code></a></td><td><code>301bde14</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/4aa661507d900992c9a587b0d8c03c41400aa27b"><code>4aa66150</code></a></td><td><code>4e81e443</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/f3c11356180682081ad4709d4b8f7e387b8d256d"><code>f3c11356</code></a></td><td><code>85c1f902</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/95dd47e8322df6dc5792f151193c3b594da24089"><code>95dd47e8</code></a></td><td><code>8aa178c5</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/04bb7899d293cd9afd68ebe54d468f13774b0393"><code>04bb7899</code></a></td><td><code>aa06f32e</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/c31820cb14845ce05d0356e5f91d047e75ee441d"><code>c31820cb</code></a></td><td><code>b000a28f</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/5a881160b35321b5bd980c21b16a0ea0c42e75a0"><code>5a881160</code></a></td><td><code>c36b92fb</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/78291febbc85f7170ea04e718c36d00fa8343906"><code>78291feb</code></a></td><td><code>c9694977</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/3b72cde7bbda257bdb9ba4564c24c30e8600f92a"><code>3b72cde7</code></a></td><td><code>d34413ec</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/6fbb3274e656df0ccabc8a330e59fc04866656b6"><code>6fbb3274</code></a></td><td><code>e24198f5</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/47c0c70b754d7796057b0a31c130b217298492ce"><code>47c0c70b</code></a></td><td><code>e80a1842</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/e5353d706b35941aba40569ceb211d343f9603ae"><code>e5353d70</code></a></td><td><code>f6c601b0</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/31cab33d0f37974afb1740f0902a335ea5a59654"><code>31cab33d</code></a></td><td><code>f7dd2bc8</code></td></tr><tr><td><a href="https://github.com/e-Evolution/omlx/commit/e80eb1f754e52922a88b7133ca5c510a681b4837"><code>e80eb1f7</code></a></td><td><code>f92fbd7c</code></td></tr></tbody>
+  </table></div>
+  <div class="callout">Scope of the evidence: one M5 Max with 128 GB, one model family (Qwen3.8-27B, 4-bit, MTP, TurboQuant KV), Python 3.11, macOS. The fork was rebased onto upstream <code>main</code> (<a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a>) with a single docs conflict. Upstream's CI selection (<code>pytest tests/ -m "not slow and not integration"</code>, Python 3.11) gives 16,941 passed on <code>main</code> and 17,635 passed on the rebased fork, with the same 3 environment-only failures on both. Benchmarks ran each build alone through the same runtime, which pins the v0.7.0 app's dependencies rather than <code>main</code>'s. The exception is PR1's P3 re-validation on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>, which ran both trees from one venv with <code>main</code>'s pins (mlx 0.32.3, mlx-vlm 0.7.7) and no compiled custom kernels. The pause-resume branch (<a href="https://github.com/e-Evolution/omlx/commit/47c0c70b754d7796057b0a31c130b217298492ce" title="Measured as e80a1842. Published with local paths removed from benchmark defaults; the code is otherwise identical.">47c0c70b</a>) gives 17,908 passed with the same 3 environment-only failures. With xdist, as CI runs it, the fork rebased on <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> (<a href="https://github.com/e-Evolution/omlx/commit/4aa661507d900992c9a587b0d8c03c41400aa27b" title="Measured as 4e81e443. Published with local paths removed from benchmark defaults; the code is otherwise identical.">4aa66150</a>) gives 18,072 passed against <code>main</code>'s 16,921, with the same 3 environment-only failures plus one load-sensitive cluster test that passes alone; the <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> re-validation ran both trees from one venv with <code>main</code>'s pins. The branches on <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a> are listed in <a href="#contribution">Proposed contribution</a>.</div>
+</section>
+
+<section id="contribution">
+  <h2>Proposed contribution</h2>
+  <h3 id="contribution-omlx">To oMLX</h3>
+  <p>We would like to send these upstream as small pull requests, each with its own regression tests and before/after numbers on the same hardware, following <code>docs/CONTRIBUTING.md</code>. Upstream routes feature proposals to GitHub Discussions &gt; Ideas, and blank issues are disabled, so the proposal is posted as Ideas discussion <a href="https://github.com/jundot/omlx/discussions/4440">#4440</a> (2026-10-11). The two TurboQuant fixes, PR1 and PR2, are bug fixes under 1,000 changed lines, so they were opened directly on the same day: PR1 as <a href="https://github.com/jundot/omlx/pull/4441">#4441</a> and PR2 as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a>. On 2026-10-12 the maintainer merged PR2 as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a>, with a follow-up for the dense dtype when no KV layer is plain and the embedding is quantized, and closed PR1 in favor of <a href="https://github.com/jundot/omlx/pull/4453">#4453</a>, which extends the <a href="https://github.com/jundot/omlx/pull/4408">#4408</a> kernel to take each row's left padding and lists us as co-author. The pause-resume cycle is over 1,000 changed lines and adds a subsystem, so it was first posted for feedback on <a href="https://github.com/jundot/omlx/discussions/4440">#4440</a>; on 2026-10-12 its stack was opened as twelve pull requests, <a href="https://github.com/jundot/omlx/pull/4478">#4478</a> (ready for review) to <a href="https://github.com/jundot/omlx/pull/4489">#4489</a> (drafts). Each slice states its dependency and merge order. The order is a proposal and we will adapt it to your preferences.</p>
+  <p>Every branch below is rebased on upstream <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a> (2026-10-10, MLX 0.32.3, mlx-vlm 0.7.7). On that base, CI's command (<code>-m "not slow and not integration" -n 3 --dist loadgroup</code>, Python 3.11, a venv with <code>main</code>'s pins) gives 16,928 passed on <code>main</code>, 16,956 with PR1 (+28 tests) and 16,944 with PR2 (+16), with the same 3 environment-only failures (<code>test_gemma4_rendering.py</code>). Before opening them, PR1 and PR2 were also checked against the newer <code>main</code> <a href="https://github.com/jundot/omlx/commit/e02ae514">e02ae514</a> (2026-10-11): both merge without conflicts, and CI's command gives 16,938 passed on <code>main</code>, 16,966 with PR1 and 16,954 with PR2, with the same 3 failures. The whole stack was rebuilt on the same base from the fork, every slice from P-a to S9, with the <code>memory_scheduling</code> gate (G) before S4; each slice applies on the one before, and its focused tests and CI's command pass at its tip (two load-sensitive tests that pass alone aside). For the pull requests, the stack was rebased on <code>main</code> <a href="https://github.com/jundot/omlx/commit/f3ad34d2">f3ad34d2</a> (2026-10-12), and following upstream <a href="https://github.com/jundot/omlx/pull/4396">#4396</a> its two environment-only switches became settings (<code>memory.abort_single_victim</code>, <code>scheduler.media_text_suffix_chunked</code>) and the forced-pause test knob was dropped. CI's command gives 17,119 passed on that <code>main</code> and 17,175 (P-a) to 17,580 (S9) at the slice tips, with the same 3 failures; one load-sensitive cluster test also failed at S2 and S4 and passes alone 3/3 there.</p>
+  <p>About two thirds of the cycle's changed lines are tests. For S1–S9 and G, the per-slice counts in the table below add up to 8,632 test lines out of 12,961 (67%); with the prerequisites P-a and P-b, 11,658 of 17,652 (66%). The scheduler is concurrent (the MLX thread, the memory enforcer and the SSD writer interleave), so every edge case found on the real model has a regression test on the real scheduler and enforcer rather than on fakes. That is why it is split into chained pull requests, each carrying its own tests.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Pull request</th><th>Lines (tests)</th><th>Default</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td class="n">PR1</td><td><b>fix(turboquant):</b> attend each left-padded row's own slice in batched decode and MTP verify. On newer <code>main</code> primarily a performance fix for padded batched decode, with a correctness signal. Two commits: per-row attention for decode, and the per-row path for padded verify (own mask kept across mlx-vlm's per-layer slice). A third commit, an exact rollback of the verify tail, was dropped: upstream #3127 fixed the same lossy rollback on <code>main</code>.</td><td class="n">816 (544): +815 / −1, 28 tests</td><td>always (bug fix)</td><td>Closed in favor of <a href="https://github.com/jundot/omlx/pull/4453">#4453</a> (merged 2026-10-12, co-authored). Branch <a href="https://github.com/e-Evolution/omlx/tree/fix/turboquant-padded-batched-decode"><code>fix/turboquant-padded-batched-decode</code></a> on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>: 16,956 passed against <code>main</code>'s 16,928, the same 3 environment-only failures. Real model, P3 on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a> with <code>main</code>'s pinned dependencies (one run per build; the TurboQuant files are unchanged upstream since then): no aborts or degeneration on either tree; batched decode 5–12× faster per row (1.5 → 8.3 tok/s with MTP on, 0.66 → 8.1 with MTP off), B=3 phase 345 → 66 s and 780 → 65 s, peak 11–15 GB lower; with MTP off, batched rows stay on the B=1 output longer (about token 8–10 against 1–2). Per-layer decode attention runs 9–28× faster (microbenchmark). Historical, before the rebase (<code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> on the v0.7.0 app runtime, PR1 with the dropped rollback commit): the B=3 batch aborted on <code>main</code> (6 aborts, 120 GB peak), and PR1 gave 4-gram 1.00 / 0.99 / 0.99 and 0 aborts.</td></tr>
+      <tr><td class="n">PR2</td><td><b>fix(scheduler):</b> prefill long suffixes over a dense copy of a restored TurboQuant prefix (<a href="#tq-restored-prefill">details</a>). Two commits: the dense step, and the embedding-dtype fallback when every KV layer is TurboQuant.</td><td class="n">547 (360), 16 tests</td><td>always (bug fix)</td><td>Merged as <a href="https://github.com/jundot/omlx/pull/4442">#4442</a> (2026-10-12), independent of PR1 and of the stack. Branch <a href="https://github.com/e-Evolution/omlx/tree/fix/turboquant-restored-prefix-prefill"><code>fix/turboquant-restored-prefix-prefill</code></a> on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>: 16,944 passed, the same 3 environment-only failures. Restored suffix 2.41× → 0.92× of cold on <code>main</code>; quality differences only at near-ties, as without the fix; reservation +2.23 GB.</td></tr>
+      <tr><td class="n">P-a</td><td>Prefill progress commit, including the commit executor in its own module (prerequisite)</td><td class="n">2,133 (1,293)</td><td>off</td><td rowspan="12">Open since 2026-10-12, rebased on <code>main</code> <a href="https://github.com/jundot/omlx/commit/f3ad34d2">f3ad34d2</a>: P-a <a href="https://github.com/jundot/omlx/pull/4478">#4478</a>, P-b <a href="https://github.com/jundot/omlx/pull/4479">#4479</a>, S1 <a href="https://github.com/jundot/omlx/pull/4480">#4480</a>, S2 <a href="https://github.com/jundot/omlx/pull/4481">#4481</a>, S3 <a href="https://github.com/jundot/omlx/pull/4482">#4482</a>, S5 <a href="https://github.com/jundot/omlx/pull/4483">#4483</a>, G <a href="https://github.com/jundot/omlx/pull/4484">#4484</a>, S4 <a href="https://github.com/jundot/omlx/pull/4485">#4485</a>, S6 <a href="https://github.com/jundot/omlx/pull/4486">#4486</a>, S7 <a href="https://github.com/jundot/omlx/pull/4487">#4487</a>, S8 <a href="https://github.com/jundot/omlx/pull/4488">#4488</a>, S9 <a href="https://github.com/jundot/omlx/pull/4489">#4489</a>. P-a is ready for review; the rest are drafts in merge order.</td></tr>
+      <tr><td class="n">P-b</td><td>Prefill park instead of abort, plus the media progress commit and the shutdown watchdog (prerequisite)</td><td class="n">2,558 (1,733)</td><td>off</td></tr>
+      <tr><td class="n">S1</td><td>Single-victim fallback and exact-chain cache primitives</td><td class="n">1,284 (687)</td><td>off</td></tr>
+      <tr><td class="n">S2</td><td>Decode pause and resume (pause primitive, resume fast path, stop and parser continuity, enforcer wiring, MTP handoff)</td><td class="n">2,735 (1,912)</td><td>off</td></tr>
+      <tr><td class="n">S3</td><td>Memory-aware resume priority (resume when the need fits; FIFO hold as the reservation), adapted to #3482</td><td class="n">532 (348)</td><td>off</td></tr>
+      <tr><td class="n">S5</td><td>Cached-media text suffix through the chunked path (makes image prompts parkable), with the position proof also in the packed prefill path</td><td class="n">997 (758)</td><td>off</td></tr>
+      <tr><td class="n">G</td><td>Memory scheduling gate first: the <code>memory_scheduling</code> setting (off without an explicit ceiling), its resolution and propagation by the enforcer, the admin settings and the live state; nothing reads it yet</td><td class="n">696 (464)</td><td>adds the setting</td></tr>
+      <tr><td class="n">S4</td><td>Never-fits gate, fits-later wait and capacity API (endpoint, header, 400 schema; VLM weights sizing), adapted to #3482 and #4252; a parked request's own committed blocks reported as resumed prefill (#4383)</td><td class="n">2,550 (1,612)</td><td>memory scheduling</td></tr>
+      <tr><td class="n">S6</td><td>Resume under the hard watermark without thrashing, solo run, decode pause budget</td><td class="n">922 (537)</td><td>off</td></tr>
+      <tr><td class="n">S7</td><td>Enforcer: spare external-loop prefills, no abort-all without a live victim, emergency pause-first</td><td class="n">1,012 (736)</td><td>off / memory scheduling</td></tr>
+      <tr><td class="n">S8</td><td>Admission progress clock, solo admission, a lone head that fits alone re-measured on a stale reading (the forced-pause test knob of this build was dropped from the opened pull request)</td><td class="n">1,743 (1,238)</td><td>memory scheduling / off</td></tr>
+      <tr><td class="n">S9</td><td>Follow-ups: the hot cache raises the never-fits line, and the stall clock across park holds</td><td class="n">490 (340)</td><td>memory scheduling / park</td></tr>
+    </tbody>
+  </table></div>
+  <p style="margin-top:10px">Line counts are additions plus deletions of each slice against the slice before it, on <code>main</code> <a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a>. "Memory scheduling" means off unless an explicit memory ceiling is set or <code>memory_scheduling=on</code>. G adds that gate before any path reads it, and S4, S7 and S8 consult it from their first commit, so with every flag off each prefix of the stack behaves as <code>main</code> on these paths; each gated slice has tests that drive it with the gate off and expect <code>main</code>'s behaviour. The C7 evidence on <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a> (<a href="#fork-current-main">re-validation</a>) covers P-b, S1–S3, G and S6–S9, the MTP-off identity run covers S2, the never-fits run covers S4, and S5 has unit and tiny-model identity tests only. The rebuild cherry-picked the fork's commits in slice order with mechanical resolutions; the one test that used the fork's defaults file (G's admin-state test) now sets the mode in <code>settings.json</code>, and a test-fixture fix for upstream #4312 moved into S6, whose tests need it. These fork commits are in no pull request: the packaging commits (defaults bundle, gate removal, <code>--allow-pin-mismatch</code>), the defaults-file layer and the shared on/off env reader that goes with it, the <code>benchmarks/unattended</code> harness (linked as reproduction only), and the fork-side test that combines PR2 with the prefill park (it follows once both are on <code>main</code>).</p>
+  <h3>Later, separate oMLX proposals</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Pull request</th><th>Size</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>perf(turboquant): ragged single-launch batched kernel</td><td class="n">—</td><td>Follow-up to PR1. After PR1, batched decode runs at about 8 tok/s per row on newer <code>main</code> (about 7 on the v0.7.0 runtime), against 17–40 tok/s at B=1; the fork's ragged kernel is the next speed step. Upstream's <a href="https://github.com/jundot/omlx/pull/4453">#4453</a> now runs a padded batch in one kernel launch per layer (maintainer-reported 62–65 tok/s per row with three concurrent requests, Qwen3.6-35B-A3B with TQ4), so this proposal would first be re-measured against it.</td></tr>
+      <tr><td>feat(memory): <code>memory.mlx_cache_limit_gb</code></td><td class="n">~170</td><td>Bounds the Metal buffer cache. Includes i18n entries.</td></tr>
+      <tr><td>feat(cache): eviction summary and per-request cache outcome; TTFT breakdown log</td><td class="n">2 PRs</td><td>Observability only.</td></tr>
+      <tr><td>feat(api): <code>inline_note</code> as a third mid-system policy</td><td class="n">~700</td><td>Opt-in, next to <code>strict</code> and <code>user_note_safe</code>.</td></tr>
+      <tr><td>feat(api): deterministic thinking retention with a configurable non-query marker list</td><td class="n">~1.6k</td><td>We will generalize it beyond one client's marker text first, and check templates one by one.</td></tr>
+      <tr><td>feat(scheduler): batched-decode context gate with backfill and aging</td><td class="n">—</td><td>On hold. The fork app dropped it in fork.5 (<a href="https://github.com/e-Evolution/omlx/commit/159673d5278cb1bf86ca32f8436411ccad261f18" title="Measured as 301bde14. Published with local paths removed from benchmark defaults; the code is otherwise identical.">159673d5</a>) because decode pauses now handle the memory case.</td></tr>
+    </tbody>
+  </table></div>
+  <h3>oMLX bug reports we would file (or comment on)</h3>
+  <ul>
+    <li>TurboQuant left-padded batched decode attends over padding columns (short-row norm ratio 0.32 in synthetic tests) and is slow (about 1.5 tok/s per row at B=3 on <a href="https://github.com/e-Evolution/omlx/commit/25aebb3ee0bb052a264241953bef6820f102dd0b">25aebb3e</a>), with a reproducer; PR1 is the fix. Degenerate output and aborts were seen only on <a href="https://github.com/e-Evolution/omlx/commit/b7c7929e8a5e06a7f1e1bb78faea3084110b1c06">b7c7929e</a> with the v0.7.0 app runtime. Related: #4110, #3767, #2784.</li>
+    <li>Slow suffix prefill after a paged-SSD restore of a TurboQuant prefix (2.4× a cold prefill of the same positions on <a href="https://github.com/e-Evolution/omlx/commit/c0b1056b41ebde9422af316cf5038a423eb8f24c">c0b1056b</a>); PR2 is the fix. Related: #1842, #3933.</li>
+    <li>Decode fairness bypassed for multimodal prompts. Related: #3209.</li>
+    <li>Lightning MTP single-request output is not bit-reproducible on reruns. It diverged on 1 of 3 runs on upstream.</li>
+    <li>A1 and A2 context added to the existing threads (#3608, #1966, #3378, #900, #1003) rather than new issues.</li>
+  </ul>
+  <h3>Before each oMLX PR we will</h3>
+  <ul>
+    <li>rebase onto current <code>main</code> (<a href="https://github.com/e-Evolution/omlx/commit/013bc3f3a48fa9a4b7dffbfeb6cdc7c1face1c5d">013bc3f3</a> at the last rebase, 2026-10-10: MLX 0.32.3, mlx-vlm 0.7.7);</li>
+    <li>run CI's command: <code>python -m pytest tests/ -m "not slow and not integration" -n 3 --dist loadgroup</code> on Python 3.11, plus Black and Ruff at 88 columns;</li>
+    <li>re-run the relevant benchmark against <code>main</code> with run counts.</li>
+  </ul>
+  <h3 id="contribution-gentle-shell">To gentle-shell</h3>
+  <p>gentle-shell requires an issue with <code>status:approved</code> before a pull request. <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a> is open with <code>status:needs-review</code>, and we have asked for approval so that the fix can go in as a pull request, or be folded into another change if the maintainers prefer.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Change</th><th>Lines (tests)</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td><b>fix(todo):</b> deliver todo state as messages to keep the prompt cache-stable. The system prompt stays byte-stable within a session; todo updates are hidden conversation messages sent only when the list changes; the stale reminder fires once; the state is re-injected once after compaction. Keeps #1924's reminder and the blocked/dropped statuses.</td><td class="n">388 (296)</td><td>Ready. Branch <a href="https://github.com/e-Evolution/gentle-shell/tree/fix/todo-prompt-cache-1367"><code>fix/todo-prompt-cache-1367</code></a>, one commit (<a href="https://github.com/e-Evolution/gentle-shell/commit/4b92925726462eb6aaac338dc6b63776ce0d7a53">4b929257</a>) on <a href="https://github.com/e-Evolution/gentle-shell/commit/43541a0d30dfafacfcb2e99ef4135ab8b1693e99">43541a0d</a>: 63 todo tests, typecheck, <code>check:runtime-modules</code> and <code>verify-package-files</code> pass; the remaining <code>pnpm test</code> failures also fail on a clean base. Waits for <code>status:approved</code>; will be rebased onto current <code>main</code> first.</td></tr>
+      <tr><td><b>test:</b> a prompt-stability invariant for every extension that touches the system prompt (RDD status, YOLO directive, memory)</td><td class="n">—</td><td>Proposal (<a href="#gentle-shell">above</a>)</td></tr>
+      <tr><td>An optional end-to-end check against a local server that reports cached tokens, and an opt-in payload recorder</td><td class="n">—</td><td>Proposal</td></tr>
+      <tr><td>The <a href="#gentle-shell-other">other harness findings</a>: YOLO directive and memory addendum toggles in the system prompt, the worker role without <code>agent_browser</code>, squad workers ignoring the pinned model</td><td class="n">—</td><td>The first two raised in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">#1367</a> (related: <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1029">#1029</a>); the other two not reported yet, one issue each</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>
+  <a class="footer-brand" href="https://e-evolution.com" title="e-Evolution"><img src="media/logos/e-evolution.png" alt="e-Evolution" width="200" height="75"></a><br>
+  Contribution from the lead maintainer of <a href="https://github.com/adempiere/adempiere/tree/hotfix/3.9.4.002">ADempiere</a>. Author: victor.perez@e-evolution.com. All numbers come from the author's own machine and logs. Client-side fixes are tracked in their own repositories: the pi extension that pauses and auto-continues and records request traces, and the gentle-shell harness (<a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">gentle-shell #1367</a>).<br>
+  Thanks to <a href="https://github.com/jundot">jundot</a> (<a href="https://x.com/jundotkim">@jundotkim</a> on X) for oMLX, and to <a href="https://github.com/Alan-TheGentleman">Alan-TheGentleman</a> (<a href="https://x.com/G_Programming">@G_Programming</a> on X) for the gentle-shell harness.
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local AI Agents Finished a Real Project on One Mac: What It Took</title>
+<link rel="canonical" href="https://e-evolution.github.io/omlx/local-ai-agents-one-mac-en.html">
+<style>
+  body { max-width: 720px; margin: 2rem auto; padding: 0 16px; font: 18px/1.6 Georgia, serif; color: #222; background: #fff; }
+  h1, h2 { font-family: -apple-system, Helvetica, Arial, sans-serif; line-height: 1.25; }
+  img { max-width: 100%; height: auto; }
+  figcaption { font-size: 14px; color: #666; text-align: center; }
+  blockquote { border-left: 3px solid #222; margin: 1.5rem 0; padding-left: 1rem; font-style: italic; }
+</style>
+</head>
+<body>
+<article>
+
+<h1>Local AI Agents Finished a Real Project on One Mac: What It Took</h1>
+<h2>What broke in oMLX and gentle-shell, how we fixed it, and the fixes we're contributing back to both projects.</h2>
+
+<p>Can local models, one Mac and only open-source tools finish real work from beginning to end, without someone watching every step?</p>
+
+<p>I am the lead maintainer of <a href="https://github.com/adempiere/adempiere/tree/hotfix/3.9.4.002">ADempiere</a>, an open-source ERP, CRM and SCM project. We had a concrete, useful task to test that question on: turn our PDF manuals and older screenshots into wiki documentation, with images of the new ADempiere version and an assistant that answers questions.</p>
+
+<p>With the server and harness fixes described below applied during the pilot, the project met its objective. The documentation was completed end to end on a single Apple workstation configured for local AI. This article is the short version. The <a href="https://e-evolution.github.io/omlx/">full field report</a> has the method, every number and its limits.</p>
+
+<h2>The tools, for anyone new to them</h2>
+
+<ul>
+  <li><strong><a href="https://github.com/jundot/omlx">oMLX</a></strong>, by <a href="https://github.com/jundot">jundot</a>, runs open AI models locally on Apple Silicon Macs. It keeps a prompt cache on SSD, so an agent that re-sends a long conversation does not pay for all of it again.</li>
+  <li><strong><a href="https://github.com/Gentleman-Programming/gentle-shell">gentle-shell</a></strong>, by <a href="https://github.com/Alan-TheGentleman">Alan-TheGentleman</a>, is a harness for the pi coding agent. It adds the agent workflow: orchestration, a todo tool, review integration and subagents that run as separate processes.</li>
+  <li><strong>Qwen models</strong>, specifically Qwen3.8-27B in a 4-bit build with Multi-Token Prediction and TurboQuant 4-bit KV cache, running on an Apple M5 Max with 128 GB of memory.</li>
+</ul>
+
+<p>Several agent sessions shared one model. They read whole source files and took screenshots, so prompts were large: across 1,260 recorded requests, the median was 107k tokens and the 90th percentile 168k. At that size, the prompt cache decides whether a turn costs one second or several minutes.</p>
+
+<figure>
+  <img src="https://e-evolution.github.io/omlx/media/omlx-gentle-shell-intellij-load.gif" alt="oMLX dashboard serving several concurrent agent requests">
+  <figcaption>One local oMLX server, two clients: gentle-shell subagents and an IDE assistant sending requests at the same time (10× speed, field recording).</figcaption>
+</figure>
+
+<h2>What broke when we left it alone</h2>
+
+<p>The goal was simple to state: leave the machine working until every job finishes. On the stock release (oMLX v0.7.0) it did not:</p>
+
+<ul>
+  <li><strong>Lost work under memory pressure.</strong> Several long prompts at once reached the memory guard's hard limit. Requests were aborted mid-prefill, all progress was lost, and the agents stopped and waited for a human.</li>
+  <li><strong>Concurrency made it worse.</strong> In a three-request benchmark, running them together took 538 s against 246 s one by one, with 6 aborts.</li>
+  <li><strong>Batched decode was slow and, on that runtime, could go wrong.</strong> Short rows in a padded batch attended over padding.</li>
+  <li><strong>The prompt cache collapsed in bursts.</strong> Average reuse was high, but single turns lost 70k–170k cached tokens.</li>
+</ul>
+
+<p>None of these showed up in a unit test. They appeared only when real agents ran for hours against a real server.</p>
+
+<h2>How we worked</h2>
+
+<p>Before writing code, we wrote six falsifiable premises, each tied to a benchmark on the same machine, model and prompts, against the upstream release. Nothing counted as done until its premise passed.</p>
+
+<p>The changes were made test-first, one reviewable commit per behaviour, with an independent review on each slice. When something failed, we traced it in server logs and in a small client-side recorder that captured the exact payload of every request, then fixed it with a regression test first.</p>
+
+<p>That last tool mattered more than expected. Comparing consecutive requests byte by byte, and matching the first changed byte with the position where the server's cache diverged, is what found the largest problem of all, and it was not in the server.</p>
+
+<h2>What we propose for oMLX</h2>
+
+<p><strong>1. Batched TurboQuant decode (<a href="https://github.com/jundot/omlx/pull/4441">PR #4441</a>).</strong> When rows of different lengths decode together, the shorter rows are left-padded. The batched path let the padding into attention and dequantized the whole context on every step. The fix makes each row attend only to its own slice. On recent upstream code, with a batch of three restored prompts (20k, 45k and 135k tokens), batched decode became 5–12× faster per row, the batch phase went from 345 s to 66 s with MTP on, and peak memory dropped by 11–15 GB. Two commits, 28 tests.</p>
+
+<p><strong>2. Prefill after an SSD cache hit (<a href="https://github.com/jundot/omlx/pull/4442">PR #4442</a>).</strong> When a long prompt reuses a cached TurboQuant prefix from SSD, the rest of the prompt was prefilled against the compressed prefix, 2.4× slower than processing the same positions cold. A one-off dense copy of the restored layers (0.43 s) brings it to 0.92× of cold. Two commits, 16 tests.</p>
+
+<p><strong>3. Pause and resume instead of abort (<a href="https://github.com/jundot/omlx/discussions/4440">proposal in discussion #4440</a>).</strong> Under memory pressure, the server pauses one request, saves its state to the SSD cache, and resumes it later on the same stream, instead of aborting everything in flight. A request that can never fit gets a clear error with the numbers in 0.1 s, so the agent can compact its context and retry. In a forced-pressure test, 9 of 9 requests finished, against 3 of 9 on recent upstream code. With MTP off, 12 forced pauses produced identical output. It is about 13,000 changed lines, two thirds of them tests, so it is proposed as a stack of 12 small pull requests, every new behaviour behind an opt-in switch, waiting for the maintainer's view before any is opened.</p>
+
+<figure>
+  <img src="https://e-evolution.github.io/omlx/media/omlx-sustained-no-abort.gif" alt="oMLX dashboard during a sustained run with no aborts">
+  <figcaption>Over three minutes of real work (20× speed), the fork keeps 3–4 agent requests in flight; requests finish and new ones start, with no error in the visible frames.</figcaption>
+</figure>
+
+<p>On the fork used day to day, 333 live agent requests at up to 5 at a time ran with 0 memory aborts, and 94.8% of prompt tokens came from the cache in that log window. In the benchmarks against the upstream code of the time, two concurrent 130k-token prompts peaked at 44 GB instead of 116 GB and finished about 3× faster, and unattended agent batches finished 3 of 3 times against 0 of 3 on v0.7.0.</p>
+
+<h2>What we propose for gentle-shell</h2>
+
+<p>The largest single cache loss in the whole investigation was in the harness. While todos were open, gentle-shell's todo extension rewrote the system prompt on every user prompt, including a "stale" counter that changed each time. On the tested setup, every rewrite broke cache reuse from that point onward.</p>
+
+<blockquote>Nothing failed and every harness test passed. Agent turns just took minutes instead of seconds.</blockquote>
+
+<p>Over about a day and a half of real use, that meant roughly 1.05 million tokens processed again, about 80–85 minutes of GPU time. The fix moves todo state out of the system prompt into conversation messages, sent only when the list changes. Requests that rewrote the system prompt went from 21 of 61 to 0 of 90, and re-prefills above 20k tokens went from one or two per hour to zero. The fix is ready, its 63 todo tests pass, and it is tracked in <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">issue #1367</a>.</p>
+
+<p>The lesson applies to any agent harness: prompt-stability tests catch the rewrite itself, but only a server with an observable cache shows what it costs.</p>
+
+<h2>What this does and does not show</h2>
+
+<p>The numbers come from my own runs on one Apple M5 Max and one model family, mostly one run per configuration. They are evidence, not an independent reproduction. The fixes are proposals; none is adopted upstream yet, and they are not guarantees for smaller machines. The full report lists every limit next to the number it qualifies.</p>
+
+<h2>Why we are sharing it</h2>
+
+<p>oMLX and gentle-shell are open source, built by people who share their work with everyone. We like that philosophy, and contributing back is how we take part in it. My thanks to jundot and Alan-TheGentleman for the projects that made this pilot possible.</p>
+
+<p>If you contribute to either project, reviews and tests on other Macs and models are very welcome:</p>
+
+<ul>
+  <li>Full field report: <a href="https://e-evolution.github.io/omlx/">e-evolution.github.io/omlx</a> (<a href="https://e-evolution.github.io/omlx/es.html">en español</a>)</li>
+  <li>oMLX discussion: <a href="https://github.com/jundot/omlx/discussions/4440">jundot/omlx#4440</a></li>
+  <li>oMLX pull requests: <a href="https://github.com/jundot/omlx/pull/4441">#4441</a> and <a href="https://github.com/jundot/omlx/pull/4442">#4442</a></li>
+  <li>gentle-shell issue: <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">Gentleman-Programming/gentle-shell#1367</a></li>
+</ul>
+
+<p><em>Victor Perez, lead maintainer of ADempiere. Originally published at <a href="https://e-evolution.github.io/omlx/">e-evolution.github.io/omlx</a>.</em></p>
+
+</article>
+</body>
+</html>

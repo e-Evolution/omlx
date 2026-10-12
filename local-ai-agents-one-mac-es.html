@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentes de IA locales terminaron un proyecto real en una Mac: lo que hizo falta</title>
+<link rel="canonical" href="https://e-evolution.github.io/omlx/local-ai-agents-one-mac-es.html">
+<style>
+  body { max-width: 720px; margin: 2rem auto; padding: 0 16px; font: 18px/1.6 Georgia, serif; color: #222; background: #fff; }
+  h1, h2 { font-family: -apple-system, Helvetica, Arial, sans-serif; line-height: 1.25; }
+  img { max-width: 100%; height: auto; }
+  figcaption { font-size: 14px; color: #666; text-align: center; }
+  blockquote { border-left: 3px solid #222; margin: 1.5rem 0; padding-left: 1rem; font-style: italic; }
+</style>
+</head>
+<body>
+<article>
+
+<h1>Agentes de IA locales terminaron un proyecto real en una Mac: lo que hizo falta</h1>
+<h2>Qué falló en oMLX y gentle-shell, cómo lo corregimos y las correcciones que devolvemos a ambos proyectos.</h2>
+
+<p>¿Pueden los modelos locales, una Mac y solo herramientas de código abierto completar un trabajo real de principio a fin, sin que alguien supervise cada paso?</p>
+
+<p>Soy el mantenedor principal de <a href="https://github.com/adempiere/adempiere/tree/hotfix/3.9.4.002">ADempiere</a>, un proyecto de código abierto de ERP, CRM y SCM. Teníamos una tarea concreta y útil para poner a prueba esa pregunta: convertir nuestros manuales en PDF y capturas de pantalla antiguas en documentación tipo wiki, con imágenes de la nueva versión de ADempiere y un asistente que responde preguntas.</p>
+
+<p>Con las correcciones de servidor y de harness que se describen más abajo, aplicadas durante el piloto, el proyecto cumplió su objetivo. La documentación se completó de principio a fin en una sola estación de trabajo de Apple preparada para IA local. Este artículo es la versión corta. El <a href="https://e-evolution.github.io/omlx/es.html">informe de campo completo</a> incluye el método, cada número y sus límites.</p>
+
+<h2>Las herramientas, para quien no las conoce</h2>
+
+<ul>
+  <li><strong><a href="https://github.com/jundot/omlx">oMLX</a></strong>, de <a href="https://github.com/jundot">jundot</a>, ejecuta modelos de IA abiertos de forma local en Macs con Apple Silicon. Guarda una caché de prompts en SSD, así un agente que reenvía una conversación larga no vuelve a pagarla completa.</li>
+  <li><strong><a href="https://github.com/Gentleman-Programming/gentle-shell">gentle-shell</a></strong>, de <a href="https://github.com/Alan-TheGentleman">Alan-TheGentleman</a>, es un harness para el agente de programación pi. Agrega el flujo de trabajo de agentes: orquestación, una herramienta de tareas, integración de revisiones y subagentes que se ejecutan como procesos separados.</li>
+  <li><strong>Modelos Qwen</strong>, en concreto Qwen3.8-27B en una versión de 4 bits con Multi-Token Prediction y caché KV TurboQuant de 4 bits, sobre una Apple M5 Max con 128 GB de memoria.</li>
+</ul>
+
+<p>Varias sesiones de agentes compartían un mismo modelo. Leían archivos de código completos y tomaban capturas de pantalla, así que los prompts eran grandes: en 1.260 solicitudes registradas, la mediana fue de 107k tokens y el percentil 90 de 168k. Con ese tamaño, la caché de prompts decide si un turno cuesta un segundo o varios minutos.</p>
+
+<figure>
+  <img src="https://e-evolution.github.io/omlx/media/omlx-gentle-shell-intellij-load.gif" alt="Panel de oMLX atendiendo varias solicitudes de agentes al mismo tiempo">
+  <figcaption>Un servidor oMLX local y dos clientes: subagentes de gentle-shell y un asistente del IDE enviando solicitudes al mismo tiempo (velocidad 10×, grabación de campo).</figcaption>
+</figure>
+
+<h2>Lo que falló cuando lo dejamos solo</h2>
+
+<p>El objetivo era fácil de enunciar: dejar la máquina trabajando hasta que terminara cada tarea. Con la versión original (oMLX v0.7.0) no ocurrió:</p>
+
+<ul>
+  <li><strong>Trabajo perdido bajo presión de memoria.</strong> Varios prompts largos a la vez alcanzaban el límite duro del guardián de memoria. Las solicitudes se abortaban a mitad del prefill, se perdía todo el progreso y los agentes se detenían a esperar a una persona.</li>
+  <li><strong>La concurrencia lo empeoraba.</strong> En una prueba con tres solicitudes, ejecutarlas juntas tomó 538 s contra 246 s de a una, con 6 abortos.</li>
+  <li><strong>El decode en lote era lento y, en ese runtime, podía fallar.</strong> Las filas cortas de un lote con relleno atendían sobre el relleno.</li>
+  <li><strong>La caché de prompts colapsaba en ráfagas.</strong> La reutilización promedio era alta, pero turnos individuales perdían entre 70k y 170k tokens en caché.</li>
+</ul>
+
+<p>Nada de esto apareció en una prueba unitaria. Solo se manifestó cuando agentes reales trabajaron durante horas contra un servidor real.</p>
+
+<h2>Cómo trabajamos</h2>
+
+<p>Antes de escribir código, formulamos seis premisas falsables, cada una ligada a un benchmark en la misma máquina, con el mismo modelo y los mismos prompts, contra la versión de upstream. Nada se dio por terminado hasta que su premisa se cumplió.</p>
+
+<p>Los cambios se hicieron con tests primero, un commit revisable por comportamiento y una revisión independiente en cada parte. Cuando algo fallaba, lo rastreábamos en los logs del servidor y en un pequeño registrador del lado del cliente que capturaba el contenido exacto de cada solicitud, y lo corregíamos escribiendo primero un test de regresión.</p>
+
+<p>Esa última herramienta resultó más importante de lo esperado. Comparar solicitudes consecutivas byte a byte, y hacer coincidir el primer byte modificado con la posición en la que la caché del servidor divergía, fue lo que encontró el problema más grande de todos, y no estaba en el servidor.</p>
+
+<h2>Lo que proponemos para oMLX</h2>
+
+<p><strong>1. Decode en lote con TurboQuant (<a href="https://github.com/jundot/omlx/pull/4441">PR #4441</a>).</strong> Cuando filas de distinta longitud se decodifican juntas, las más cortas se rellenan a la izquierda. El camino en lote dejaba entrar el relleno en la atención y descuantizaba todo el contexto en cada paso. La corrección hace que cada fila atienda solo su propio tramo. Sobre código reciente de upstream, con un lote de tres prompts restaurados (20k, 45k y 135k tokens), el decode en lote fue entre 5 y 12 veces más rápido por fila, la fase del lote bajó de 345 s a 66 s con MTP activado y el pico de memoria se redujo entre 11 y 15 GB. Dos commits, 28 tests.</p>
+
+<p><strong>2. Prefill después de un acierto de caché en SSD (<a href="https://github.com/jundot/omlx/pull/4442">PR #4442</a>).</strong> Cuando un prompt largo reutiliza desde el SSD un prefijo TurboQuant en caché, el resto del prompt se procesaba contra el prefijo comprimido, 2,4 veces más lento que procesar esas mismas posiciones en frío. Una copia densa única de las capas restauradas (0,43 s) lo deja en 0,92 veces el tiempo en frío. Dos commits, 16 tests.</p>
+
+<p><strong>3. Pausar y reanudar en lugar de abortar (<a href="https://github.com/jundot/omlx/discussions/4440">propuesta en la discusión #4440</a>).</strong> Bajo presión de memoria, el servidor pausa una solicitud, guarda su estado en la caché SSD y la reanuda después en el mismo stream, en lugar de abortar todo lo que está en curso. Una solicitud que nunca va a caber recibe en 0,1 s un error claro con los números, para que el agente compacte su contexto y vuelva a intentar. En una prueba con presión forzada terminaron 9 de 9 solicitudes, contra 3 de 9 en código reciente de upstream. Con MTP desactivado, 12 pausas forzadas produjeron una salida idéntica. Son unas 13.000 líneas modificadas, dos tercios de ellas tests, por lo que se propone como una serie de 12 pull requests pequeños, con cada comportamiento nuevo detrás de una opción que se activa explícitamente, a la espera de la opinión del mantenedor antes de abrir cualquiera.</p>
+
+<figure>
+  <img src="https://e-evolution.github.io/omlx/media/omlx-sustained-no-abort.gif" alt="Panel de oMLX durante una ejecución sostenida sin abortos">
+  <figcaption>Durante más de tres minutos de trabajo real (velocidad 20×), el fork mantiene 3 o 4 solicitudes de agentes en curso; las solicitudes terminan y empiezan otras, sin errores en los cuadros visibles.</figcaption>
+</figure>
+
+<p>En el fork de uso diario, 333 solicitudes reales de agentes, con hasta 5 a la vez, se ejecutaron con 0 abortos por memoria, y el 94,8 % de los tokens de prompt salió de la caché en ese período de logs. En los benchmarks contra el código de upstream de ese momento, dos prompts concurrentes de 130k tokens llegaron a un pico de 44 GB en lugar de 116 GB y terminaron unas 3 veces más rápido, y los lotes de agentes desatendidos terminaron 3 de 3 veces contra 0 de 3 con v0.7.0.</p>
+
+<h2>Lo que proponemos para gentle-shell</h2>
+
+<p>La mayor pérdida de caché de toda la investigación estaba en el harness. Mientras había tareas abiertas, la extensión de tareas de gentle-shell reescribía el prompt de sistema en cada mensaje del usuario, incluido un contador de antigüedad que cambiaba cada vez. En el entorno probado, cada reescritura rompía la reutilización de la caché desde ese punto en adelante.</p>
+
+<blockquote>Nada fallaba y todos los tests del harness pasaban. Simplemente, los turnos de los agentes tardaban minutos en lugar de segundos.</blockquote>
+
+<p>En aproximadamente un día y medio de uso real, eso significó cerca de 1,05 millones de tokens procesados otra vez, unos 80 a 85 minutos de GPU. La corrección saca el estado de las tareas del prompt de sistema y lo envía en mensajes de la conversación, solo cuando la lista cambia. Las solicitudes que reescribían el prompt de sistema pasaron de 21 de 61 a 0 de 90, y los reprocesamientos de más de 20k tokens bajaron de uno o dos por hora a cero. La corrección está lista, sus 63 tests de tareas pasan y se sigue en el <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">issue #1367</a>.</p>
+
+<p>La lección vale para cualquier harness de agentes: los tests de estabilidad del prompt detectan la reescritura, pero solo un servidor con una caché observable muestra cuánto cuesta.</p>
+
+<h2>Lo que esto muestra y lo que no</h2>
+
+<p>Los números provienen de mis propias ejecuciones en una Apple M5 Max y con una sola familia de modelos, en su mayoría con una ejecución por configuración. Son evidencia, no una reproducción independiente. Las correcciones son propuestas; ninguna está adoptada todavía en upstream y no son garantías para máquinas más pequeñas. El informe completo indica cada límite junto al número que acota.</p>
+
+<h2>Por qué lo compartimos</h2>
+
+<p>oMLX y gentle-shell son de código abierto, construidos por personas que comparten su trabajo con todos. Nos gusta esa filosofía, y contribuir de vuelta es nuestra forma de ser parte de ella. Mi agradecimiento a jundot y a Alan-TheGentleman por los proyectos que hicieron posible este piloto.</p>
+
+<p>Si contribuyes a alguno de los dos proyectos, las revisiones y pruebas en otras Macs y con otros modelos son muy bienvenidas:</p>
+
+<ul>
+  <li>Informe de campo completo: <a href="https://e-evolution.github.io/omlx/es.html">e-evolution.github.io/omlx/es.html</a> (<a href="https://e-evolution.github.io/omlx/">in English</a>)</li>
+  <li>Discusión en oMLX: <a href="https://github.com/jundot/omlx/discussions/4440">jundot/omlx#4440</a></li>
+  <li>Pull requests en oMLX: <a href="https://github.com/jundot/omlx/pull/4441">#4441</a> y <a href="https://github.com/jundot/omlx/pull/4442">#4442</a></li>
+  <li>Issue en gentle-shell: <a href="https://github.com/Gentleman-Programming/gentle-shell/issues/1367">Gentleman-Programming/gentle-shell#1367</a></li>
+</ul>
+
+<p><em>Victor Perez, mantenedor principal de ADempiere. Publicado originalmente en <a href="https://e-evolution.github.io/omlx/es.html">e-evolution.github.io/omlx/es.html</a>.</em></p>
+
+</article>
+</body>
+</html>
