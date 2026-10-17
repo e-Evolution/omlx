@@ -2420,10 +2420,40 @@ def _prefill_activity_recent() -> bool:
         return False
 
 
-def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) -> None:
+def _prefill_activity_since(since_ts: float) -> bool:
+    try:
+        return get_prefill_tracker().active_since(since_ts)
+    except Exception:
+        return False
+
+
+def _arm_std_tax_probe(
+    gen_batch: Any,
+    t0_ms: Optional[float],
+    uid: Any = None,
+    since_ts: Optional[float] = None,
+) -> None:
+    """Arm the post-park standard-step probe.
+
+    ``since_ts`` is the monotonic start of the MTP run that produced
+    ``t0_ms``. When given, only prefill activity after it counts as
+    contention: the sequence's own prefill ended before its run began and
+    cannot have shaped t0. Without it, any prefill in the last
+    ``_STD_TAX_CONTENTION_WINDOW_S`` blocks the probe, which in practice
+    skips every probe of an interactive request (it parks about a second
+    after its own prefill) and leaves the exit margin at its prior.
+    """
     if not (t0_ms and t0_ms > 0.0):
         return
-    if _prefill_activity_recent():
+    if since_ts is not None:
+        if _prefill_activity_since(since_ts):
+            logger.debug(
+                "MTP loop-tax probe skipped: prefill activity during the run, "
+                "t0=%.1fms is contention-contaminated",
+                t0_ms,
+            )
+            return
+    elif _prefill_activity_recent():
         logger.debug(
             "MTP loop-tax probe skipped: prefill activity within %.1fs, "
             "t0=%.1fms is contention-contaminated",
@@ -2436,6 +2466,8 @@ def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) 
         "skip": _STD_TAX_SKIP,
         "samples": [],
         "uid": uid,
+        # Run-scoped probes finalize against activity after arming only.
+        "armed_ts": time.monotonic() if since_ts is not None else None,
     }
 
 
@@ -2466,7 +2498,13 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
-    if _prefill_activity_recent():
+    armed_ts = probe.get("armed_ts")
+    contended = (
+        _prefill_activity_since(armed_ts)
+        if armed_ts is not None
+        else _prefill_activity_recent()
+    )
+    if contended:
         logger.debug(
             "MTP loop-tax probe discarded: prefill activity during the "
             "std sampling window"
@@ -2617,6 +2655,9 @@ class _DepthController:
         if exit_margin:
             self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
+        # Start of this MTP run: a park scopes its loop-tax contention check
+        # to prefill activity after it (see _arm_std_tax_probe).
+        self.started_ts = time.monotonic()
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         # A position never reached yet (None) borrows the estimate of the
         # position before it; a flat 0.6 prior kept deep drafts unexplored.
@@ -3688,7 +3729,12 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
-        _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+        _arm_std_tax_probe(
+            gen_batch,
+            state.controller.t.get(0),
+            state.uid,
+            since_ts=getattr(state.controller, "started_ts", None),
+        )
     logger.info(
         "MTP[%s] parked for %d standard tokens before re-entry probe",
         state.uid,
