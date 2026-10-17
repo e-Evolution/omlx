@@ -2642,6 +2642,17 @@ class _DepthController:
     # a hardcoded ratio.
     EXIT_MARGIN = 1.15
     EXIT_STREAK = 16
+    # Depth 0 drafts nothing, so acceptance does not update while the
+    # controller sits there: a losing verdict built at depth 0 rests on the
+    # estimate that sent it there. A hand-off therefore needs this many
+    # speculative cycles inside the losing streak; when they are missing,
+    # the best speculative depth is re-measured first (the depth-0 trap:
+    # one dip in a story's acceptance otherwise parks MTP for content where
+    # depth 1 beats the plain step). 16 cycles let the acceptance EMA
+    # (ALPHA 0.08) climb back from a dip; in simulation 8 cycles still
+    # parked ~40% of stale dips, 16 parks ~6%, and truly losing content
+    # exits by cycle ~37 (24 before this gate).
+    EXIT_CONFIRM = 16
 
     def __init__(
         self,
@@ -2667,6 +2678,7 @@ class _DepthController:
         self.cycles = 0
         self.probe_left = 0
         self.exit_streak = 0
+        self._streak_spec = 0  # speculative cycles in the current losing streak
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
         # Measure each depth once (max..1), then the depth-0 plain step
@@ -2725,8 +2737,11 @@ class _DepthController:
 
         if self._speculation_losing():
             self.exit_streak += 1
+            if used > 0 and time_sample:
+                self._streak_spec += 1
         else:
             self.exit_streak = 0
+            self._streak_spec = 0
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
@@ -2737,6 +2752,19 @@ class _DepthController:
                 self.cur = self._warmup[0]
                 return
             self.cur = self._best()
+            self._ms_probe = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("MTP controller warmup done: %s", self.describe())
+            return
+
+        # Confirm a losing verdict before it can hand off (EXIT_CONFIRM).
+        if (
+            self.probe_left == 0
+            and self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec < self.EXIT_CONFIRM
+        ):
+            self.cur = max(range(1, self.max_depth + 1), key=self._score)
+            self.probe_left = self.EXIT_CONFIRM - self._streak_spec
             self._ms_probe = 0.0
             return
 
@@ -2860,8 +2888,27 @@ class _DepthController:
 
     def should_exit(self) -> bool:
         """Sustained losing speculation: hand the sequence back to the
-        standard decoder."""
-        return self.exit_streak >= self.EXIT_STREAK
+        standard decoder. The streak must include EXIT_CONFIRM speculative
+        cycles, so the verdict is not just the estimate that led to depth 0."""
+        return (
+            self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec >= self.EXIT_CONFIRM
+        )
+
+    def describe(self) -> str:
+        """Compact state for debug logs: costs, acceptance and scores."""
+        t = ", ".join(f"{d}:{v:.1f}" for d, v in sorted(self.t.items()))
+        p = ", ".join("-" if v is None else f"{v:.2f}" for v in self.p)
+        scores = ", ".join(
+            f"{d}:{self._score(d) * 1000.0:.1f}"
+            for d in range(0, self.max_depth + 1)
+            if d > 0 or 0 in self.t
+        )
+        return (
+            f"cur={self.cur} cycles={self.cycles} t_ms={{{t}}} p=[{p}] "
+            f"tok_per_s={{{scores}}} exit_margin={self.EXIT_MARGIN:.3f} "
+            f"exit_streak={self.exit_streak}"
+        )
 
     def _select_candidates(self) -> List[int]:
         # Depth 0 is only selectable once its cost has actually been
@@ -3729,6 +3776,9 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
+        describe = getattr(state.controller, "describe", None)
+        if describe is not None and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("MTP[%s] park decision: %s", state.uid, describe())
         _arm_std_tax_probe(
             gen_batch,
             state.controller.t.get(0),
