@@ -118,55 +118,7 @@ async def test_only_qwen4_exp_loader_defers_parameter_eval_to_materialize(
         assert captured["lazy"] is expected_lazy
 
 
-def _write_qwen4_exp_mtp_checkpoint(path):
-    (path / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "qwen4_exp",
-                "text_config": {
-                    "model_type": "qwen4_exp_text",
-                    "mtp_num_hidden_layers": 1,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    (path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
-        encoding="utf-8",
-    )
-
-
-@pytest.mark.parametrize(
-    ("adaptive_max", "fixed", "expected_depth", "expected_fixed"),
-    [
-        # Default: one draft per cycle, so no adaptive depth controller is
-        # built (Flash-Next depths 1-3 score within 3.5%; the controller's
-        # warmup, depth-0 cycles and parking only cost throughput).
-        (None, None, 1, False),
-        # An explicit adaptive ceiling still selects the adaptive controller.
-        (3, None, 3, False),
-        # A fixed depth wins over everything.
-        (None, 2, 2, True),
-    ],
-)
-def test_qwen4_exp_loader_mtp_depth_defaults(
-    tmp_path, adaptive_max, fixed, expected_depth, expected_fixed
-):
-    _write_qwen4_exp_mtp_checkpoint(tmp_path)
-    settings = SimpleNamespace(
-        mtp_enabled=True, mtp_adaptive_max_depth=adaptive_max, mtp_fixed_depth=fixed
-    )
-
-    maybe_apply_pre_load_patches(str(tmp_path), settings, for_vlm=True)
-
-    from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
-
-    assert get_mtp_depth() == expected_depth
-    assert is_mtp_depth_fixed() is expected_fixed
-
-
-def test_qwen4_exp_loader_enables_lightning_mtp(tmp_path):
+def test_qwen4_exp_loader_enables_adaptive_depth_three_lightning_mtp(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -193,7 +145,7 @@ def test_qwen4_exp_loader_enables_lightning_mtp(tmp_path):
 
     assert get_mtp_runtime().enabled is True
     assert get_mtp_runtime().checkpoint_prefix == "mtp."
-    assert get_mtp_depth() == 1
+    assert get_mtp_depth() == 3
     assert is_mtp_active() is True
 
     maybe_apply_pre_load_patches(

@@ -864,18 +864,13 @@ def maybe_apply_pre_load_patches(
             else None
         )
         fixed = getattr(model_settings, "mtp_fixed_depth", None)
-        # Qwen4-Exp defaults to one draft per cycle. On Flash-Next (M5 Max,
-        # oQ4e, batch 1) depths 1-3 score within 3.5% of each other, because
-        # each extra row-exact verify row costs about as much as it saves, so
-        # the adaptive controller can at best tie depth 1. Its warmup,
-        # depth-0 cycles and parking then cost throughput: in interleaved
-        # A/B runs adaptive max 3 decoded 64-93 tok/s against a stable
-        # 87-98 at depth 1. Depth 1 builds no controller. An explicit
-        # mtp_adaptive_max_depth still selects the adaptive controller.
+        # Qwen4-Exp uses the same adaptive draft-depth controller as the
+        # general Lightning MTP path.  A single MTP hidden layer can be
+        # chained autoregressively, so default to the validated max depth 3.
         if fixed:
             set_mtp_depth(int(fixed), fixed=True)
         else:
-            set_mtp_depth(int(depth) if depth else 1)
+            set_mtp_depth(int(depth) if depth else 3)
         if mtp_active and not apply_mlx_lm_mtp_patch():
             logger.warning(
                 "Qwen4-Exp Lightning MTP dispatch patch failed for %s; "
